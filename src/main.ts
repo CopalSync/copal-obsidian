@@ -27,6 +27,7 @@ import { type MutationData, MutationQueue } from "./sync/mutation-queue";
 import { ObsidianVault } from "./sync/obsidian-vault";
 import { type SyncData, SyncState } from "./sync/state";
 import { confirmModal } from "./ui/confirm";
+import { openExternal } from "./ui/external-link";
 import { STATUS_META, type SyncStatus } from "./ui/status";
 
 /**
@@ -110,9 +111,7 @@ export default class CopalPlugin extends Plugin {
     this.flow = new ConnectFlow({
       f: requestUrlFetch,
       store: this.store,
-      openUrl: (url) => {
-        window.open(url, "_blank");
-      },
+      openUrl: (url) => openExternal(this.app, url),
       randomState: () => crypto.randomUUID(),
     });
 

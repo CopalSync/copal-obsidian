@@ -63,6 +63,21 @@
   margin-top: 16px;
 }
 
+/* Mobile "continue in browser" prompt: a prominent tappable link (the user's tap opens the system browser). */
+.copal-continue-btn {
+  display: inline-block;
+  margin: 10px 0 4px;
+  padding: 10px 16px;
+  border-radius: 8px;
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  font-weight: 600;
+  text-decoration: none;
+}
+.copal-continue-btn:hover {
+  background: var(--interactive-accent-hover);
+}
+
 /* Adopt screen: a list of vault rows (name left, compact red Adopt button right) + the "clears this folder" note. */
 .copal-vault-list {
   display: flex;
