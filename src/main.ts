@@ -456,6 +456,11 @@ export default class CopalPlugin extends Plugin {
 
   /** Start the sync engine for the now-linked vault in `mode`, bind the active editor, refresh settings. */
   private async startBound(mode: "merge" | "adopt"): Promise<void> {
+    // The vault is already linked (the caller committed `setVault`) — reflect the connected state in settings
+    // NOW, before the initial reconcile. An adopt downloads every note in the vault, which can take seconds on
+    // mobile; without this the settings pane sits on the stale "No vault adopted" screen until sync finishes,
+    // reading as a failed adopt. The status indicator shows sync progress in the meantime.
+    await this.settingsTab?.refresh();
     await this.sync?.start(mode);
     this.syncActive = true;
     await this.settingsTab?.refresh();
