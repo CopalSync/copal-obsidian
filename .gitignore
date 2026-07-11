@@ -1,0 +1,11 @@
+# Dependencies
+node_modules/
+
+# Build output — attached to GitHub releases, not committed
+main.js
+main.js.map
+*.map
+
+# Logs / OS
+*.log
+.DS_Store

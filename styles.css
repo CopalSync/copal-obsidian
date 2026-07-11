@@ -1,0 +1,102 @@
+/* Copal status-bar indicator: the amber shard logo + a standard sync icon that colours by state. */
+.copal-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+}
+.copal-gem {
+  display: inline-flex;
+}
+.copal-gem svg {
+  width: 15px;
+  height: 15px;
+  display: block;
+}
+.copal-sync {
+  display: inline-flex;
+  align-items: center;
+}
+.copal-sync svg {
+  width: 14px;
+  height: 14px;
+}
+
+/* Not connected / offline — muted. */
+.copal-sync.is-off {
+  color: var(--text-muted);
+}
+
+/* Syncing — amber, spinning. */
+.copal-sync.is-sync {
+  color: #ef9f2c;
+  animation: copal-spin 0.9s linear infinite;
+}
+
+/* Synced & live — green. */
+.copal-sync.is-live {
+  color: #3fb950;
+}
+
+/* Ribbon icon — the mobile-visible sync-state surface (mobile has no status bar). Same state colours. */
+.copal-ribbon.is-off {
+  color: var(--text-muted);
+}
+.copal-ribbon.is-sync {
+  color: #ef9f2c;
+  animation: copal-spin 0.9s linear infinite;
+}
+.copal-ribbon.is-live {
+  color: #3fb950;
+}
+
+@keyframes copal-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Muted fine-print note in settings (e.g. the credential-storage transparency line). */
+.copal-fineprint {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  margin-top: 16px;
+}
+
+/* Adopt screen: a list of vault rows (name left, compact red Adopt button right) + the "clears this folder" note. */
+.copal-vault-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 4px 0 8px;
+}
+.copal-vault-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 8px 8px 14px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 9px;
+  background: var(--background-secondary);
+}
+.copal-vault-name {
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.copal-vault-row button {
+  margin: 0;
+  flex: none;
+}
+.copal-modal-danger {
+  border: 1px solid var(--background-modifier-error);
+  border-radius: 8px;
+  background: var(--background-modifier-error-hover);
+  padding: 10px 12px;
+  margin: 8px 0 14px;
+}
+.copal-modal-danger p {
+  margin: 4px 0;
+}
