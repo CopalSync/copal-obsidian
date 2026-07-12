@@ -216,7 +216,9 @@ class PersistedIndex {
     return this.db().then(
       (db) =>
         new Promise<T>((resolve, reject) => {
-          const req = fn(db.transaction(PersistedIndex.STORE, mode).objectStore(PersistedIndex.STORE));
+          const req = fn(
+            db.transaction(PersistedIndex.STORE, mode).objectStore(PersistedIndex.STORE),
+          );
           req.onsuccess = () => resolve(req.result);
           req.onerror = () => reject(req.error ?? new Error("index request failed"));
         }),

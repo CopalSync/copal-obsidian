@@ -27,7 +27,9 @@ describe("SyncState", () => {
   });
 
   it("loads an existing cursor on init", async () => {
-    const s = new SyncState(mem({ lastSeq: 3, knownServer: ["x.md"] }).load, () => Promise.resolve());
+    const s = new SyncState(mem({ lastSeq: 3, knownServer: ["x.md"] }).load, () =>
+      Promise.resolve(),
+    );
     await s.init();
     expect(s.lastSeq).toBe(3);
     expect(s.knownServer).toEqual(["x.md"]);

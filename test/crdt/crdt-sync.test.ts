@@ -1,5 +1,5 @@
 import "fake-indexeddb/auto";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import { CrdtNote, type YTransport } from "../../src/crdt/crdt-note";
 import { CrdtSync, type CrdtSyncDeps } from "../../src/crdt/crdt-sync";
@@ -95,7 +95,10 @@ function makeSync(
   const deleted: string[] = [];
   const moved: [string, string][] = [];
   // A mutable server manifest the fake `api.manifest()` reads at reconcile time (paths + journal head).
-  const manifestState: { head: number; entries: { path: string }[] } = { head: 0, entries: [] };
+  const manifestState: { head: number; entries: { path: string; version?: string }[] } = {
+    head: 0,
+    entries: [],
+  };
   const defaultDelete = (p: string): Promise<void> => {
     deleted.push(p);
     return Promise.resolve();
@@ -173,6 +176,54 @@ describe("CrdtSync (local-first op-sync)", () => {
     expect(vault.snapshot()["pic.png"]).toBeUndefined(); // binary quarantined
   });
 
+  it("routes a non-markdown remote change to BinarySync (never the text CRDT)", async () => {
+    const binarySync = { onRemoteChange: vi.fn(() => Promise.resolve()) };
+    const { crdt, vault } = makeSync(
+      {},
+      { binarySync: binarySync as unknown as NonNullable<CrdtSyncDeps["binarySync"]> },
+    );
+    await crdt.onRemoteChange({ path: "image.png", op: "put", version: "e1" });
+    expect(binarySync.onRemoteChange).toHaveBeenCalledWith({
+      path: "image.png",
+      op: "put",
+      version: "e1",
+    });
+    expect(vault.snapshot()["image.png"]).toBeUndefined(); // never CRDT-materialized as text
+  });
+
+  it("reconcile delegates the binary manifest entries to BinarySync while .md flows through the CRDT", async () => {
+    const binarySync = {
+      onRemoteChange: vi.fn(() => Promise.resolve()),
+      reconcile: vi.fn(() => Promise.resolve()),
+    };
+    const { crdt, serverDocs, vault, manifestState } = makeSync(
+      {},
+      { binarySync: binarySync as unknown as NonNullable<CrdtSyncDeps["binarySync"]> },
+    );
+    const md = new Y.Doc();
+    md.getText("content").insert(0, "note body");
+    serverDocs.set("note.md", md);
+    manifestState.entries = [
+      { path: "note.md", version: "m1" },
+      { path: "pic.png", version: "p1" },
+      { path: "doc.pdf", version: "d1" },
+    ];
+    await crdt.reconcile([], "merge");
+    await waitFor(() => vault.snapshot()["note.md"] === "note body");
+    // The binary entries (and only those) were handed to BinarySync — never the CRDT.
+    expect(binarySync.reconcile).toHaveBeenCalledTimes(1);
+    expect(binarySync.reconcile).toHaveBeenCalledWith(
+      [
+        { path: "pic.png", version: "p1" },
+        { path: "doc.pdf", version: "d1" },
+      ],
+      "merge",
+    );
+    // No binary ever became a CRDT server doc or a materialized text file.
+    expect(serverDocs.has("pic.png")).toBe(false);
+    expect(vault.snapshot()["pic.png"]).toBeUndefined();
+  });
+
   it("UNIONS an offline local edit with a concurrent server edit — zero loss", async () => {
     const { crdt, serverDocs, registry } = makeSync({ "n.md": "" });
     await crdt.onLocalChange("n.md", "BASE\n"); // establish shared history
@@ -226,9 +277,13 @@ describe("CrdtSync (local-first op-sync)", () => {
   it("deleteLocal KEEPS the persisted doc + surfaces the error when the server delete fails", async () => {
     // A failed server delete must NOT orphan the note (server keeps it / local forgets it → resurrect).
     // Keep the persisted doc and throw so main.ts can surface it; reconcile retries once the server lands.
-    const { crdt, registry } = makeSync({ "d.md": "x" }, {}, {
-      deleteNote: () => Promise.reject(new Error("delete failed: 500")),
-    });
+    const { crdt, registry } = makeSync(
+      { "d.md": "x" },
+      {},
+      {
+        deleteNote: () => Promise.reject(new Error("delete failed: 500")),
+      },
+    );
     const { note, whenLoaded } = registry.note("d.md");
     await whenLoaded;
     await note.applyFileEdit("x"); // give it a persisted local doc
@@ -268,9 +323,13 @@ describe("CrdtSync (local-first op-sync)", () => {
   });
 
   it("rename falls back to delete-old + upload-new when the server move fails", async () => {
-    const { crdt, vault, serverDocs, deleted } = makeSync({ "old.md": "hello" }, {}, {
-      moveNote: () => Promise.reject(new Error("move failed: 503")),
-    });
+    const { crdt, vault, serverDocs, deleted } = makeSync(
+      { "old.md": "hello" },
+      {},
+      {
+        moveNote: () => Promise.reject(new Error("move failed: 503")),
+      },
+    );
     await crdt.open("old.md");
     await waitFor(() => crdt.ownsPath("old.md"));
     await waitFor(() => serverText(serverDocs, "old.md") === "hello");
@@ -288,10 +347,14 @@ describe("CrdtSync (local-first op-sync)", () => {
   it("a fully-offline rename durably queues the old-path delete and keeps the old doc (no resurrect)", async () => {
     const { q } = makeQueue();
     await q.init();
-    const { crdt, registry, vault } = makeSync({ "old.md": "hello" }, { queue: q }, {
-      moveNote: () => Promise.reject(new Error("offline")),
-      deleteNote: () => Promise.reject(new Error("offline")),
-    });
+    const { crdt, registry, vault } = makeSync(
+      { "old.md": "hello" },
+      { queue: q },
+      {
+        moveNote: () => Promise.reject(new Error("offline")),
+        deleteNote: () => Promise.reject(new Error("offline")),
+      },
+    );
     await crdt.open("old.md");
     await waitFor(() => crdt.ownsPath("old.md"));
     await vault.write("new.md", "hello");
@@ -338,7 +401,8 @@ describe("CrdtSync (local-first op-sync)", () => {
     await crdt.reconcile();
 
     await waitFor(
-      () => serverText(serverDocs, "a.md") === "note A" && serverText(serverDocs, "b.md") === "note B",
+      () =>
+        serverText(serverDocs, "a.md") === "note A" && serverText(serverDocs, "b.md") === "note B",
     );
     expect(serverText(serverDocs, "a.md")).toBe("note A");
     expect(serverText(serverDocs, "b.md")).toBe("note B");
@@ -569,9 +633,13 @@ describe("CrdtSync — durable delete queue (offline mutation durability)", () =
   it("deleteLocal enqueues + persists the delete when the server delete fails, and re-throws", async () => {
     const { q, peek } = makeQueue();
     await q.init();
-    const { crdt, registry } = makeSync({ "d.md": "x" }, { queue: q }, {
-      deleteNote: () => Promise.reject(new Error("delete failed: 500")),
-    });
+    const { crdt, registry } = makeSync(
+      { "d.md": "x" },
+      { queue: q },
+      {
+        deleteNote: () => Promise.reject(new Error("delete failed: 500")),
+      },
+    );
     const { note, whenLoaded } = registry.note("d.md");
     await whenLoaded;
     await note.applyFileEdit("x"); // persisted local doc
@@ -612,9 +680,13 @@ describe("CrdtSync — durable delete queue (offline mutation durability)", () =
   it("drainPending KEEPS a queued delete when the server delete still fails (still offline)", async () => {
     const { q } = makeQueue({ deletes: ["gone.md"] });
     await q.init();
-    const { crdt, registry } = makeSync({}, { queue: q }, {
-      deleteNote: () => Promise.reject(new Error("delete failed: 503")),
-    });
+    const { crdt, registry } = makeSync(
+      {},
+      { queue: q },
+      {
+        deleteNote: () => Promise.reject(new Error("delete failed: 503")),
+      },
+    );
     const { note, whenLoaded } = registry.note("gone.md");
     await whenLoaded;
     await note.applyFileEdit("x");

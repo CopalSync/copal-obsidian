@@ -6,7 +6,6 @@ import {
   Modal,
   Notice,
   Plugin,
-  requestUrl,
   setIcon,
   setTooltip,
   type TAbstractFile,
@@ -22,33 +21,17 @@ import { type PersistedData, TokenStore } from "./connect/store";
 import type { Tokens } from "./types";
 import { CopalSettingTab } from "./settings";
 import { SyncApi, type Vault } from "./sync/api";
+import { type BinaryData, BinaryCursor } from "./sync/binary-cursor";
+import { BinarySync, isAttachmentPath } from "./sync/binary-sync";
+import { ObsidianBinaryVault } from "./sync/binary-vault";
 import { SyncClient } from "./sync/live";
 import { type MutationData, MutationQueue } from "./sync/mutation-queue";
 import { ObsidianVault } from "./sync/obsidian-vault";
+import { requestUrlFetch } from "./sync/request-url-fetch";
 import { type SyncData, SyncState } from "./sync/state";
 import { confirmModal } from "./ui/confirm";
 import { openExternal } from "./ui/external-link";
 import { STATUS_META, type SyncStatus } from "./ui/status";
-
-/**
- * A `fetch`-shaped adapter over Obsidian's `requestUrl`. Plugin requests to api.copal.uk are
- * cross-origin from `app://obsidian.md` and would be CORS-blocked with the browser `fetch`;
- * `requestUrl` is a native request that bypasses CORS.
- */
-const requestUrlFetch: typeof fetch = async (input, init) => {
-  const url = typeof input === "string" ? input : input.toString();
-  const res = await requestUrl({
-    url,
-    method: init?.method ?? "GET",
-    ...(init?.headers ? { headers: init.headers as Record<string, string> } : {}),
-    ...(init?.body ? { body: init.body as string } : {}),
-    throw: false,
-  });
-  return new Response(res.text, {
-    status: res.status,
-    headers: { "content-type": res.headers["content-type"] ?? "application/json" },
-  });
-};
 
 /** The real Copal logo — the faceted-e amber shard (from copal-web/public/copal-gem.svg), as polygon
  *  data so it's built via the DOM (`createSvg`) rather than `innerHTML` (an Obsidian review-guideline). */
@@ -61,7 +44,9 @@ const GEM_POLYGONS: { points: string; fill: string }[] = [
 
 /** Build the amber-shard SVG into `parent` using Obsidian's namespaced `createSvg` DOM helper (no innerHTML). */
 function renderGem(parent: HTMLElement): void {
-  const svg = parent.createSvg("svg", { attr: { viewBox: "84 184 374 196", "aria-hidden": "true" } });
+  const svg = parent.createSvg("svg", {
+    attr: { viewBox: "84 184 374 196", "aria-hidden": "true" },
+  });
   const g = svg.createSvg("g", { attr: { "shape-rendering": "geometricPrecision" } });
   for (const { points, fill } of GEM_POLYGONS) g.createSvg("polygon", { attr: { points, fill } });
 }
@@ -97,6 +82,9 @@ export default class CopalPlugin extends Plugin {
   private api: SyncApi | undefined;
   private syncState: SyncState | undefined;
   private mutationQueue: MutationQueue | undefined;
+  private binarySync: BinarySync | undefined;
+  private binaryCursor: BinaryCursor | undefined;
+  private binaryQueue: MutationQueue | undefined;
   private registry: LocalNoteRegistry | undefined;
   private statusEl: HTMLElement | undefined;
   private syncIconEl: HTMLElement | undefined;
@@ -148,6 +136,41 @@ export default class CopalPlugin extends Plugin {
     this.deviceId = await this.store.getDeviceId();
     const vault = new ObsidianVault(this.app);
     this.vault = vault;
+    // Attachment (non-`.md`) sync: file-level last-writer-wins, keyed on the R2 etag. Its cursor persists
+    // under the `binary` key of data.json and its durable delete queue under `binaryPending` — both coexist
+    // with `sync`/`pending` via the same read-modify-write idiom.
+    const binaryCursor = new BinaryCursor(
+      async () =>
+        ((await this.loadData()) as (PersistedData & { binary?: BinaryData }) | null)?.binary ??
+        null,
+      async (binary) => {
+        const data = ((await this.loadData()) as PersistedData | null) ?? {};
+        await this.saveData({ ...data, binary });
+      },
+    );
+    await binaryCursor.init();
+    this.binaryCursor = binaryCursor;
+    const binaryQueue = new MutationQueue(
+      async () =>
+        ((await this.loadData()) as (PersistedData & { binaryPending?: MutationData }) | null)
+          ?.binaryPending ?? null,
+      async (binaryPending) => {
+        const data = ((await this.loadData()) as PersistedData | null) ?? {};
+        await this.saveData({ ...data, binaryPending });
+      },
+    );
+    await binaryQueue.init();
+    this.binaryQueue = binaryQueue;
+    const binarySync = new BinarySync({
+      api,
+      files: new ObsidianBinaryVault(this.app),
+      cursor: binaryCursor,
+      queue: binaryQueue,
+      log: (m) => {
+        if (debugEnabled()) console.debug(`[copal binary] ${m}`);
+      },
+    });
+    this.binarySync = binarySync;
     // Local-first: every note is a persisted local Y.Doc (IndexedDB); the registry hands one out per path.
     const registry = new LocalNoteRegistry(new LocalDocStore("vault"), vault);
     this.registry = registry;
@@ -158,6 +181,7 @@ export default class CopalPlugin extends Plugin {
       registry,
       vault,
       queue: mutationQueue,
+      binarySync,
       bind: (peer) => {
         // Give the human a presence identity so yCollab labels the local user and the agent's caret
         // reads as distinct. A stable per-device colour distinguishes concurrent devices; the agent
@@ -252,28 +276,33 @@ export default class CopalPlugin extends Plugin {
   }
 
   private onDelete(path: string): void {
-    if (!this.syncActive || !this.isSyncable(path)) return;
-    void this.crdt?.deleteLocal(path).catch((err: unknown) => {
-      // A failed server delete keeps the note (no orphan/resurrect) and is durably QUEUED — it'll sync
+    if (!this.syncActive) return;
+    const notifyOffline = (err: unknown) => {
+      // A failed server delete keeps the file (no orphan/resurrect) and is durably QUEUED — it'll sync
       // automatically when back online (no manual action / reload needed).
       new Notice(
         `Copal: ${path} will finish deleting on the server when you're back online. ` +
           `(${err instanceof Error ? err.message : String(err)})`,
       );
-    });
+    };
+    if (this.isSyncable(path)) {
+      void this.crdt?.deleteLocal(path).catch(notifyOffline);
+      return;
+    }
+    if (isAttachmentPath(path)) void this.binarySync?.deleteLocal(path).catch(notifyOffline);
   }
 
   /**
    * A rename fires a single Obsidian `rename` event. A `.md`→`.md` rename routes through the unified,
    * history-preserving `crdt.rename` (server move + local lineage transfer; it tears down an active note's
-   * old socket itself). A rename that moves a note IN or OUT of the synced `.md` set degrades to a delete of
-   * the old path and/or a create of the new — whichever apply.
+   * old socket itself). Any other rename — a binary↔binary move, or one that crosses the `.md`/attachment
+   * boundary — degrades to a delete of the old path and/or a create of the new on whichever channel applies
+   * (`onDelete`/`onVaultChange` route by type). A binary has no server-side history to preserve, so
+   * delete-old + upload-new is the right move.
    */
   private async onRename(f: TAbstractFile, oldPath: string): Promise<void> {
     if (!this.syncActive) return;
-    const oldMd = this.isSyncable(oldPath);
-    const newMd = this.isSyncable(f.path);
-    if (oldMd && newMd) {
+    if (this.isSyncable(oldPath) && this.isSyncable(f.path)) {
       try {
         await this.crdt?.rename(oldPath, f.path);
       } catch (err) {
@@ -284,8 +313,8 @@ export default class CopalPlugin extends Plugin {
       }
       return;
     }
-    if (oldMd) this.onDelete(oldPath); // moved out of the synced set → delete the old path
-    if (newMd) this.onVaultChange(f); // became a synced .md → upload the new path
+    if (this.isSyncable(oldPath) || isAttachmentPath(oldPath)) this.onDelete(oldPath); // old path gone
+    if (this.isSyncable(f.path) || isAttachmentPath(f.path)) this.onVaultChange(f); // new path created
   }
 
   private isSyncable(path: string): boolean {
@@ -293,11 +322,20 @@ export default class CopalPlugin extends Plugin {
   }
 
   private onVaultChange(file: TAbstractFile): void {
-    if (!this.syncActive || !this.isSyncable(file.path)) return;
-    // The active note is owned by the CM6 editor binding (Obsidian saves it). Every other note's local
-    // edit is read + applied as an op to its persisted Y.Doc, then op-synced.
-    if (this.crdt?.ownsPath(file.path)) return;
-    void this.pushLocalChange(file.path);
+    if (!this.syncActive) return;
+    if (this.isSyncable(file.path)) {
+      // The active note is owned by the CM6 editor binding (Obsidian saves it). Every other note's local
+      // edit is read + applied as an op to its persisted Y.Doc, then op-synced.
+      if (this.crdt?.ownsPath(file.path)) return;
+      void this.pushLocalChange(file.path);
+      return;
+    }
+    // A non-`.md` attachment → the file-level last-writer-wins channel (never the text CRDT).
+    if (isAttachmentPath(file.path)) {
+      void this.binarySync?.pushLocal(file.path).catch((err: unknown) => {
+        if (debugEnabled()) console.debug(`[copal binary] push failed for ${file.path}: ${err}`);
+      });
+    }
   }
 
   private async pushLocalChange(path: string): Promise<void> {
@@ -355,7 +393,9 @@ export default class CopalPlugin extends Plugin {
       try {
         await this.crdt?.flushAll();
       } catch (err) {
-        console.warn(`[copal] disconnect flush failed: ${err instanceof Error ? err.message : err}`);
+        console.warn(
+          `[copal] disconnect flush failed: ${err instanceof Error ? err.message : err}`,
+        );
       }
     }
     this.stopSync();
@@ -373,6 +413,8 @@ export default class CopalPlugin extends Plugin {
     await this.store.unlinkVault();
     await this.syncState?.reset();
     await this.mutationQueue?.reset(); // drop queued deletes so they can't fire against the next vault
+    await this.binaryCursor?.reset(); // drop the attachment etag cursor so it can't bleed into the next vault
+    await this.binaryQueue?.reset(); // drop queued binary deletes
     await this.registry?.destroyAll();
   }
 

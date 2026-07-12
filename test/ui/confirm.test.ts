@@ -2,7 +2,12 @@ import { describe, expect, it } from "vitest";
 import { App } from "obsidian";
 import { ConfirmModal } from "../../src/ui/confirm";
 
-const opts = { title: "Disconnect?", body: "This unlinks the folder.", cta: "Disconnect", danger: true };
+const opts = {
+  title: "Disconnect?",
+  body: "This unlinks the folder.",
+  cta: "Disconnect",
+  danger: true,
+};
 
 describe("ConfirmModal", () => {
   it("resolves true when the confirm action fires", async () => {

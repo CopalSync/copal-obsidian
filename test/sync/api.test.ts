@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { SyncApi } from "../../src/sync/api";
+import { PreconditionError, SyncApi } from "../../src/sync/api";
 
 const json = (b: unknown, status = 200) => new Response(JSON.stringify(b), { status });
+const bin = (bytes: number[], status = 200, headers: Record<string, string> = {}) =>
+  new Response(new Uint8Array(bytes), { status, headers });
 const makeApi = (f: typeof fetch, vaultId: string | undefined = "vlt_x") =>
   new SyncApi(
     f,
@@ -147,5 +149,72 @@ describe("SyncApi", () => {
   it("throws on a non-ok response", async () => {
     const f = vi.fn<typeof fetch>().mockResolvedValue(new Response("", { status: 401 }));
     await expect(makeApi(f).manifest()).rejects.toThrow();
+  });
+});
+
+describe("SyncApi binary files (E3)", () => {
+  it("getFile GETs /file/:path and returns bytes + content-type + raw etag", async () => {
+    const f = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(bin([1, 2, 3, 255], 200, { "content-type": "image/png", ETag: '"e1"' }));
+    const r = await makeApi(f).getFile("assets/b.png");
+    expect(r).not.toBeNull();
+    expect([...new Uint8Array(r!.bytes)]).toEqual([1, 2, 3, 255]);
+    expect(r!.contentType).toBe("image/png");
+    expect(r!.etag).toBe("e1"); // unquoted so it matches the manifest version
+    expect(String(f.mock.calls[0]![0])).toContain("/file/assets/b.png");
+  });
+
+  it("getFile returns null on 404", async () => {
+    const f = vi.fn<typeof fetch>().mockResolvedValue(new Response("", { status: 404 }));
+    expect(await makeApi(f).getFile("missing.png")).toBeNull();
+  });
+
+  it("putFile sends If-Match (quoted) + content-type and returns the new etag", async () => {
+    const f = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(new Response(null, { status: 201, headers: { ETag: '"e2"' } }));
+    const r = await makeApi(f).putFile("a.png", new Uint8Array([9]).buffer, "image/png", "e1");
+    expect(r.etag).toBe("e2");
+    const init = f.mock.calls[0]![1]!;
+    expect(init.method).toBe("PUT");
+    const headers = init.headers as Record<string, string>;
+    expect(headers["If-Match"]).toBe('"e1"');
+    expect(headers["content-type"]).toBe("image/png");
+  });
+
+  it("putFile omits If-Match when no known etag is passed", async () => {
+    const f = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(new Response(null, { status: 201, headers: { ETag: '"e2"' } }));
+    await makeApi(f).putFile("a.png", new Uint8Array([9]).buffer, "image/png");
+    expect((f.mock.calls[0]![1]!.headers as Record<string, string>)["If-Match"]).toBeUndefined();
+  });
+
+  it("putFile throws PreconditionError carrying the server's current etag on 412", async () => {
+    const f = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(new Response(null, { status: 412, headers: { ETag: '"server"' } }));
+    await expect(
+      makeApi(f).putFile("a.png", new Uint8Array([9]).buffer, "image/png", "stale"),
+    ).rejects.toMatchObject({ name: "PreconditionError", currentEtag: "server" });
+    expect(PreconditionError).toBeTruthy();
+  });
+
+  it("deleteFile DELETEs /file/:path and tolerates a 404", async () => {
+    const f = vi.fn<typeof fetch>().mockResolvedValue(new Response("", { status: 404 }));
+    await expect(makeApi(f).deleteFile("dir/x.png")).resolves.toBeUndefined();
+    expect(f.mock.calls[0]![1]!.method).toBe("DELETE");
+    expect(String(f.mock.calls[0]![0])).toContain("/file/dir/x.png");
+  });
+
+  it("binary methods send the bearer + X-Copal-Vault header", async () => {
+    const f = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(new Response(null, { status: 201, headers: { ETag: '"e"' } }));
+    await makeApi(f, "vlt_bin").putFile("a.png", new Uint8Array([1]).buffer, "image/png");
+    const headers = f.mock.calls[0]![1]!.headers as Record<string, string>;
+    expect(headers.authorization).toBe("Bearer tok");
+    expect(headers["X-Copal-Vault"]).toBe("vlt_bin");
   });
 });

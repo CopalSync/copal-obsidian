@@ -1,4 +1,6 @@
 import type { SyncApi } from "../sync/api";
+import { type BinarySync, isAttachmentPath } from "../sync/binary-sync";
+import { conflictName } from "../sync/conflict-name";
 import type { MutationQueue } from "../sync/mutation-queue";
 import type { VaultWriter } from "../sync/vault";
 import { CrdtNote, type YTransport } from "./crdt-note";
@@ -13,6 +15,9 @@ export interface CrdtSyncDeps {
   /** Durable pending-mutation queue: an offline/failed delete is queued here + replayed on reconnect /
    *  reconcile, so a fully-offline delete is guaranteed-delivered instead of silently lost. */
   queue?: MutationQueue;
+  /** File-level last-writer-wins sync for non-`.md` attachments. The CRDT engine is markdown-only, so a
+   *  binary journal entry / manifest path is routed here instead of the (text) CRDT — the quarantine seam. */
+  binarySync?: BinarySync;
   /** Create a connected transport to a note's YNoteDO. Injected for tests; default mints a ticket + WS. */
   transportFor?: (path: string) => Promise<YTransport>;
   /** Bind the active editor to the connected peer's Y.Text once synced (main.ts supplies this). */
@@ -108,13 +113,20 @@ export class CrdtSync {
   }
 
   /** A remote change to a non-active note → transient op-sync into its persisted doc + materialize. */
-  async onRemoteChange(change: { path: string; op: "put" | "delete" }): Promise<void> {
+  async onRemoteChange(change: {
+    path: string;
+    op: "put" | "delete";
+    version?: string;
+  }): Promise<void> {
     if (this.active?.path === change.path) return; // the editor binding owns the live note
     // The CRDT engine is markdown-only (Yjs text). A non-.md journal entry (e.g. a binary written via
-    // WebDAV/MCP) must never be CRDT-pulled as text — quarantine it. This is the seam where Phase-B binary
-    // sync will route such paths to a file-level (last-writer-wins) transport instead.
+    // WebDAV/MCP/another device) must never be CRDT-pulled as text — route an attachment to the file-level
+    // last-writer-wins transport (BinarySync) instead; anything else (e.g. config) is skipped.
     if (!isMarkdownPath(change.path)) {
-      this.deps.log?.(`skipping non-markdown remote change: ${change.path}`);
+      if (this.deps.binarySync && isAttachmentPath(change.path)) {
+        return this.deps.binarySync.onRemoteChange(change);
+      }
+      this.deps.log?.(`skipping non-syncable remote change: ${change.path}`);
       return;
     }
     if (change.op === "delete") {
@@ -142,7 +154,9 @@ export class CrdtSync {
     try {
       await this.deps.api.deleteNote(path);
     } catch (err) {
-      this.deps.log?.(`delete propagate failed for ${path}: ${err instanceof Error ? err.message : err}`);
+      this.deps.log?.(
+        `delete propagate failed for ${path}: ${err instanceof Error ? err.message : err}`,
+      );
       // Durably queue the intent so it's replayed on reconnect — a fully-offline delete must not be lost.
       if (this.deps.queue) {
         this.deps.queue.enqueueDelete(path);
@@ -219,7 +233,8 @@ export class CrdtSync {
         /* deleteLocal already queued the delete + kept the doc; the new path uploads below */
       }
     }
-    if (wasActive) await this.open(newPath); // rebind the editor to the (rekeyed) new doc → converges w/ server
+    if (wasActive)
+      await this.open(newPath); // rebind the editor to the (rekeyed) new doc → converges w/ server
     else await this.syncOnce(newPath); // establish/converge the new-path local doc
   }
 
@@ -369,6 +384,15 @@ export class CrdtSync {
         await this.deps.registry.destroy(path); // drop the persisted local doc so it can't re-push
       }),
     );
+    // Seam: the same manifest, partitioned by extension. Attachments (non-`.md`) are NEVER in the CRDT
+    // sets above (`vault.list()` is markdown-only), so they can't reach `syncOnce` — they reconcile on the
+    // file-level LWW channel instead, which persists its own known-etag cursor.
+    if (this.deps.binarySync) {
+      const binaryEntries = manifest
+        .filter((e) => isAttachmentPath(e.path))
+        .map((e) => ({ path: e.path, version: e.version }));
+      await this.deps.binarySync.reconcile(binaryEntries, mode);
+    }
     return { knownServer: [...serverPaths], head };
   }
 
@@ -392,15 +416,6 @@ export class CrdtSync {
  *  binary-sync seam) so a binary never gets pulled through the text CRDT and corrupted. */
 function isMarkdownPath(path: string): boolean {
   return path.endsWith(".md");
-}
-
-/** `dir/note.md` → `dir/note (conflicted copy).md` — the label for a first-import keep-both. */
-function conflictName(path: string): string {
-  const dot = path.lastIndexOf(".");
-  const slash = path.lastIndexOf("/");
-  return dot > slash
-    ? `${path.slice(0, dot)} (conflicted copy)${path.slice(dot)}`
-    : `${path} (conflicted copy)`;
 }
 
 /** Max concurrent first-import syncs during reconcile (bounded so a big vault doesn't open N sockets). */

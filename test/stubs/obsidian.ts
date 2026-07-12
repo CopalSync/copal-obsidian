@@ -35,6 +35,31 @@ export class Notice {
   constructor(_message: string) {}
 }
 
+// A swappable `requestUrl` (Obsidian's CORS-free native request) so the fetch-adapter unit test can drive
+// controlled responses. `__setRequestUrl` replaces the implementation the exported `requestUrl` delegates to.
+export interface RequestUrlParam {
+  url: string;
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string | ArrayBuffer;
+  throw?: boolean;
+}
+export interface RequestUrlResponse {
+  status: number;
+  headers: Record<string, string>;
+  arrayBuffer: ArrayBuffer;
+  text: string;
+  json: unknown;
+}
+let requestUrlImpl: (p: RequestUrlParam) => Promise<RequestUrlResponse> = () =>
+  Promise.reject(new Error("requestUrl not stubbed in this test"));
+export function __setRequestUrl(fn: (p: RequestUrlParam) => Promise<RequestUrlResponse>): void {
+  requestUrlImpl = fn;
+}
+export function requestUrl(p: RequestUrlParam): Promise<RequestUrlResponse> {
+  return requestUrlImpl(p);
+}
+
 export class ButtonComponent {
   onClickCb: (() => void) | undefined;
   setButtonText(_t: string): this {
