@@ -28,6 +28,7 @@ import { SyncClient } from "./sync/live";
 import { type MutationData, MutationQueue } from "./sync/mutation-queue";
 import { ObsidianVault } from "./sync/obsidian-vault";
 import { requestUrlFetch } from "./sync/request-url-fetch";
+import { safePath } from "./sync/safe-path";
 import { type SyncData, SyncState } from "./sync/state";
 import { confirmModal } from "./ui/confirm";
 import { openExternal } from "./ui/external-link";
@@ -86,6 +87,7 @@ export default class CopalPlugin extends Plugin {
   private binaryCursor: BinaryCursor | undefined;
   private binaryQueue: MutationQueue | undefined;
   private registry: LocalNoteRegistry | undefined;
+  private readonly warnedNames = new Set<string>();
   private statusEl: HTMLElement | undefined;
   private syncIconEl: HTMLElement | undefined;
   private ribbonIconEl: HTMLElement | undefined;
@@ -253,7 +255,14 @@ export default class CopalPlugin extends Plugin {
     // Live CRDT sync for the active note. Opening a note connects its Y.Doc + binds the editor.
     this.registerEvent(
       this.app.workspace.on("file-open", (file) => {
-        if (this.syncActive && file && file.extension === "md") void this.crdt?.open(file.path);
+        if (!this.syncActive || !file || file.extension !== "md") return;
+        // A control char in the filename (e.g. a newline from a shared social post) can't sync — tell the
+        // user (once per name) to rename it, instead of silently not syncing. `crdt.open` skips it either way.
+        if (safePath(file.path) === null) {
+          this.warnUnsyncableName(file.path);
+          return;
+        }
+        void this.crdt?.open(file.path);
       }),
     );
 
@@ -319,6 +328,18 @@ export default class CopalPlugin extends Plugin {
 
   private isSyncable(path: string): boolean {
     return path.endsWith(".md");
+  }
+
+  /** Tell the user (once per name) that a file can't sync because its name has an invalid character
+   *  (e.g. a line break from a shared social post) — so the failure is actionable, not a silent mystery. */
+  private warnUnsyncableName(path: string): void {
+    if (this.warnedNames.has(path)) return;
+    this.warnedNames.add(path);
+    new Notice(
+      `Copal: "${path}" can't sync — its name contains an invalid character (e.g. a line break). ` +
+        `Rename it to sync.`,
+      8000,
+    );
   }
 
   private onVaultChange(file: TAbstractFile): void {

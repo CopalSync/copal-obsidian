@@ -2,6 +2,7 @@ import type { SyncApi } from "../sync/api";
 import { type BinarySync, isAttachmentPath } from "../sync/binary-sync";
 import { conflictName } from "../sync/conflict-name";
 import type { MutationQueue } from "../sync/mutation-queue";
+import { safePath } from "../sync/safe-path";
 import type { VaultWriter } from "../sync/vault";
 import { CrdtNote, type YTransport } from "./crdt-note";
 import type { LocalNote } from "./local-note";
@@ -67,7 +68,14 @@ export class CrdtSync {
   /** Open the active note: connect its persisted local doc to the DO (op-exchange) + bind the editor. */
   async open(path: string): Promise<void> {
     if (this.active?.path === path) return;
-    await this.close();
+    await this.close(); // unbind the previous note first, even if the new one turns out unsyncable
+    // A control char in the filename (e.g. a newline from a shared social post) can't be routed over HTTP,
+    // so the /ycrdt WS 404s and the transport would reconnect-loop forever. Skip it — the note stays a
+    // plain local file (edits don't sync) rather than taking the whole connection down.
+    if (safePath(path) === null) {
+      this.deps.log?.(`skipping unsyncable path (invalid characters in name): ${path}`);
+      return;
+    }
     const { note, whenLoaded } = this.deps.registry.note(path);
     await whenLoaded; // the persisted history must be loaded before we send our state vector
     const transport = await this.transportFor(path);
@@ -246,6 +254,8 @@ export class CrdtSync {
     adopt = false,
   ): Promise<void> {
     if (this.active?.path === path) return Promise.resolve();
+    // Never transient-sync an unroutable path (control chars in the name) — its /ycrdt WS would 404-loop.
+    if (safePath(path) === null) return Promise.resolve();
     const existing = this.inFlight.get(path);
     if (existing) return existing;
     const p = this.doSync(path, applyFileText, settleMs, adopt).finally(() =>

@@ -1,10 +1,24 @@
 import { describe, expect, it, vi } from "vitest";
 import { PreconditionError, type SyncApi } from "../../src/sync/api";
 import { BinaryCursor } from "../../src/sync/binary-cursor";
-import { BinarySync } from "../../src/sync/binary-sync";
+import { BinarySync, isAttachmentPath } from "../../src/sync/binary-sync";
 import { fnv1a } from "../../src/sync/fnv";
 import { MutationQueue } from "../../src/sync/mutation-queue";
 import { InMemoryBinaryVault } from "./fake-binary-vault";
+
+describe("isAttachmentPath", () => {
+  it("accepts a normal non-.md file", () => {
+    expect(isAttachmentPath("assets/diagram.png")).toBe(true);
+  });
+  it("rejects .md, .obsidian config, and trash", () => {
+    expect(isAttachmentPath("note.md")).toBe(false);
+    expect(isAttachmentPath(".obsidian/app.json")).toBe(false);
+    expect(isAttachmentPath(".trash/old.png")).toBe(false);
+  });
+  it("rejects a name with control characters (unroutable over HTTP → would 404-loop)", () => {
+    expect(isAttachmentPath("photo (@x)\n18 likes.png")).toBe(false);
+  });
+});
 
 const buf = (arr: number[]) => new Uint8Array(arr).buffer;
 

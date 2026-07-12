@@ -4,6 +4,7 @@ import { type BinaryFiles, mimeForPath } from "./binary-vault";
 import { conflictName } from "./conflict-name";
 import { fnv1a } from "./fnv";
 import type { MutationQueue } from "./mutation-queue";
+import { safePath } from "./safe-path";
 
 /** One server entry for reconcile: an attachment path + its R2 etag (the manifest `version`). */
 export interface BinaryManifestEntry {
@@ -27,7 +28,14 @@ export interface BinarySyncDeps {
  * attachments-only — plugin/theme config never leaves the device.
  */
 export function isAttachmentPath(path: string): boolean {
-  return !path.endsWith(".md") && !path.startsWith(".obsidian/") && !path.startsWith(".trash/");
+  return (
+    !path.endsWith(".md") &&
+    !path.startsWith(".obsidian/") &&
+    !path.startsWith(".trash/") &&
+    // A control char in the name (e.g. from a shared social post) can't be routed over HTTP — the /file
+    // request 404s — so it's not syncable; skip it rather than retry-loop.
+    safePath(path) !== null
+  );
 }
 
 /** Max concurrent transfers during reconcile (bounded so a big vault doesn't open N requests at once). */

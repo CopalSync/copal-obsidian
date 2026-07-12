@@ -151,6 +151,21 @@ describe("CrdtSync (local-first op-sync)", () => {
     expect(vault.snapshot()["x.md"]).toBe("from agent");
   });
 
+  // A filename with a control char (e.g. a newline from a shared social post) can't be routed over HTTP —
+  // the /ycrdt WS 404s and the client would reconnect-loop forever. It must be skipped, so one bad-named
+  // note never opens a socket / breaks the rest of the vault's sync.
+  it("open() skips a path with control characters — never opens a socket for an unsyncable filename", async () => {
+    const { crdt, serverDocs } = makeSync({});
+    await crdt.open("EmDash CMS (@x)\n18 likes.md");
+    expect(serverDocs.has("EmDash CMS (@x)\n18 likes.md")).toBe(false); // no transport/DO connection
+  });
+
+  it("onLocalChange skips a control-character path (never transient-syncs an unsyncable filename)", async () => {
+    const { crdt, serverDocs } = makeSync({});
+    await crdt.onLocalChange("bad\nname.md", "text");
+    expect(serverDocs.has("bad\nname.md")).toBe(false);
+  });
+
   it("quarantines a non-markdown remote change — never CRDT-pulls a binary path as text", async () => {
     const { crdt, serverDocs, vault } = makeSync({});
     const serverDoc = new Y.Doc();
