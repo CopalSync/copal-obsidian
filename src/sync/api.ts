@@ -1,6 +1,10 @@
 import { API_BASE } from "../connect/oauth";
 import { parseBatch, parseChangesResponse, parseManifest } from "./validate";
 
+/** Safety cap on manifest pages (1000 pages × ~1000 objects = ~1M files) so a misbehaving server can't
+ *  spin the paging loop forever. Far above any real vault. */
+const MAX_MANIFEST_PAGES = 1000;
+
 export interface ManifestEntry {
   path: string;
   version: string;
@@ -100,11 +104,28 @@ export class SyncApi {
     return (await res.json()) as Vault;
   }
 
-  /** Full manifest of the vault (all paths + versions) — the authoritative fresh/initial state. */
+  /** Full manifest of the vault (every path + version) — the authoritative fresh/initial state. The server
+   *  pages it with a cursor, so loop until there's no `cursor`; that way a vault of ANY size fully syncs
+   *  (not just the first page). `head` anchors `lastSeq` to the snapshot start, so keep page 1's value. */
   async manifest(): Promise<{ head: number; manifest: ManifestEntry[] }> {
-    const res = await this.authed("/sync/changes?since=0");
-    if (!res.ok) throw new Error(`manifest failed: ${res.status}`);
-    return parseManifest(await res.json()); // validate + drop any unsafe (traversal) paths
+    const all: ManifestEntry[] = [];
+    let head = 0;
+    let cursor: string | undefined;
+    let pages = 0;
+    do {
+      const query =
+        cursor === undefined ? "since=0" : `since=0&cursor=${encodeURIComponent(cursor)}`;
+      // oxlint-disable-next-line no-await-in-loop -- pages are inherently sequential (each needs the prior cursor)
+      const res = await this.authed(`/sync/changes?${query}`);
+      if (!res.ok) throw new Error(`manifest failed: ${res.status}`);
+      // oxlint-disable-next-line no-await-in-loop
+      const page = parseManifest(await res.json()); // validate + drop any unsafe (traversal) paths
+      if (cursor === undefined) head = page.head; // page 1 anchors the cursor
+      all.push(...page.manifest);
+      cursor = page.cursor;
+      pages += 1;
+    } while (cursor !== undefined && pages < MAX_MANIFEST_PAGES);
+    return { head, manifest: all };
   }
 
   /** The journal delta after `since`. */

@@ -42,8 +42,13 @@ export function parseChange(x: unknown): Change | null {
   return change;
 }
 
-/** Validate a `{ head, manifest[] }` response; drops entries without a safe string path. */
-export function parseManifest(x: unknown): { head: number; manifest: ManifestEntry[] } {
+/** Validate a `{ head, manifest[], cursor? }` page; drops entries without a safe string path. A non-empty
+ *  string `cursor` signals more pages remain (the manifest is cursor-paged so any vault size fully syncs). */
+export function parseManifest(x: unknown): {
+  head: number;
+  manifest: ManifestEntry[];
+  cursor?: string;
+} {
   if (!isRecord(x)) return { head: 0, manifest: [] };
   const manifest: ManifestEntry[] = [];
   if (Array.isArray(x.manifest)) {
@@ -59,7 +64,11 @@ export function parseManifest(x: unknown): { head: number; manifest: ManifestEnt
       });
     }
   }
-  return { head: num(x.head), manifest };
+  return {
+    head: num(x.head),
+    manifest,
+    ...(typeof x.cursor === "string" && x.cursor !== "" ? { cursor: x.cursor } : {}),
+  };
 }
 
 /** Validate a `{ head, changes[] }` delta; filters malformed frames, preserves order. */

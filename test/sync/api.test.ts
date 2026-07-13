@@ -26,6 +26,33 @@ describe("SyncApi", () => {
     expect((init!.headers as Record<string, string>).authorization).toBe("Bearer tok");
   });
 
+  it("manifest() pages through cursors and assembles the full list (head from page 1)", async () => {
+    const f = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        json({
+          full: true,
+          head: 9,
+          manifest: [{ path: "a.md", version: "v1", size: 1, mtime: 1 }],
+          cursor: "C1",
+        }),
+      )
+      .mockResolvedValueOnce(
+        json({
+          full: true,
+          head: 0,
+          manifest: [{ path: "b.md", version: "v2", size: 1, mtime: 1 }],
+        }),
+      );
+    const m = await makeApi(f).manifest();
+    expect(m.head).toBe(9); // anchored to page 1, not the later page's 0
+    expect(m.manifest.map((e) => e.path)).toEqual(["a.md", "b.md"]);
+    expect(String(f.mock.calls[0]![0])).toContain("/sync/changes?since=0");
+    expect(String(f.mock.calls[0]![0])).not.toContain("cursor");
+    expect(String(f.mock.calls[1]![0])).toContain("cursor=C1");
+    expect(f).toHaveBeenCalledTimes(2); // stops once the last page returns no cursor
+  });
+
   it("manifest() drops malformed / unsafe-path entries (server-response validation)", async () => {
     const f = vi.fn<typeof fetch>().mockResolvedValue(
       json({
