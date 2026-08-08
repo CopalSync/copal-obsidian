@@ -1,5 +1,5 @@
 import { API_BASE } from "../connect/oauth";
-import { parseBatch, parseChangesResponse, parseManifest } from "./validate";
+import { parseBatch, parseChangesResponse, parseManifest, parseSearch } from "./validate";
 
 /** Safety cap on manifest pages (1000 pages × ~1000 objects = ~1M files) so a misbehaving server can't
  *  spin the paging loop forever. Far above any real vault. */
@@ -36,6 +36,16 @@ export interface Vault {
   displayName: string;
   createdAt: number;
 }
+
+/** One search result from `GET /search` — no relevance score is exposed; order IS the ranking. */
+export interface SearchHit {
+  path: string;
+  title: string;
+  snippet: string;
+}
+
+/** Search mode: by-meaning (semantic), exact (keyword), or both fused (hybrid). */
+export type SearchMode = "semantic" | "keyword" | "hybrid";
 
 /** A binary attachment's bytes + metadata, as read from `GET /file`. `etag` is unquoted (matches the
  *  manifest `version`), so it round-trips as the `If-Match` token on the next `putFile`. */
@@ -126,6 +136,24 @@ export class SyncApi {
       pages += 1;
     } while (cursor !== undefined && pages < MAX_MANIFEST_PAGES);
     return { head, manifest: all };
+  }
+
+  /** Search the vault against the server-side index: `GET /search?q=&mode=&limit=`. `mode` defaults to the
+   *  server default (keyword) when omitted; the search pane sends `semantic` for by-meaning search. Returns
+   *  validated `{ path, title, snippet }` hits (unsafe paths dropped), server order preserved (= relevance). */
+  async search(query: string, opts?: { mode?: SearchMode; limit?: number }): Promise<SearchHit[]> {
+    const params = new URLSearchParams({ q: query });
+    if (opts?.mode !== undefined) params.set("mode", opts.mode);
+    if (opts?.limit !== undefined) params.set("limit", String(opts.limit));
+    // A mobile webview was serving a stale cached response (missing freshly-indexed notes). Defeat it on
+    // every layer: a unique URL per request (cache-buster) + a no-cache request header (forces revalidation
+    // even if a cache ignores the query). The server also sends `Cache-Control: no-store`.
+    params.set("_", String(Date.now()));
+    const res = await this.authed(`/search?${params.toString()}`, {
+      headers: { "cache-control": "no-cache" },
+    });
+    if (!res.ok) throw new Error(`search failed: ${res.status}`);
+    return parseSearch(await res.json());
   }
 
   /** The journal delta after `since`. */

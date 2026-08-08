@@ -5,25 +5,13 @@
   "type": "module",
   "scripts": {
     "dev": "node esbuild.config.mjs",
-    "build": "tsgo --noEmit && node esbuild.config.mjs production",
-    "typecheck": "tsgo --noEmit",
+    "build": "tsc --noEmit && node esbuild.config.mjs production",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "oxlint",
     "format": "oxfmt",
     "format:check": "oxfmt --check"
-  },
-  "devDependencies": {
-    "@types/node": "^26.0.1",
-    "@typescript/native-preview": "7.0.0-dev.20260619.1",
-    "builtin-modules": "^4.0.0",
-    "esbuild": "^0.25.0",
-    "fake-indexeddb": "^6.2.5",
-    "obsidian": "^1.7.2",
-    "oxfmt": "0.55.0",
-    "oxlint": "1.70.0",
-    "typescript": "6.0.3",
-    "vitest": "4.1.9"
   },
   "dependencies": {
     "@codemirror/state": "^6.7.1",
@@ -33,5 +21,16 @@
     "y-indexeddb": "^9.0.12",
     "y-protocols": "^1.0.7",
     "yjs": "^13.6.31"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.1",
+    "builtin-modules": "^4.0.0",
+    "esbuild": "^0.25.0",
+    "fake-indexeddb": "^6.2.5",
+    "obsidian": "^1.7.2",
+    "oxfmt": "0.55.0",
+    "oxlint": "1.70.0",
+    "typescript": "7.0.2",
+    "vitest": "4.1.9"
   }
 }

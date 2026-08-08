@@ -245,3 +245,41 @@ describe("SyncApi binary files (E3)", () => {
     expect(headers["X-Copal-Vault"]).toBe("vlt_bin");
   });
 });
+
+describe("SyncApi.search", () => {
+  it("GETs /search with q + mode + limit and a bearer, returning validated hits", async () => {
+    const f = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(json([{ path: "a.md", title: "A", snippet: "a bird" }]));
+    const hits = await makeApi(f).search("bird of prey", { mode: "semantic", limit: 20 });
+    expect(hits).toEqual([{ path: "a.md", title: "A", snippet: "a bird" }]);
+    const [url, init] = f.mock.calls[0]!;
+    const parsed = new URL(String(url));
+    expect(parsed.pathname).toBe("/search");
+    expect(parsed.searchParams.get("q")).toBe("bird of prey");
+    expect(parsed.searchParams.get("mode")).toBe("semantic");
+    expect(parsed.searchParams.get("limit")).toBe("20");
+    expect((init!.headers as Record<string, string>).authorization).toBe("Bearer tok");
+  });
+
+  it("defaults to no mode param when unspecified (server default)", async () => {
+    const f = vi.fn<typeof fetch>().mockResolvedValue(json([]));
+    await makeApi(f).search("x");
+    expect(new URL(String(f.mock.calls[0]![0])).searchParams.has("mode")).toBe(false);
+  });
+
+  it("drops hits with an unsafe path defensively", async () => {
+    const f = vi.fn<typeof fetch>().mockResolvedValue(
+      json([
+        { path: "../evil", title: "x", snippet: "y" },
+        { path: "ok.md", title: "O", snippet: "k" },
+      ]),
+    );
+    expect((await makeApi(f).search("q")).map((h) => h.path)).toEqual(["ok.md"]);
+  });
+
+  it("throws on a non-ok response", async () => {
+    const f = vi.fn<typeof fetch>().mockResolvedValue(json({ error: "boom" }, 500));
+    await expect(makeApi(f).search("q")).rejects.toThrow();
+  });
+});

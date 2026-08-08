@@ -1,4 +1,4 @@
-import type { Change, ManifestEntry, NoteContent } from "./api";
+import type { Change, ManifestEntry, NoteContent, SearchHit } from "./api";
 import { safePath } from "./safe-path";
 
 /**
@@ -82,6 +82,23 @@ export function parseChangesResponse(x: unknown): { head: number; changes: Chang
     }
   }
   return { head: num(x.head), changes };
+}
+
+/** Validate a `GET /search` response (`{ path, title, snippet }[]`); drops any hit whose path is unsafe. */
+export function parseSearch(x: unknown): SearchHit[] {
+  if (!Array.isArray(x)) return [];
+  const hits: SearchHit[] = [];
+  for (const h of x) {
+    if (!isRecord(h)) continue;
+    const path = safeStr(h.path);
+    if (path === null) continue;
+    hits.push({
+      path,
+      title: typeof h.title === "string" ? h.title : path,
+      snippet: typeof h.snippet === "string" ? h.snippet : "",
+    });
+  }
+  return hits;
 }
 
 /** Validate a `/sync/batch` GET response; keeps only found notes with a safe path + string content. */

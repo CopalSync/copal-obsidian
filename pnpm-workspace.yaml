@@ -1,0 +1,13 @@
+# Native build scripts this project allows to run on install.
+#
+# pnpm 11 honors `allowBuilds`; pnpm 9/10 honor `onlyBuiltDependencies`. Both are emitted so the
+# project installs cleanly on either (each ignores the other key) — the same shape the four Worker
+# apps use.
+#
+# esbuild bundles the plugin (esbuild.config.mjs), so without this `pnpm build` fails outright with
+# ERR_PNPM_IGNORED_BUILDS. It was left as the scaffold's literal placeholder text, which is not a
+# boolean and not an approval, so the build only worked where a warm node_modules already existed.
+allowBuilds:
+  esbuild: true
+onlyBuiltDependencies:
+  - esbuild

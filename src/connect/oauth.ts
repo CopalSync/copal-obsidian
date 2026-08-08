@@ -10,8 +10,50 @@ interface Discovery {
   token_endpoint: string;
 }
 
+/** The MCP resource this plugin authenticates against — the identifier tokens are minted for. */
+const MCP_RESOURCE = `${API_BASE}/mcp`;
+
+interface ProtectedResource {
+  authorization_servers?: string[];
+}
+
+/**
+ * Fetch the RFC 9728 protected-resource document for `MCP_RESOURCE`.
+ *
+ * Two candidates, in order. RFC 9728 builds the metadata URL by inserting the well-known segment
+ * **between host and path**, so a resource with a path (`/mcp`) publishes at
+ * `/.well-known/oauth-protected-resource/mcp`. Older gateways served only the bare path, so that
+ * is the fallback — which keeps connect working either side of the deploy that moves it.
+ */
+async function protectedResource(f: typeof fetch): Promise<ProtectedResource> {
+  const path = new URL(MCP_RESOURCE).pathname.replace(/\/+$/, "");
+  for (const url of [
+    `${API_BASE}/.well-known/oauth-protected-resource${path}`,
+    `${API_BASE}/.well-known/oauth-protected-resource`,
+  ]) {
+    const res = await f(url);
+    if (res.ok) return (await res.json()) as ProtectedResource;
+  }
+  throw new Error("discovery failed: the server published no protected-resource metadata");
+}
+
+/**
+ * Find the authorization server, then read its metadata.
+ *
+ * The gateway is a RESOURCE server: it does not issue tokens and does not serve
+ * `/.well-known/oauth-authorization-server` — asking it for one 404s. Which host IS the
+ * authorization server is something only the protected-resource document can say, so this follows
+ * it rather than assuming. Assuming is exactly what broke connect when the two moved apart.
+ */
 export async function discover(f: typeof fetch): Promise<Discovery> {
-  const res = await f(`${API_BASE}/.well-known/oauth-authorization-server`);
+  const { authorization_servers: servers } = await protectedResource(f);
+  const issuer = servers?.[0];
+  if (issuer === undefined) {
+    throw new Error("discovery failed: the resource names no authorization server");
+  }
+  const res = await f(
+    `${issuer.replace(/\/+$/, "")}/.well-known/oauth-authorization-server`,
+  );
   if (!res.ok) throw new Error(`discovery failed: ${res.status}`);
   return (await res.json()) as Discovery;
 }
@@ -26,6 +68,10 @@ export async function registerClient(
     body: JSON.stringify({
       client_name: "Copal for Obsidian",
       redirect_uris: [REDIRECT_URI],
+      // `obsidian://copal-connect` is a custom scheme, not HTTPS. OIDC defaults application_type
+      // to "web", which forbids that, so a native client that leaves this out is refused at
+      // registration — and MCP 2026-07-28 requires clients to declare it.
+      application_type: "native",
       token_endpoint_auth_method: "none",
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],

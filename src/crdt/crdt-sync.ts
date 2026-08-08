@@ -25,6 +25,10 @@ export interface CrdtSyncDeps {
   bind?: (peer: CrdtNote) => void;
   /** Unbind the editor on close/switch. */
   unbind?: () => void;
+  /** Read the LIVE editor buffer for `path`, but only when it's the note currently open in the editor
+   *  (else `null`). Captures a brand-new note's unsaved keystrokes — which aren't flushed to disk yet — so
+   *  seeding an empty doc from the file (and materialize writing "" back) can't wipe them. */
+  readActiveText?: (path: string) => string | null;
   /** Settle window (ms) to let a transient sync flush + materialize before disconnecting. */
   settleMs?: number;
   log?: (msg: string) => void;
@@ -92,8 +96,13 @@ export class CrdtSync {
    */
   private async seedFromFileIfEmpty(note: LocalNote, path: string): Promise<void> {
     if (note.text().length > 0) return; // the doc already carries history
-    const fileText = await this.readFileSafe(path);
-    if (fileText.length > 0) await note.applyFileEdit(fileText);
+    // Prefer the LIVE editor buffer over the file on disk: a brand-new note the user just started typing
+    // into may not be autosaved yet, so reading the file would miss their keystrokes — and then
+    // `materialize()` would write "" back over the open editor, WIPING them. `readActiveText` returns null
+    // for a non-active note, so we fall back to the file on disk (the correct source for closed notes).
+    const editorText = this.deps.readActiveText?.(path) ?? "";
+    const text = editorText.length > 0 ? editorText : await this.readFileSafe(path);
+    if (text.length > 0) await note.applyFileEdit(text);
   }
 
   private async seedAndBind(path: string, note: LocalNote, peer: CrdtNote): Promise<void> {
@@ -103,7 +112,13 @@ export class CrdtSync {
     await Promise.race([peer.whenSynced(), new Promise((r) => setTimeout(r, SYNC_TIMEOUT_MS))]);
     if (this.active?.path !== path) return;
     await this.reconcileFileAfterSync(note, path, wasEmpty);
-    await note.materialize(); // project the converged doc into the .md
+    // Only write the .md when the live editor is OUT OF SYNC with the doc (i.e. there's remote content to
+    // project down). When we just seeded the doc FROM the editor (a new note), the editor already matches —
+    // writing the file would reload + race the open editor and could clobber the user's keystrokes. The
+    // editor binding + Obsidian's autosave own the file in that case.
+    if (this.deps.readActiveText?.(path) !== note.text()) {
+      await note.materialize(); // project the converged doc into the .md
+    }
     this.deps.bind?.(peer);
   }
 

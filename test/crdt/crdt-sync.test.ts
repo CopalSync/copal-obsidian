@@ -141,6 +141,23 @@ describe("CrdtSync (local-first op-sync)", () => {
     expect(serverText(serverDocs, "n.md")).toBe("hello world");
   });
 
+  it("captures a brand-new note's unsaved editor content on open (never wipes it)", async () => {
+    // Repro of the wipe bug: a NEW note (empty on the server) whose file on disk is still empty because
+    // Obsidian hasn't autosaved the user's keystrokes yet. Seeding from the disk would miss them and
+    // materialize would write "" back over the editor. `readActiveText` exposes the live editor buffer.
+    const typed = "hello I just started typing this";
+    const { crdt, serverDocs } = makeSync(
+      { "fresh.md": "" }, // disk file empty (unsaved)
+      { readActiveText: (p) => (p === "fresh.md" ? typed : null) },
+    );
+
+    await crdt.open("fresh.md");
+
+    // The keystrokes are captured into the doc and synced UP (old behaviour lost them → server stayed "").
+    await waitFor(() => serverText(serverDocs, "fresh.md") === typed);
+    expect(serverText(serverDocs, "fresh.md")).toBe(typed);
+  });
+
   it("onRemoteChange syncs remote ops into the local doc + materializes the .md", async () => {
     const { crdt, serverDocs, vault } = makeSync({});
     const serverDoc = new Y.Doc();

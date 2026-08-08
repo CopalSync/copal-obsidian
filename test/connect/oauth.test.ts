@@ -31,17 +31,69 @@ describe("buildAuthorizeUrl", () => {
   });
 });
 
+// The gateway is a RESOURCE server and does not serve authorization-server metadata — asking it
+// for `/.well-known/oauth-authorization-server` 404s. The authorization server is named by the
+// protected-resource document, and only that document knows which host it is. Hardcoding the
+// answer is what broke connect in production when the two moved apart.
 describe("discover", () => {
-  it("returns the endpoints", async () => {
-    const f = vi.fn<typeof fetch>().mockResolvedValue(
-      jsonResponse({
-        registration_endpoint: "https://api.copal.uk/register",
-        authorization_endpoint: "https://api.copal.uk/authorize",
-        token_endpoint: "https://api.copal.uk/token",
-      }),
-    );
+  const asMetadata = {
+    registration_endpoint: "https://auth.copal.uk/oauth2/register",
+    authorization_endpoint: "https://auth.copal.uk/oauth2/authorize",
+    token_endpoint: "https://auth.copal.uk/oauth2/token",
+  };
+
+  it("follows the protected-resource document to the authorization server", async () => {
+    const f = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          resource: "https://api.copal.uk/mcp",
+          authorization_servers: ["https://auth.copal.uk"],
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse(asMetadata));
+
     const d = await discover(f);
-    expect(d.token_endpoint).toBe("https://api.copal.uk/token");
+
+    expect(d.token_endpoint).toBe("https://auth.copal.uk/oauth2/token");
+    // RFC 9728 inserts the well-known segment between host and path, so the document for the
+    // resource `https://api.copal.uk/mcp` lives under `/.well-known/oauth-protected-resource/mcp`.
+    expect(f.mock.calls[0]![0]).toBe(
+      "https://api.copal.uk/.well-known/oauth-protected-resource/mcp",
+    );
+    // The second hop must go to the host the document named, not to the gateway.
+    expect(f.mock.calls[1]![0]).toBe(
+      "https://auth.copal.uk/.well-known/oauth-authorization-server",
+    );
+  });
+
+  it("falls back to the bare well-known path", async () => {
+    // A gateway that has not yet moved the document to its RFC 9728 location still serves the
+    // bare path, so connect must keep working across that deploy.
+    const f = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse({ error: "not found" }, 404))
+      .mockResolvedValueOnce(
+        jsonResponse({ authorization_servers: ["https://auth.copal.uk"] }),
+      )
+      .mockResolvedValueOnce(jsonResponse(asMetadata));
+
+    const d = await discover(f);
+
+    expect(d.registration_endpoint).toBe("https://auth.copal.uk/oauth2/register");
+    expect(f.mock.calls[1]![0]).toBe("https://api.copal.uk/.well-known/oauth-protected-resource");
+  });
+
+  it("refuses a document that names no authorization server", async () => {
+    const f = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(jsonResponse({ resource: "https://api.copal.uk/mcp" }));
+    await expect(discover(f)).rejects.toThrow(/authorization server/i);
+  });
+
+  it("throws when the resource serves no metadata at either path", async () => {
+    const f = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({ error: "nope" }, 404));
+    await expect(discover(f)).rejects.toThrow();
   });
 });
 
@@ -54,9 +106,14 @@ describe("registerClient", () => {
     const body = JSON.parse(init!.body as string) as {
       redirect_uris: string[];
       token_endpoint_auth_method: string;
+      application_type: string;
     };
     expect(body.redirect_uris).toEqual([REDIRECT_URI]);
     expect(body.token_endpoint_auth_method).toBe("none");
+    // `obsidian://copal-connect` is not HTTPS. OIDC defaults application_type to "web", which
+    // forbids a non-HTTPS redirect, so a native client that omits this is refused outright —
+    // and MCP 2026-07-28 says clients MUST declare it.
+    expect(body.application_type).toBe("native");
   });
 });
 

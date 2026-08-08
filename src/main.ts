@@ -20,7 +20,7 @@ import { discover, refresh } from "./connect/oauth";
 import { type PersistedData, TokenStore } from "./connect/store";
 import type { Tokens } from "./types";
 import { CopalSettingTab } from "./settings";
-import { SyncApi, type Vault } from "./sync/api";
+import { type SearchHit, type SearchMode, SyncApi, type Vault } from "./sync/api";
 import { type BinaryData, BinaryCursor } from "./sync/binary-cursor";
 import { BinarySync, isAttachmentPath } from "./sync/binary-sync";
 import { ObsidianBinaryVault } from "./sync/binary-vault";
@@ -32,6 +32,7 @@ import { safePath } from "./sync/safe-path";
 import { type SyncData, SyncState } from "./sync/state";
 import { confirmModal } from "./ui/confirm";
 import { openExternal } from "./ui/external-link";
+import { COPAL_SEARCH_VIEW, CopalSearchView } from "./ui/search-view";
 import { STATUS_META, type SyncStatus } from "./ui/status";
 
 /** The real Copal logo — the faceted-e amber shard (from copal-web/public/copal-gem.svg), as polygon
@@ -197,6 +198,13 @@ export default class CopalPlugin extends Plugin {
         const view = this.activeEditorView();
         if (view) this.editorBinding.detach(view);
       },
+      // The live editor buffer for `path`, ONLY when it's the note currently open (else null) — so a
+      // brand-new note's unsaved keystrokes are captured into the doc before materialize can wipe them.
+      readActiveText: (path) => {
+        const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (!mdView || mdView.file?.path !== path) return null;
+        return this.activeEditorView()?.state.doc.toString() ?? null;
+      },
       log: (m) => {
         if (debugEnabled()) console.debug(`[copal crdt] ${m}`);
       },
@@ -210,9 +218,7 @@ export default class CopalPlugin extends Plugin {
     this.registerDomEvent(this.statusEl, "click", (evt) => this.showStatusMenu(evt));
     // Ribbon icon — visible on BOTH desktop and mobile (the only sync-status surface on mobile). Reflects
     // the current state and opens the same status menu on click/tap.
-    this.ribbonIconEl = this.addRibbonIcon("cloud-off", "Copal — not connected", (evt) =>
-      this.showStatusMenu(evt),
-    );
+    this.ribbonIconEl = this.addRibbonIcon("cloud-off", "Copal", (evt) => this.showStatusMenu(evt));
     this.ribbonIconEl.addClass("copal-ribbon");
     this.setStatus("idle");
     this.sync = new SyncClient(api, this.crdt, syncState, (s) => this.setStatus(s));
@@ -242,6 +248,24 @@ export default class CopalPlugin extends Plugin {
         });
       },
     });
+
+    // "Search my vault by meaning" pane — humans get the same server-side vector index the agent uses.
+    this.registerView(
+      COPAL_SEARCH_VIEW,
+      (leaf) =>
+        new CopalSearchView(leaf, {
+          searchVault: (q, mode) => this.searchVault(q, mode),
+          isConnected: () => this.store.isConnected(),
+          openNote: (path) => void this.app.workspace.openLinkText(path, "", false),
+        }),
+    );
+    this.addCommand({
+      id: "copal-search",
+      name: "Copal: Search my vault by meaning",
+      callback: () => void this.activateSearchView(),
+    });
+    // A ribbon icon so the pane is reachable on mobile too (where the status bar doesn't render).
+    this.addRibbonIcon("search", "Copal Search", () => void this.activateSearchView());
 
     // Watch local edits to non-active notes and push them into their Y.Doc (transient connect). The
     // active note is owned by the live CM6 binding (ignored here). Obsidian fires a single `rename`
@@ -282,6 +306,29 @@ export default class CopalPlugin extends Plugin {
 
   override onunload(): void {
     this.stopSync();
+  }
+
+  /** Search the connected vault against the server-side index (the search pane). Throws if no vault is
+   *  linked, so the pane can show a connect prompt. `limit` 50 is generous for a sidebar result list. */
+  async searchVault(query: string, mode: SearchMode): Promise<SearchHit[]> {
+    if (!this.api || !(await this.store.isConnected())) {
+      throw new Error("Copal is not connected");
+    }
+    return this.api.search(query, { mode, limit: 50 });
+  }
+
+  /** Reveal the search pane if it's open, else open it in the right sidebar. */
+  private async activateSearchView(): Promise<void> {
+    const existing = this.app.workspace.getLeavesOfType(COPAL_SEARCH_VIEW);
+    if (existing[0]) {
+      await this.app.workspace.revealLeaf(existing[0]);
+      return;
+    }
+    const leaf = this.app.workspace.getRightLeaf(false);
+    if (leaf) {
+      await leaf.setViewState({ type: COPAL_SEARCH_VIEW, active: true });
+      await this.app.workspace.revealLeaf(leaf);
+    }
   }
 
   private onDelete(path: string): void {
@@ -571,22 +618,23 @@ export default class CopalPlugin extends Plugin {
       icon.removeClass("is-off", "is-sync", "is-live");
       icon.addClass(meta.cls);
       setIcon(icon, meta.icon);
-      setTooltip(this.statusEl, `Copal — ${meta.label}`, { placement: "top" });
+      setTooltip(this.statusEl, `Copal: ${meta.label}`, { placement: "top" });
     }
-    // Ribbon (the mobile-visible surface) — null-guarded so an early status can't abort onload.
+    // Ribbon (the mobile-visible surface) — null-guarded so an early status can't abort onload. The label
+    // stays a plain "Copal" (set at creation): the icon colour shows the state, and clicking opens the
+    // status menu. (On mobile the "…" menu shows the creation label, which a later tooltip wouldn't update.)
     const ribbon = this.ribbonIconEl;
     if (ribbon) {
       ribbon.removeClass("is-off", "is-sync", "is-live");
       ribbon.addClass(meta.cls);
       setIcon(ribbon, meta.icon);
-      setTooltip(ribbon, `Copal — ${meta.label}`, { placement: "top" });
     }
   }
 
   /** Clicking the status shows the current state + a Sync-now action. */
   private showStatusMenu(evt: MouseEvent): void {
     const menu = new Menu();
-    menu.addItem((item) => item.setTitle(`Copal — ${this.lastStatusLabel}`).setDisabled(true));
+    menu.addItem((item) => item.setTitle(`Copal: ${this.lastStatusLabel}`).setDisabled(true));
     menu.addItem((item) =>
       item
         .setTitle("Sync now")

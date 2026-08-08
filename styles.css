@@ -115,3 +115,109 @@
 .copal-modal-danger p {
   margin: 4px 0;
 }
+
+/* ── Search-by-meaning pane (right sidebar ItemView) ─────────────────────────────────────────── */
+/* Anchor for the absolutely-positioned pane below. */
+.copal-search-host {
+  position: relative;
+}
+.copal-search {
+  /* Fill the view content via absolute positioning — a percentage height is unreliable when the parent's
+     height comes from flex (Obsidian's mobile view-content), which left dead space + clipped the results
+     when the keyboard resized the pane. `inset: 0` always fills the (correctly-sized) positioned parent. */
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 8px 12px 12px;
+  gap: 10px;
+  overflow: hidden;
+}
+.copal-search-header {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: none;
+}
+.copal-search-input {
+  width: 100%;
+}
+.copal-search-modes {
+  display: flex;
+  gap: 6px;
+}
+.copal-search-mode {
+  flex: 1;
+  padding: 4px 8px;
+  font-size: var(--font-ui-smaller);
+  border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.copal-search-mode.is-active {
+  border-color: #ef9f2c;
+  color: var(--text-normal);
+  background: var(--background-primary);
+}
+.copal-search-results {
+  flex: 1;
+  /* Flexbox: a flex child defaults to min-height:auto (its content height), so without this the results
+     won't shrink when the keyboard opens — they overflow behind it (clipped mid-result) instead of
+     scrolling within the visible pane. */
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch; /* momentum touch scrolling on iOS */
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  /* A little runway so the last result can always scroll clear of the on-screen keyboard. */
+  padding-bottom: 8px;
+}
+.copal-search-empty,
+.copal-search-loading {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  padding: 12px 4px;
+  text-align: center;
+}
+.copal-search-hit {
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+  cursor: pointer;
+}
+.copal-search-hit:hover {
+  background: var(--background-modifier-hover);
+}
+.copal-search-hit-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  color: var(--text-normal);
+}
+.copal-search-hit-icon {
+  display: inline-flex;
+  color: var(--text-muted);
+}
+.copal-search-hit-path {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  margin-top: 2px;
+  word-break: break-word;
+}
+.copal-search-hit-snippet {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  margin-top: 4px;
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
