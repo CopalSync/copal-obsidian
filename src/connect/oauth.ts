@@ -1,7 +1,21 @@
 import type { ClientReg, PkcePair, Tokens } from "../types";
 
 export const API_BASE = "https://api.copal.uk";
-export const REDIRECT_URI = "obsidian://copal-connect";
+/**
+ * Where the authorization server sends the code — an https URL, NOT `obsidian://copal-connect`.
+ *
+ * A private-use scheme can be claimed by any installed app, so the OS cannot say who owns
+ * `obsidian://` and a malicious app could intercept the code. RFC 8252 §7.1 therefore wants a
+ * reverse-domain scheme the author controls, and `@better-auth/oauth-provider` 1.7 enforces that,
+ * refusing to register `obsidian://…` at all. Obsidian only routes its own scheme, so the
+ * reverse-domain form is unavailable — leaving the option RFC 8252 §7.2 prefers anyway: redirect
+ * to a domain we control and let it forward inward.
+ *
+ * `copal.uk/plugin/connect` forwards the code straight to `obsidian://copal-connect`, so the
+ * protocol handler below is unchanged. PKCE still protects the exchange: the verifier never leaves
+ * this plugin, so a code seen in the browser is not redeemable by anyone else.
+ */
+export const REDIRECT_URI = "https://copal.uk/plugin/connect";
 export const SCOPE = "vault.read vault.write";
 
 interface Discovery {
@@ -68,9 +82,9 @@ export async function registerClient(
     body: JSON.stringify({
       client_name: "Copal for Obsidian",
       redirect_uris: [REDIRECT_URI],
-      // `obsidian://copal-connect` is a custom scheme, not HTTPS. OIDC defaults application_type
-      // to "web", which forbids that, so a native client that leaves this out is refused at
-      // registration — and MCP 2026-07-28 requires clients to declare it.
+      // Truthful, and MCP 2026-07-28 requires clients to declare it. `web` would also be accepted
+      // now that REDIRECT_URI is https, but this is a native app and the distinction is what the
+      // server uses to decide which redirect shapes are legal for it.
       application_type: "native",
       token_endpoint_auth_method: "none",
       grant_types: ["authorization_code", "refresh_token"],

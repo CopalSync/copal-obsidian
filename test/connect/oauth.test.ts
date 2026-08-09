@@ -98,7 +98,7 @@ describe("discover", () => {
 });
 
 describe("registerClient", () => {
-  it("posts a public loopback-free client registration and returns the id", async () => {
+  it("registers against the https bounce, not obsidian:// — which 1.7 refuses outright", async () => {
     const f = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({ client_id: "abc123" }, 201));
     const reg = await registerClient(f, "https://api.copal.uk/register");
     expect(reg.client_id).toBe("abc123");
@@ -108,11 +108,12 @@ describe("registerClient", () => {
       token_endpoint_auth_method: string;
       application_type: string;
     };
+    // A private-use scheme can be claimed by any app, so RFC 8252 §7.1 wants a reverse-domain one
+    // and better-auth 1.7 enforces it — `obsidian://copal-connect` is rejected at registration.
+    // copal.uk/plugin/connect forwards the code inward instead.
     expect(body.redirect_uris).toEqual([REDIRECT_URI]);
+    expect(REDIRECT_URI).toBe("https://copal.uk/plugin/connect");
     expect(body.token_endpoint_auth_method).toBe("none");
-    // `obsidian://copal-connect` is not HTTPS. OIDC defaults application_type to "web", which
-    // forbids a non-HTTPS redirect, so a native client that omits this is refused outright —
-    // and MCP 2026-07-28 says clients MUST declare it.
     expect(body.application_type).toBe("native");
   });
 });
