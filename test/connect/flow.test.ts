@@ -100,3 +100,63 @@ describe("ConnectFlow", () => {
 		expect(new URL(openUrl.mock.calls[0]![0]).searchParams.get("client_id")).toBe("existing");
 	});
 });
+
+/**
+ * ⛔ THE DEAD-END THIS EXISTS TO PREVENT.
+ *
+ * A stored registration the server has forgotten could not be recovered from inside the plugin:
+ * `/oauth2/authorize` refuses an unknown client BEFORE it will redirect anywhere that client
+ * nominated, so the failure never reaches `handleCallback`; and `clientId` is deliberately kept
+ * across disconnects, so reconnecting reused the same dead id. The only exit was deleting
+ * `data.json` by hand.
+ *
+ * Measured against production 2026-09-11: an unknown client returns `invalid_client` with the
+ * message **"client_id is required"**, which reads like a missing parameter. A genuinely missing
+ * one returns `invalid_request` / "client_id: client_id is required". That wording is why this took
+ * a while to find, and it is why the recovery cannot depend on reading the error.
+ */
+describe("ConnectFlow — recovering from a registration the server has forgotten", () => {
+	it("re-registers when the previous attempt never came back", async () => {
+		const store = memStore();
+		await store.setClientId("dead-client-from-before-the-reset");
+		await store.setConnectAttemptPending(true);
+
+		const f = discovery(vi.fn<typeof fetch>()).mockResolvedValueOnce(
+			json({ client_id: "fresh" }, 201),
+		);
+		const openUrl = vi.fn<(u: string) => void>();
+		await new ConnectFlow({ f, store, openUrl, randomState: () => "st8" }).start();
+
+		expect(await store.getClientId()).toBe("fresh");
+		expect(new URL(openUrl.mock.calls[0]![0]).searchParams.get("client_id")).toBe("fresh");
+	});
+
+	it("⛔ KEEPS the registration when the last attempt completed", async () => {
+		// The falsifier for the test above. If `start()` simply discarded the client every time, that
+		// test would pass while the plugin registered a new client on every single connect.
+		const store = memStore();
+		await store.setClientId("known-good");
+		await store.setConnectAttemptPending(false);
+
+		const f = discovery(vi.fn<typeof fetch>());
+		const openUrl = vi.fn<(u: string) => void>();
+		await new ConnectFlow({ f, store, openUrl, randomState: () => "st8" }).start();
+
+		expect(await store.getClientId()).toBe("known-good");
+		expect(new URL(openUrl.mock.calls[0]![0]).searchParams.get("client_id")).toBe("known-good");
+	});
+
+	it("clears the mark once a callback lands, so the next connect keeps its client", async () => {
+		const store = memStore();
+		const f = discovery(vi.fn<typeof fetch>())
+			.mockResolvedValueOnce(json({ client_id: "cid" }, 201))
+			.mockResolvedValueOnce(json({ access_token: "at", refresh_token: "rt", expires_in: 3600 }));
+		const openUrl = vi.fn<(u: string) => void>();
+		const flow = new ConnectFlow({ f, store, openUrl, randomState: () => "st8" });
+
+		await flow.start();
+		expect(await store.getConnectAttemptPending()).toBe(true);
+		await flow.handleCallback({ code: "c0de", state: "st8" });
+		expect(await store.getConnectAttemptPending()).toBe(false);
+	});
+});

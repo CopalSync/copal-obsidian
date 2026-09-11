@@ -2,8 +2,15 @@ import type { Tokens } from "../types";
 
 /** The plugin's persisted state (Obsidian `data.json`). */
 export interface PersistedData {
-	/** The dynamically-registered OAuth client id — kept across disconnects so re-connect reuses it. */
+	/** The dynamically-registered OAuth client id — kept across disconnects so re-connect reuses it.
+	 *  ⚠️ DISCARDED when a connect attempt is started while `connectAttemptPending` is still set: see
+	 *  the note on `ConnectFlow.start`. A registration the server has forgotten is otherwise a dead
+	 *  end with no way out from inside the plugin. */
 	clientId?: string;
+	/** Set when a connect attempt opens the browser, cleared when the callback lands. Still set at
+	 *  the start of the next attempt means the last one died somewhere the plugin cannot see —
+	 *  `/oauth2/authorize` refusing an unknown client never reaches our redirect. */
+	connectAttemptPending?: boolean;
 	tokens?: Tokens;
 	/** A stable per-install id so this device's own pushes can be filtered off the live feed. */
 	deviceId?: string;
@@ -33,8 +40,17 @@ export class TokenStore {
 		return (await this.read()).clientId;
 	}
 
-	async setClientId(id: string): Promise<void> {
-		await this.save({ ...(await this.read()), clientId: id });
+	/** `undefined` discards it, which is how a registration the server has forgotten gets replaced. */
+	async setClientId(id: string | undefined): Promise<void> {
+		const data = await this.read();
+		// `exactOptionalPropertyTypes` is on, so discarding means REMOVING the key rather than setting
+		// it to undefined — the two are different types here and only one of them round-trips as JSON.
+		if (id === undefined) {
+			const { clientId: _discarded, ...rest } = data;
+			await this.save(rest);
+			return;
+		}
+		await this.save({ ...data, clientId: id });
 	}
 
 	async getTokens(): Promise<Tokens | undefined> {
@@ -81,6 +97,14 @@ export class TokenStore {
 
 	async isConnected(): Promise<boolean> {
 		return Boolean((await this.read()).tokens?.access_token);
+	}
+
+	async getConnectAttemptPending(): Promise<boolean> {
+		return (await this.read()).connectAttemptPending === true;
+	}
+
+	async setConnectAttemptPending(pending: boolean): Promise<void> {
+		await this.save({ ...(await this.read()), connectAttemptPending: pending });
 	}
 
 	/** The stable device id, generated + persisted on first use (kept across disconnects). */

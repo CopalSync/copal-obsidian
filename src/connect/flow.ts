@@ -30,9 +30,42 @@ export class ConnectFlow {
 
 	constructor(private readonly deps: ConnectDeps) {}
 
+	/**
+	 * ⛔ **A STORED CLIENT THAT THE SERVER HAS FORGOTTEN IS A PERMANENT DEAD END, AND WAS.**
+	 *
+	 * The registration used to be kept forever and reused whenever it existed. When the server's
+	 * client row goes away — production was reset on 2026-08-31 and took seven OAuth clients with it
+	 * — every later connect presents an id the authorization server does not recognise, and there
+	 * was no path back:
+	 *
+	 *   - The failure happens at `/oauth2/authorize`, which refuses an unknown client BEFORE it will
+	 *     redirect anywhere that client nominated. So the error never reaches `handleCallback` and
+	 *     the plugin cannot see it.
+	 *   - `store.clientId` is explicitly kept across disconnects, so disconnecting and reconnecting
+	 *     reuses the same dead id.
+	 *   - Better Auth reports it as `invalid_client` / **"client_id is required"**, which reads like
+	 *     a missing parameter and sends whoever debugs it looking for one. Measured against
+	 *     production: an unknown client gives that message; a genuinely missing one gives
+	 *     `invalid_request` / "client_id: client_id is required".
+	 *
+	 * So the only exit was deleting `data.json` by hand, on a phone.
+	 *
+	 * The fix is to notice a connect that never came back. `start()` marks an attempt pending and
+	 * `handleCallback` clears it; a second `start()` that finds the mark still set knows the last
+	 * attempt died somewhere it could not observe, and discards the registration before trying
+	 * again. Costs one extra registration after a genuine failure, and nothing at all in the happy
+	 * path — and a user who abandons the browser tab simply re-registers next time, which is
+	 * harmless for a public client.
+	 */
 	async start(): Promise<void> {
 		const { f, store, openUrl, randomState } = this.deps;
 		const disc = await discover(f);
+
+		if (await store.getConnectAttemptPending()) {
+			await store.setClientId(undefined);
+		}
+		await store.setConnectAttemptPending(true);
+
 		let clientId = await store.getClientId();
 		if (!clientId) {
 			const reg = await registerClient(f, disc.registration_endpoint);
@@ -68,6 +101,9 @@ export class ConnectFlow {
 			pending.verifier,
 		);
 		await this.deps.store.setTokens(tokens);
+		// The attempt came back. Clear the mark so the NEXT connect keeps this registration rather
+		// than treating it as the corpse of a failed one.
+		await this.deps.store.setConnectAttemptPending(false);
 		this.pending = undefined;
 		return tokens;
 	}
