@@ -259,10 +259,6 @@
 .copal-choice-text {
 	min-width: 0;
 }
-.copal-choice-title {
-	margin: 0;
-	font-weight: 500;
-}
 .copal-choice-note {
 	margin: 2px 0 0;
 	font-size: var(--font-ui-small);
@@ -270,7 +266,13 @@
 }
 /* The divider between "upload what is here" and "take one you already have". */
 .copal-choice-or {
-	margin: 16px 0 4px;
+	margin: 16px 0 6px;
 	font-size: var(--font-ui-small);
+	font-weight: 600;
+	letter-spacing: 0.06em;
 	color: var(--text-muted);
+}
+.copal-choice-title {
+	margin: 0 0 8px;
+	font-weight: 600;
 }

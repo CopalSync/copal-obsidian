@@ -716,32 +716,27 @@ class VaultChoiceModal extends Modal {
 
 	override onOpen(): void {
 		const { contentEl } = this;
-		const n = this.localFileCount;
-		contentEl.createEl("h3", { text: "Sync this folder" });
+		contentEl.createEl("h3", { text: "Sync" });
 
-		// 1. Push what is here up as a new vault.
 		const up = contentEl.createDiv({ cls: "copal-choice" });
-		up.createDiv({ cls: "copal-choice-text" }, (d) => {
-			d.createEl("p", {
-				cls: "copal-choice-title",
-				text: n === 0 ? "Start a new vault" : `Upload these ${n} file${n === 1 ? "" : "s"}`,
-			});
-			d.createEl("p", {
-				cls: "copal-choice-note",
-				text: "Makes a new Copal vault. Nothing here is lost.",
-			});
-		});
+		up.createSpan({ text: "Upload your existing local files to Copal" });
 		const upBtn = up.createEl("button", { text: "Upload", cls: "mod-cta" });
 		upBtn.onclick = () => {
 			this.pick({ kind: "create" });
 		};
 
-		// 2. Take one that already exists, replacing this folder.
-		contentEl.createEl("p", { cls: "copal-choice-or", text: "or use a vault you already have" });
-		if (n > 0) {
+		contentEl.createEl("p", { cls: "copal-choice-or", text: "OR" });
+		contentEl.createEl("p", { cls: "copal-choice-title", text: "Adopt existing vault" });
+		if (this.localFileCount > 0) {
+			/*
+			 * ⚠️ "Obsidian's trash", not "deleted". `ObsidianVault.delete` calls
+			 * `app.vault.trash(file, false)` — the `.trash` FOLDER INSIDE THE VAULT, which exists on
+			 * mobile and is recoverable. Saying "deleted" would be shorter and would overstate the
+			 * damage, and overstating it makes people abandon a safe action.
+			 */
 			contentEl.createEl("p", {
-				cls: "copal-choice-note",
-				text: "The files here move to Obsidian trash.",
+				cls: "copal-modal-danger",
+				text: "Local files will be moved to Obsidian's trash.",
 			});
 		}
 
@@ -749,16 +744,15 @@ class VaultChoiceModal extends Modal {
 		for (const v of this.vaults) {
 			const row = list.createDiv({ cls: "copal-vault-row" });
 			row.createSpan({ cls: "copal-vault-name", text: v.displayName });
-			const b = row.createEl("button", { text: "Use this" });
+			const b = row.createEl("button", { text: "Adopt" });
 			b.onclick = () => {
 				this.confirmAdopt(v, row, b);
 			};
 		}
 
-		// 3. The thing this screen cannot do, said rather than left to be discovered.
 		contentEl.createEl("p", {
 			cls: "copal-modal-hint",
-			text: "Want to keep both? Close this and connect Copal from a new, empty Obsidian vault.",
+			text: "To sync remote files for the first time, create a new local vault, then adopt the remote one.",
 		});
 	}
 
@@ -775,9 +769,9 @@ class VaultChoiceModal extends Modal {
 		const n = this.localFileCount;
 		row.createSpan({
 			cls: "copal-vault-warning",
-			text: `Replaces the ${n} file${n === 1 ? "" : "s"} here.`,
+			text: `${n} local file${n === 1 ? "" : "s"} to Obsidian's trash.`,
 		});
-		const yes = row.createEl("button", { text: "Replace", cls: "mod-warning" });
+		const yes = row.createEl("button", { text: "Adopt", cls: "mod-warning" });
 		yes.onclick = () => {
 			this.pick({ kind: "adopt", vault: v });
 		};
@@ -786,7 +780,7 @@ class VaultChoiceModal extends Modal {
 			row.empty();
 			row.removeClass("is-confirming");
 			row.createSpan({ cls: "copal-vault-name", text: v.displayName });
-			const again = row.createEl("button", { text: "Use this" });
+			const again = row.createEl("button", { text: "Adopt" });
 			again.onclick = () => {
 				this.confirmAdopt(v, row, again);
 			};
