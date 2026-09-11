@@ -548,13 +548,17 @@ export default class CopalPlugin extends Plugin {
 				);
 				return;
 			}
+			let vanished = false;
 			const vaultId = await this.store.getVaultId();
 			if (vaultId) {
 				if (vaults.some((v) => v.vaultId === vaultId)) {
 					await this.startBound("merge"); // linked & present → resume, just as it was
 					return;
 				}
-				await this.resetLocalVaultState(); // linked vault vanished → unlink + clear stale local state
+				// The vault this folder was syncing with is gone from the account. Unlink and clear the
+				// stale local state, but REMEMBER WHY so the screen below can say it.
+				await this.resetLocalVaultState();
+				vanished = true;
 			}
 			// Unlinked folder: the first vault → create + push; otherwise the adopt screen.
 			if (decideConnect(vaults).kind === "create") {
@@ -562,7 +566,7 @@ export default class CopalPlugin extends Plugin {
 				return;
 			}
 			const localFileCount = (await this.vault.list()).length;
-			const chosen = await new VaultChoiceModal(this.app, vaults, localFileCount).ask();
+			const chosen = await new VaultChoiceModal(this.app, vaults, localFileCount, vanished).ask();
 			if (chosen?.kind === "create") {
 				/*
 				 * ⛔ THE PLAN CAP IS A LIKELY OUTCOME HERE, NOT AN EXCEPTIONAL ONE. Solo includes one
@@ -723,6 +727,8 @@ class VaultChoiceModal extends Modal {
 		app: App,
 		private readonly vaults: Vault[],
 		private readonly localFileCount: number,
+		/** True when this folder WAS linked and its vault no longer exists on the account. */
+		private readonly vanished: boolean = false,
 	) {
 		super(app);
 	}
@@ -737,6 +743,19 @@ class VaultChoiceModal extends Modal {
 	override onOpen(): void {
 		const { contentEl } = this;
 		contentEl.createEl("h3", { text: "Sync" });
+
+		/*
+		 * ⚠️ SAY WHY THEY ARE HERE. A folder whose vault was deleted elsewhere is unlinked silently
+		 * and lands on this screen looking like a folder that was never connected. The difference
+		 * matters: one is a setup step, the other is "something you had is gone", and a person who is
+		 * not told the second will assume the plugin lost their notes.
+		 */
+		if (this.vanished) {
+			contentEl.createEl("p", {
+				cls: "copal-modal-danger",
+				text: "The vault this folder was syncing with is no longer on your account. Your local files are untouched.",
+			});
+		}
 
 		const up = contentEl.createDiv({ cls: "copal-choice" });
 		up.createSpan({ text: "Upload your existing local files to Copal" });
