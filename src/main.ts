@@ -707,9 +707,19 @@ class AdoptVaultModal extends Modal {
 
 		if (this.localFileCount > 0) {
 			const n = this.localFileCount;
-			contentEl.createEl("p", {
-				cls: "copal-modal-danger",
+			const warn = contentEl.createDiv({ cls: "copal-modal-danger" });
+			warn.createEl("p", {
 				text: `This folder already has ${n} file${n === 1 ? "" : "s"}. They will move to Obsidian trash, where you can recover them, and the vault you pick will replace them.`,
+			});
+			/*
+			 * ⚠️ THE WAY OUT, NOT JUST THE WARNING. Somebody who wants their Copal notes AND their
+			 * existing local notes has a perfectly good option and no way to discover it: this screen
+			 * only offered a destructive choice and a close button. Saying "your files will be
+			 * deleted" without saying what to do instead leaves the honest answer looking like
+			 * cancelling.
+			 */
+			warn.createEl("p", {
+				text: "To keep these files, close this and make a new empty vault in Obsidian, then connect Copal from there. One Obsidian vault syncs with one Copal vault.",
 			});
 		}
 

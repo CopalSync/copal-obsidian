@@ -39,7 +39,8 @@ export class CopalSettingTab extends PluginSettingTab {
 				.setDesc(
 					"You are signed in. This folder is not connected to one of your Copal vaults, so nothing " +
 						"is being synced. Choose a vault to sync it with. Its notes will replace what is in " +
-						"this folder, and the files that are here now move to Obsidian trash.",
+						"this folder, and the files that are here now move to Obsidian trash. To keep them, " +
+						"make a new empty vault in Obsidian and connect Copal from there instead.",
 				)
 				.addButton((b) =>
 					b.setButtonText("Sign out").onClick(async () => {
