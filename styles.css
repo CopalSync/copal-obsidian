@@ -105,6 +105,21 @@
 	margin: 0;
 	flex: none;
 }
+/*
+ * The in-place confirm. It wraps rather than squeezing, because a vault name plus a sentence plus
+ * two buttons does not fit one line on a phone — and this row exists to be usable on a phone: the
+ * nested modal it replaces is precisely what did not work there.
+ */
+.copal-vault-row.is-confirming {
+	flex-wrap: wrap;
+	justify-content: flex-end;
+	border-color: var(--background-modifier-error);
+}
+.copal-vault-warning {
+	flex: 1 1 100%;
+	font-size: var(--font-ui-small);
+	color: var(--text-muted);
+}
 .copal-modal-danger {
 	border: 1px solid var(--background-modifier-error);
 	border-radius: 8px;

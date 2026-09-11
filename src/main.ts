@@ -30,7 +30,6 @@ import { ObsidianVault } from "./sync/obsidian-vault";
 import { requestUrlFetch } from "./sync/request-url-fetch";
 import { safePath } from "./sync/safe-path";
 import { type SyncData, SyncState } from "./sync/state";
-import { confirmModal } from "./ui/confirm";
 import { openExternal } from "./ui/external-link";
 import { COPAL_SEARCH_VIEW, CopalSearchView } from "./ui/search-view";
 import { STATUS_META, type SyncStatus } from "./ui/status";
@@ -545,7 +544,7 @@ export default class CopalPlugin extends Plugin {
 				// offer Sign out / Adopt. Nothing is started, so no sync is attempted in this state.
 				this.setStatus("idle");
 				await this.settingsTab?.refresh();
-				new Notice("Copal: adopt a vault to start syncing.");
+				new Notice("Copal: choose a vault to start syncing.");
 				return;
 			}
 			await this.store.setVault(chosen.vaultId, chosen.displayName);
@@ -677,14 +676,16 @@ class AdoptVaultModal extends Modal {
 
 	override onOpen(): void {
 		const { contentEl } = this;
-		contentEl.createEl("h3", { text: "Adopt a vault" });
-		contentEl.createEl("p", { text: "Sync one of your Copal vaults down into this folder:" });
+		contentEl.createEl("h3", { text: "Choose a vault to sync" });
+		contentEl.createEl("p", {
+			text: "Pick which of your Copal vaults this Obsidian folder should sync with.",
+		});
 
 		if (this.localFileCount > 0) {
 			const n = this.localFileCount;
 			contentEl.createEl("p", {
 				cls: "copal-modal-danger",
-				text: `Adopting clears this folder — its ${n} file${n === 1 ? "" : "s"} move to Obsidian trash (recoverable) and are replaced by the vault you pick.`,
+				text: `This folder already has ${n} file${n === 1 ? "" : "s"}. They will move to Obsidian trash, where you can recover them, and the vault you pick will replace them.`,
 			});
 		}
 
@@ -693,27 +694,56 @@ class AdoptVaultModal extends Modal {
 			const row = list.createDiv({ cls: "copal-vault-row" });
 			row.createSpan({ cls: "copal-vault-name", text: v.displayName });
 			const b = row.createEl("button", { text: "Adopt", cls: "mod-warning" });
-			b.onclick = () => void this.confirmAdopt(v);
+			b.onclick = () => {
+				this.confirmAdopt(v, row, b);
+			};
 		}
 	}
 
-	/** Clicking Adopt: when this folder has files, confirm the destructive replace first (they go to trash);
-	 *  an empty folder adopts straight away (nothing to lose). Uses a cross-platform Modal confirm (not
-	 *  `window.confirm`, which is unreliable/blocked on mobile — and won't render inside this open Modal). */
-	private async confirmAdopt(v: Vault): Promise<void> {
-		if (this.localFileCount > 0) {
-			const n = this.localFileCount;
-			const ok = await confirmModal(this.app, {
-				title: `Adopt "${v.displayName}"?`,
-				body:
-					`The ${n} file${n === 1 ? "" : "s"} in this folder will move to Obsidian trash (recoverable) ` +
-					`and be replaced by "${v.displayName}".`,
-				cta: "Adopt",
-				danger: true,
-			});
-			if (!ok) return;
+	/**
+	 * ⛔ **THE CONFIRM IS INLINE. IT USED TO BE A SECOND MODAL, AND THAT IS WHY ADOPTING DID NOTHING
+	 * ON A PHONE.**
+	 *
+	 * Clicking Adopt with files in the folder opened `confirmModal` on top of this one. Obsidian
+	 * mobile closes the modal underneath when another opens, which fires `onClose` here — and
+	 * `onClose` resolves the promise with `this.chosen`, still undefined. `startSync` read that as
+	 * "closed without picking", went idle and said "adopt a vault to start syncing". The button
+	 * appeared to do nothing, and the one path that could not be reached was the only one that
+	 * matters: a folder that already has notes in it.
+	 *
+	 * The file already carried a note about `window.confirm` being unreliable on mobile. The lesson
+	 * was one step short: it is not `window.confirm` that is the problem, it is putting anything on
+	 * top of an open Modal. So the row confirms in place, which is also what the console does for a
+	 * destructive row.
+	 */
+	private confirmAdopt(v: Vault, row: HTMLElement, button: HTMLButtonElement): void {
+		if (this.localFileCount === 0) {
+			this.pick(v); // nothing to lose
+			return;
 		}
-		this.pick(v);
+		if (row.hasClass("is-confirming")) return;
+		row.addClass("is-confirming");
+		button.remove();
+
+		const n = this.localFileCount;
+		row.createSpan({
+			cls: "copal-vault-warning",
+			text: `Replaces ${n} file${n === 1 ? "" : "s"} here. They move to Obsidian trash.`,
+		});
+		const yes = row.createEl("button", { text: "Replace", cls: "mod-warning" });
+		yes.onclick = () => {
+			this.pick(v);
+		};
+		const no = row.createEl("button", { text: "Cancel" });
+		no.onclick = () => {
+			row.empty();
+			row.removeClass("is-confirming");
+			row.createSpan({ cls: "copal-vault-name", text: v.displayName });
+			const again = row.createEl("button", { text: "Adopt", cls: "mod-warning" });
+			again.onclick = () => {
+				this.confirmAdopt(v, row, again);
+			};
+		};
 	}
 
 	override onClose(): void {

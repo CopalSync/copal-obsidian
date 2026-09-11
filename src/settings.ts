@@ -35,10 +35,11 @@ export class CopalSettingTab extends PluginSettingTab {
 		if (!(await this.plugin.store.getVaultId())) {
 			// Signed in, but this folder isn't linked to a vault (the adopt screen was closed). Nothing syncs.
 			new Setting(containerEl)
-				.setName("No vault adopted")
+				.setName("This folder is not syncing yet")
 				.setDesc(
-					"You're signed in, but this folder isn't linked to a Copal vault yet — so nothing is syncing. " +
-						"Adopt one to start.",
+					"You are signed in. This folder is not connected to one of your Copal vaults, so nothing " +
+						"is being synced. Choose a vault to sync it with. Its notes will replace what is in " +
+						"this folder, and the files that are here now move to Obsidian trash.",
 				)
 				.addButton((b) =>
 					b.setButtonText("Sign out").onClick(async () => {
@@ -48,7 +49,7 @@ export class CopalSettingTab extends PluginSettingTab {
 				)
 				.addButton((b) =>
 					b
-						.setButtonText("Adopt")
+						.setButtonText("Choose a vault")
 						.setCta()
 						.onClick(async () => {
 							await this.plugin.connectVault(); // re-opens the adopt screen
