@@ -1,5 +1,5 @@
 import { ItemView, type WorkspaceLeaf, setIcon } from "obsidian";
-import type { SearchHit, SearchMode } from "../sync/api";
+import { ApiError, type SearchHit, type SearchMode } from "../sync/api";
 
 export const COPAL_SEARCH_VIEW = "copal-search";
 
@@ -7,7 +7,10 @@ export const COPAL_SEARCH_VIEW = "copal-search";
 export interface SearchHost {
 	/** Search the connected vault. Rejects with a connection error when the vault isn't linked yet. */
 	searchVault(query: string, mode: SearchMode): Promise<SearchHit[]>;
-	/** Whether a Copal vault is currently linked (drives the not-connected empty state). */
+	/** Whether this folder is linked to a vault. Signed in with no vault cannot search either, and
+	 *  it is a DIFFERENT thing to fix, so the pane has to tell the two apart. */
+	hasVault(): Promise<boolean>;
+	/** Whether the plugin holds tokens, i.e. somebody is SIGNED IN. Not the same as having a vault. */
 	isConnected(): Promise<boolean>;
 	/** Open a note by its vault-relative path (click-through from a result). */
 	openNote(path: string): void;
@@ -93,7 +96,7 @@ export class CopalSearchView extends ItemView {
 			}
 		});
 
-		this.renderPrompt("Search your vault by meaning.");
+		void this.showIdleState();
 		// Defer focus so Obsidian has attached the leaf.
 		window.setTimeout(() => this.inputEl.focus(), 0);
 	}
@@ -124,10 +127,38 @@ export class CopalSearchView extends ItemView {
 		this.debounce = setTimeout(() => void this.runSearch(), DEBOUNCE_MS);
 	}
 
+	/**
+	 * ⚠️ **CHECKED BEFORE SEARCHING, NOT AFTER IT FAILS.**
+	 *
+	 * The not-connected message existed, but only in the catch — so somebody signed out typed a
+	 * query, watched "Searching…", waited for a round trip that could not work, and was then told
+	 * they were not connected. The pane knows that before the first keystroke.
+	 */
+	private async showIdleState(): Promise<void> {
+		this.renderPrompt(await this.idleText());
+	}
+
+	/**
+	 * ⚠️ THREE STATES, NOT TWO. Signed out and signed-in-without-a-vault both cannot search, and the
+	 * fix is different for each: one is Sign in, the other is Sync. Collapsing them sends half the
+	 * people to the wrong button.
+	 */
+	private async idleText(): Promise<string> {
+		if (!(await this.host.isConnected())) return "Not signed in. Open Settings, then Copal.";
+		if (!(await this.host.hasVault()))
+			return "No vault yet. Open Settings, then Copal, to sync one.";
+		return "Search your vault by meaning.";
+	}
+
 	private async runSearch(): Promise<void> {
 		const query = this.query.trim();
 		if (query.length === 0) {
-			this.renderPrompt("Search your vault by meaning.");
+			await this.showIdleState();
+			return;
+		}
+		const ready = (await this.host.isConnected()) && (await this.host.hasVault());
+		if (!ready) {
+			this.renderPrompt(await this.idleText());
 			return;
 		}
 		const mine = ++this.seq;
@@ -138,11 +169,17 @@ export class CopalSearchView extends ItemView {
 			this.renderResults(hits);
 		} catch (err) {
 			if (mine !== this.seq) return;
-			const connected = await this.host.isConnected();
+			/*
+			 * Connected but refused. A 401 here means the session went stale between opening the pane
+			 * and searching, which is a thing a person can fix; anything else is ours and a raw
+			 * message helps nobody, so it stays generic and the detail goes to the console.
+			 */
+			console.error("Copal: search failed", err);
+			const status = err instanceof ApiError ? err.status : undefined;
 			this.renderPrompt(
-				connected
-					? `Search failed: ${err instanceof Error ? err.message : String(err)}`
-					: "Connect Copal to search your vault. Open Settings → Copal to link a vault.",
+				status === 401 || status === 403
+					? "Your sign-in is no longer valid. Sign out and back in from Settings."
+					: "Search is unavailable right now. Try again in a moment.",
 			);
 		}
 	}

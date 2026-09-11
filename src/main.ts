@@ -255,6 +255,7 @@ export default class CopalPlugin extends Plugin {
 				new CopalSearchView(leaf, {
 					searchVault: (q, mode) => this.searchVault(q, mode),
 					isConnected: () => this.store.isConnected(),
+					hasVault: async () => (await this.store.getVaultId()) !== undefined,
 					openNote: (path) => void this.app.workspace.openLinkText(path, "", false),
 				}),
 		);
