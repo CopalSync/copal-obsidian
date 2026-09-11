@@ -2,15 +2,20 @@ import type { Vault } from "../sync/api";
 
 /** What connecting an *unlinked* Obsidian folder should do, given the account's existing vaults. */
 export type ConnectDecision =
-	| { kind: "create" } // zero vaults → this is the first: sync this folder up as a new vault (no screen)
-	| { kind: "adopt" }; // one or more vaults exist → show the adopt screen; the only way to join is to adopt
+	| { kind: "create" } // zero vaults → nothing to choose between: push this folder up, no screen
+	| { kind: "ask" }; // vaults exist → show the choice screen (upload this folder, or use one of them)
 
 /**
- * The whole connect rule for a folder that isn't linked yet: if the account has **no** vaults, this folder
- * becomes the first one (create + push, no screen). If it already has **any** vault, the only move is to
- * **adopt** one — there is deliberately no "create a second vault from this folder" path in the plugin.
- * (A folder that *is* already linked never reaches here — it just resumes.)
+ * Whether connecting an unlinked folder needs to ASK.
+ *
+ * No vaults: there is nothing to choose between, so this folder becomes the first one and is pushed
+ * up without a screen. Any vaults: show the choice screen.
+ *
+ * ⚠️ **`adopt` no longer means "adopt is the only option".** It used to: the screen offered exactly
+ * one move, and a person with notes here and notes in Copal could only replace one with the other.
+ * `VaultChoiceModal` now offers uploading this folder as a new vault as well, so this function has
+ * narrowed to the question it can actually answer on its own, which is whether to ask at all.
  */
 export function decideConnect(vaults: Vault[]): ConnectDecision {
-	return vaults.length === 0 ? { kind: "create" } : { kind: "adopt" };
+	return vaults.length === 0 ? { kind: "create" } : { kind: "ask" };
 }

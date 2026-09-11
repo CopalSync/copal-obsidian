@@ -13,11 +13,14 @@ describe("decideConnect", () => {
 		expect(decideConnect([]).kind).toBe("create");
 	});
 
-	it("one vault → adopt (never offer create when a vault already exists)", () => {
-		expect(decideConnect([vault("vlt_1")]).kind).toBe("adopt");
+	it("one vault → ask (the screen offers upload AND use-an-existing)", () => {
+		// This used to assert "never offer create when a vault already exists", which was the old rule
+		// and left somebody with notes in both places unable to keep both. The decision here is only
+		// whether to ASK; `VaultChoiceModal` owns what the options are.
+		expect(decideConnect([vault("vlt_1")]).kind).toBe("ask");
 	});
 
-	it("multiple vaults → adopt (pick one to pull down)", () => {
-		expect(decideConnect([vault("vlt_1"), vault("vlt_2")]).kind).toBe("adopt");
+	it("multiple vaults → ask", () => {
+		expect(decideConnect([vault("vlt_1"), vault("vlt_2")]).kind).toBe("ask");
 	});
 });

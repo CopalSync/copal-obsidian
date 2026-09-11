@@ -562,16 +562,20 @@ export default class CopalPlugin extends Plugin {
 				return;
 			}
 			const localFileCount = (await this.vault.list()).length;
-			const chosen = await new AdoptVaultModal(this.app, vaults, localFileCount).ask();
+			const chosen = await new VaultChoiceModal(this.app, vaults, localFileCount).ask();
+			if (chosen?.kind === "create") {
+				await this.linkNewVault(this.app.vault.getName());
+				return;
+			}
 			if (!chosen) {
 				// Signed in but no vault adopted → nothing to sync. Go idle (not "reconnecting") and let settings
 				// offer Sign out / Adopt. Nothing is started, so no sync is attempted in this state.
 				this.setStatus("idle");
 				await this.settingsTab?.refresh();
-				new Notice("Copal: choose a vault to start syncing.");
+				new Notice("Copal: choose how to sync this folder to start.");
 				return;
 			}
-			await this.store.setVault(chosen.vaultId, chosen.displayName);
+			await this.store.setVault(chosen.vault.vaultId, chosen.vault.displayName);
 			await this.startBound("adopt"); // pull the chosen vault down (remote-wins; local files → trash)
 		} catch (err) {
 			this.setStatus("offline");
@@ -673,15 +677,27 @@ export default class CopalPlugin extends Plugin {
 }
 
 /**
- * The **adopt screen** — the one and only join flow, shown when the account already has vaults and this
- * folder isn't linked (you disconnected and came back, an agent created the vault first, or it's a second
- * device). A plain list of your vaults, each with an **Adopt** button. Adopting pulls that vault down
- * (remote-wins) and moves this folder's current files to Obsidian trash (recoverable) — one line above the
- * list says so. One click adopts. Closing without picking = skip (stays offline). No "create", no "default".
+ * THE ONE SCREEN FOR CONNECTING AN UNLINKED FOLDER, and it offers every move there is.
+ *
+ * ⚠️ **It used to offer ONE: adopt.** If the account already had a vault, the only thing this folder
+ * could do was be replaced by one — so somebody with notes here and notes in Copal had no way to
+ * keep both, and no way to push these up as a second vault. The rule was deliberate once and it was
+ * wrong; there are three things a person can sensibly want and this now says all three, in the order
+ * they are likely to want them:
+ *
+ *   1. Upload what is here. Makes a new Copal vault from this folder. Nothing is lost.
+ *   2. Use a vault they already have. Replaces this folder. Destructive, so it confirms in place.
+ *   3. Keep both. Not something this screen can do — it is a second Obsidian vault — so it is said
+ *      plainly rather than left to be worked out.
+ *
+ * ⛔ The confirm for (2) is INLINE. A second Modal on top of this one closes it on Obsidian mobile,
+ * which resolves this promise with nothing chosen and makes the button look dead. That shipped.
  */
-class AdoptVaultModal extends Modal {
-	private chosen: Vault | undefined;
-	private resolve: ((v: Vault | undefined) => void) | undefined;
+type VaultChoice = { kind: "create" } | { kind: "adopt"; vault: Vault };
+
+class VaultChoiceModal extends Modal {
+	private chosen: VaultChoice | undefined;
+	private resolve: ((v: VaultChoice | undefined) => void) | undefined;
 
 	constructor(
 		app: App,
@@ -691,7 +707,7 @@ class AdoptVaultModal extends Modal {
 		super(app);
 	}
 
-	ask(): Promise<Vault | undefined> {
+	ask(): Promise<VaultChoice | undefined> {
 		return new Promise((resolve) => {
 			this.resolve = resolve;
 			this.open();
@@ -700,25 +716,32 @@ class AdoptVaultModal extends Modal {
 
 	override onOpen(): void {
 		const { contentEl } = this;
-		contentEl.createEl("h3", { text: "Choose a vault to sync" });
-		contentEl.createEl("p", {
-			text: "Pick which of your Copal vaults this Obsidian folder should sync with.",
-		});
+		const n = this.localFileCount;
+		contentEl.createEl("h3", { text: "Sync this folder" });
 
-		if (this.localFileCount > 0) {
-			const n = this.localFileCount;
-			const warn = contentEl.createDiv({ cls: "copal-modal-danger" });
-			warn.createEl("p", {
-				text: `This replaces the ${n} file${n === 1 ? "" : "s"} here. They go to Obsidian trash.`,
+		// 1. Push what is here up as a new vault.
+		const up = contentEl.createDiv({ cls: "copal-choice" });
+		up.createDiv({ cls: "copal-choice-text" }, (d) => {
+			d.createEl("p", {
+				cls: "copal-choice-title",
+				text: n === 0 ? "Start a new vault" : `Upload these ${n} file${n === 1 ? "" : "s"}`,
 			});
-			/*
-			 * ⚠️ OUTSIDE THE RED BOX, deliberately. This is the SAFE option, and putting it inside the
-			 * danger panel dressed the way out as part of the hazard. It is also the only screen that
-			 * ever mentions it, so somebody who wants both sets of notes finds it here or nowhere.
-			 */
+			d.createEl("p", {
+				cls: "copal-choice-note",
+				text: "Makes a new Copal vault. Nothing here is lost.",
+			});
+		});
+		const upBtn = up.createEl("button", { text: "Upload", cls: "mod-cta" });
+		upBtn.onclick = () => {
+			this.pick({ kind: "create" });
+		};
+
+		// 2. Take one that already exists, replacing this folder.
+		contentEl.createEl("p", { cls: "copal-choice-or", text: "or use a vault you already have" });
+		if (n > 0) {
 			contentEl.createEl("p", {
-				cls: "copal-modal-hint",
-				text: "Want to keep them? Close this and connect Copal from a new, empty Obsidian vault.",
+				cls: "copal-choice-note",
+				text: "The files here move to Obsidian trash.",
 			});
 		}
 
@@ -726,32 +749,23 @@ class AdoptVaultModal extends Modal {
 		for (const v of this.vaults) {
 			const row = list.createDiv({ cls: "copal-vault-row" });
 			row.createSpan({ cls: "copal-vault-name", text: v.displayName });
-			const b = row.createEl("button", { text: "Adopt", cls: "mod-warning" });
+			const b = row.createEl("button", { text: "Use this" });
 			b.onclick = () => {
 				this.confirmAdopt(v, row, b);
 			};
 		}
+
+		// 3. The thing this screen cannot do, said rather than left to be discovered.
+		contentEl.createEl("p", {
+			cls: "copal-modal-hint",
+			text: "Want to keep both? Close this and connect Copal from a new, empty Obsidian vault.",
+		});
 	}
 
-	/**
-	 * ⛔ **THE CONFIRM IS INLINE. IT USED TO BE A SECOND MODAL, AND THAT IS WHY ADOPTING DID NOTHING
-	 * ON A PHONE.**
-	 *
-	 * Clicking Adopt with files in the folder opened `confirmModal` on top of this one. Obsidian
-	 * mobile closes the modal underneath when another opens, which fires `onClose` here — and
-	 * `onClose` resolves the promise with `this.chosen`, still undefined. `startSync` read that as
-	 * "closed without picking", went idle and said "adopt a vault to start syncing". The button
-	 * appeared to do nothing, and the one path that could not be reached was the only one that
-	 * matters: a folder that already has notes in it.
-	 *
-	 * The file already carried a note about `window.confirm` being unreliable on mobile. The lesson
-	 * was one step short: it is not `window.confirm` that is the problem, it is putting anything on
-	 * top of an open Modal. So the row confirms in place, which is also what the console does for a
-	 * destructive row.
-	 */
+	/** Replacing is destructive, so the row confirms IN PLACE. See the note above on nested modals. */
 	private confirmAdopt(v: Vault, row: HTMLElement, button: HTMLButtonElement): void {
 		if (this.localFileCount === 0) {
-			this.pick(v); // nothing to lose
+			this.pick({ kind: "adopt", vault: v });
 			return;
 		}
 		if (row.hasClass("is-confirming")) return;
@@ -761,18 +775,18 @@ class AdoptVaultModal extends Modal {
 		const n = this.localFileCount;
 		row.createSpan({
 			cls: "copal-vault-warning",
-			text: `Replaces ${n} file${n === 1 ? "" : "s"} here. They move to Obsidian trash.`,
+			text: `Replaces the ${n} file${n === 1 ? "" : "s"} here.`,
 		});
 		const yes = row.createEl("button", { text: "Replace", cls: "mod-warning" });
 		yes.onclick = () => {
-			this.pick(v);
+			this.pick({ kind: "adopt", vault: v });
 		};
 		const no = row.createEl("button", { text: "Cancel" });
 		no.onclick = () => {
 			row.empty();
 			row.removeClass("is-confirming");
 			row.createSpan({ cls: "copal-vault-name", text: v.displayName });
-			const again = row.createEl("button", { text: "Adopt", cls: "mod-warning" });
+			const again = row.createEl("button", { text: "Use this" });
 			again.onclick = () => {
 				this.confirmAdopt(v, row, again);
 			};
@@ -785,8 +799,8 @@ class AdoptVaultModal extends Modal {
 		this.resolve = undefined;
 	}
 
-	private pick(v: Vault): void {
-		this.chosen = v;
-		this.close(); // → onClose resolves with the chosen vault
+	private pick(choice: VaultChoice): void {
+		this.chosen = choice;
+		this.close();
 	}
 }

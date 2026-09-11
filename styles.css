@@ -244,3 +244,33 @@
 	font-size: var(--font-ui-small);
 	color: var(--text-muted);
 }
+
+/* The three ways to connect a folder. A row is text on the left, one action on the right. */
+.copal-choice {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+	padding: 10px 8px 10px 14px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 9px;
+	background: var(--background-secondary);
+}
+.copal-choice-text {
+	min-width: 0;
+}
+.copal-choice-title {
+	margin: 0;
+	font-weight: 500;
+}
+.copal-choice-note {
+	margin: 2px 0 0;
+	font-size: var(--font-ui-small);
+	color: var(--text-muted);
+}
+/* The divider between "upload what is here" and "take one you already have". */
+.copal-choice-or {
+	margin: 16px 0 4px;
+	font-size: var(--font-ui-small);
+	color: var(--text-muted);
+}
