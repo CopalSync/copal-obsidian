@@ -99,8 +99,13 @@ export class TokenStore {
 		return Boolean((await this.read()).tokens?.access_token);
 	}
 
-	async getConnectAttemptPending(): Promise<boolean> {
-		return (await this.read()).connectAttemptPending === true;
+	/**
+	 * `undefined` means this install has never recorded one — it was written by a build that predates
+	 * the mark — which is NOT the same as `false` and the difference decides whether a stored
+	 * registration can be trusted. See `ConnectFlow.start`.
+	 */
+	async getConnectAttemptPending(): Promise<boolean | undefined> {
+		return (await this.read()).connectAttemptPending;
 	}
 
 	async setConnectAttemptPending(pending: boolean): Promise<void> {

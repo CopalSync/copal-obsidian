@@ -61,7 +61,20 @@ export class ConnectFlow {
 		const { f, store, openUrl, randomState } = this.deps;
 		const disc = await discover(f);
 
-		if (await store.getConnectAttemptPending()) {
+		/*
+		 * ⛔ `undefined` IS NOT `false`, and collapsing the two leaves every already-broken install
+		 * broken for one more attempt.
+		 *
+		 * `true`  — the last attempt opened the browser and never came back. Discard.
+		 * `undefined` — this install has never recorded an attempt, so its stored registration was
+		 *   written by a build that predates this mechanism and there is no evidence it still works.
+		 *   Discard once; from here on the mark governs. This is the migration, and without it the
+		 *   first connect after updating reuses the dead id and fails exactly as before — the fix
+		 *   would only take effect on the SECOND try, which is not a fix for someone who is stuck.
+		 * `false` — the last attempt completed. Keep it.
+		 */
+		const lastAttempt = await store.getConnectAttemptPending();
+		if (lastAttempt !== false) {
 			await store.setClientId(undefined);
 		}
 		await store.setConnectAttemptPending(true);

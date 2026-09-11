@@ -92,6 +92,10 @@ describe("ConnectFlow", () => {
 	it("reuses a previously-registered client id (no re-registration)", async () => {
 		const store = memStore();
 		await store.setClientId("existing");
+		// A COMPLETED attempt is what makes a stored registration trustworthy. Setting the id alone
+		// now describes an install that predates the mark, which re-registers on purpose — see the
+		// migration case below.
+		await store.setConnectAttemptPending(false);
 		const f = discovery(vi.fn<typeof fetch>());
 		const openUrl = vi.fn<(u: string) => void>();
 		const flow = new ConnectFlow({ f, store, openUrl, randomState: () => "st8" });
@@ -158,5 +162,26 @@ describe("ConnectFlow — recovering from a registration the server has forgotte
 		expect(await store.getConnectAttemptPending()).toBe(true);
 		await flow.handleCallback({ code: "c0de", state: "st8" });
 		expect(await store.getConnectAttemptPending()).toBe(false);
+	});
+});
+
+describe("ConnectFlow — the migration for installs that predate the mark", () => {
+	it("⛔ re-registers on the FIRST connect when no attempt was ever recorded", async () => {
+		// The case that matters most: a phone already stuck on a dead registration, updating to the
+		// build that fixes it. `undefined` is not `false` — treating it as "the last attempt was
+		// fine" would reuse the dead id and fail identically, and the fix would only bite on the
+		// second try, which is no use to somebody who is already stuck.
+		const store = memStore();
+		await store.setClientId("dead-client-from-before-the-reset");
+		expect(await store.getConnectAttemptPending()).toBeUndefined();
+
+		const f = discovery(vi.fn<typeof fetch>()).mockResolvedValueOnce(
+			json({ client_id: "fresh" }, 201),
+		);
+		const openUrl = vi.fn<(u: string) => void>();
+		await new ConnectFlow({ f, store, openUrl, randomState: () => "st8" }).start();
+
+		expect(await store.getClientId()).toBe("fresh");
+		expect(new URL(openUrl.mock.calls[0]![0]).searchParams.get("client_id")).toBe("fresh");
 	});
 });
