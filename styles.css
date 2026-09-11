@@ -265,12 +265,24 @@
 	color: var(--text-muted);
 }
 /* The divider between "upload what is here" and "take one you already have". */
+/* Centred, with a rule either side. Pseudo-elements rather than markup: the lines are decoration
+   and have no business in the accessibility tree. */
 .copal-choice-or {
-	margin: 16px 0 6px;
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	margin: 18px 0 10px;
 	font-size: var(--font-ui-small);
 	font-weight: 600;
 	letter-spacing: 0.06em;
 	color: var(--text-muted);
+}
+.copal-choice-or::before,
+.copal-choice-or::after {
+	content: "";
+	flex: 1;
+	height: 1px;
+	background: var(--background-modifier-border);
 }
 .copal-choice-title {
 	margin: 0 0 8px;

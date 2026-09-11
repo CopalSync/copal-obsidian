@@ -7,9 +7,24 @@
  * available for a log.
  */
 export class ApiError extends Error {
-	constructor(readonly status: number) {
+	constructor(
+		readonly status: number,
+		/** The gateway's machine-readable code, where it sends one. `VAULT_LIMIT_REACHED` is the only
+		 *  error on POST /vaults that carries one, precisely so a client can say something specific. */
+		readonly code?: string,
+	) {
 		super(`request failed: ${status}`);
 		this.name = "ApiError";
+	}
+}
+
+/** Read the gateway's error code without letting a non-JSON body become a second failure. */
+async function errorCode(res: Response): Promise<string | undefined> {
+	try {
+		const body = (await res.json()) as { code?: unknown };
+		return typeof body.code === "string" ? body.code : undefined;
+	} catch {
+		return undefined;
 	}
 }
 
@@ -125,7 +140,7 @@ export class SyncApi {
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({ name }),
 		});
-		if (!res.ok) throw new Error(`create vault failed: ${res.status}`);
+		if (!res.ok) throw new ApiError(res.status, await errorCode(res));
 		return (await res.json()) as Vault;
 	}
 

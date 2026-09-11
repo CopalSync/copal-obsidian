@@ -564,7 +564,27 @@ export default class CopalPlugin extends Plugin {
 			const localFileCount = (await this.vault.list()).length;
 			const chosen = await new VaultChoiceModal(this.app, vaults, localFileCount).ask();
 			if (chosen?.kind === "create") {
-				await this.linkNewVault(this.app.vault.getName());
+				/*
+				 * ⛔ THE PLAN CAP IS A LIKELY OUTCOME HERE, NOT AN EXCEPTIONAL ONE. Solo includes one
+				 * vault, so anybody on Solo who already has one and picks Upload hits it — and this
+				 * screen is shown precisely BECAUSE they already have one. Left to the outer catch it
+				 * surfaced as "Copal sync failed: request failed: 403", which names neither the cause
+				 * nor the way forward.
+				 *
+				 * The gateway sends `VAULT_LIMIT_REACHED` as a machine-readable code for exactly this,
+				 * so it is read rather than inferred from the status. The screen reopens afterwards:
+				 * adopting is still available and they are still mid-task.
+				 */
+				try {
+					await this.linkNewVault(this.app.vault.getName());
+				} catch (err) {
+					if (err instanceof ApiError && err.code === "VAULT_LIMIT_REACHED") {
+						new Notice("Your plan includes one vault. Adopt it, or upgrade at copal.uk.", 8000);
+						await this.startSync();
+						return;
+					}
+					throw err;
+				}
 				return;
 			}
 			if (!chosen) {
