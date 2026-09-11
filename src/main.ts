@@ -20,7 +20,7 @@ import { discover, refresh } from "./connect/oauth";
 import { type PersistedData, TokenStore } from "./connect/store";
 import type { Tokens } from "./types";
 import { CopalSettingTab } from "./settings";
-import { type SearchHit, type SearchMode, SyncApi, type Vault } from "./sync/api";
+import { ApiError, type SearchHit, type SearchMode, SyncApi, type Vault } from "./sync/api";
 import { type BinaryData, BinaryCursor } from "./sync/binary-cursor";
 import { BinarySync, isAttachmentPath } from "./sync/binary-sync";
 import { ObsidianBinaryVault } from "./sync/binary-vault";
@@ -533,8 +533,19 @@ export default class CopalPlugin extends Plugin {
 				 * why it has to carry the reason.
 				 */
 				this.setStatus("offline");
-				const reason = err instanceof Error ? err.message : String(err);
-				new Notice(`Copal: could not list your vaults. ${reason}`, 10000);
+				/*
+				 * ⛔ WHAT A PERSON CAN ACT ON, NOT THE STATUS CODE. A raw "401" was shown here briefly
+				 * and it is a developer artefact: somebody whose session expired cannot do anything
+				 * with a number. The status still reaches the console for whoever is debugging.
+				 */
+				console.error("Copal: listVaults failed", err);
+				const status = err instanceof ApiError ? err.status : undefined;
+				new Notice(
+					status === 401 || status === 403
+						? "Copal: your sign-in is no longer valid. Sign out in settings and sign in again."
+						: "Copal: could not reach Copal. Check your connection and try again.",
+					8000,
+				);
 				return;
 			}
 			const vaultId = await this.store.getVaultId();

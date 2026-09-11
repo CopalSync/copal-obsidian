@@ -110,6 +110,19 @@ export function buildAuthorizeUrl(
 	u.searchParams.set("code_challenge", pkce.challenge);
 	u.searchParams.set("code_challenge_method", "S256");
 	u.searchParams.set("state", state);
+	/*
+	 * ⛔ **RFC 8707. WITHOUT THIS THE TOKEN IS OPAQUE AND THE GATEWAY 401s EVERYTHING.**
+	 *
+	 * `copal-auth/src/auth.config.ts` says it plainly: the resource is "what makes the token a JWT
+	 * AT ALL — this library issues an opaque access token when there is no audience to assign, and
+	 * an opaque token cannot be verified offline, surfacing at the gateway as an ordinary bad-token
+	 * 401." The gateway pins `aud` to `OAUTH_AUDIENCE`, which is this exact string.
+	 *
+	 * So the symptom is maximally misleading: sign-in succeeds, the code exchanges, tokens are
+	 * stored, and then every call fails as if the credential were wrong. It is not wrong, it is
+	 * unverifiable. MCP 2026-07-28 requires this parameter too, so it is not an optimisation.
+	 */
+	u.searchParams.set("resource", MCP_RESOURCE);
 	return u.toString();
 }
 
@@ -144,6 +157,10 @@ export async function exchangeCode(
 			redirect_uri: REDIRECT_URI,
 			client_id: clientId,
 			code_verifier: verifier,
+			// Sent at BOTH legs, as RFC 8707 §2 requires. The authorize leg records what was consented
+			// to; this one selects which of those the token is minted for. Omitting it here lands back
+			// on "no audience to assign" and an opaque token, with the authorize leg looking correct.
+			resource: MCP_RESOURCE,
 		}).toString(),
 	});
 	if (!res.ok) throw new Error(`token exchange failed: ${res.status}`);
@@ -163,6 +180,10 @@ export async function refresh(
 			grant_type: "refresh_token",
 			refresh_token: refreshToken,
 			client_id: clientId,
+			// The refresh leg needs it too, and forgetting it here is the nastiest version of this bug:
+			// connecting works, everything works, and then an hour later the refreshed token comes back
+			// opaque and every call 401s with nothing having changed.
+			resource: MCP_RESOURCE,
 		}).toString(),
 	});
 	if (!res.ok) throw new Error(`token refresh failed: ${res.status}`);

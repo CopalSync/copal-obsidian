@@ -158,3 +158,45 @@ describe("refresh", () => {
 		expect(body.get("refresh_token")).toBe("rt");
 	});
 });
+
+/**
+ * ⛔ RFC 8707. The resource is what makes the access token a JWT with an audience the gateway will
+ * accept. `copal-auth` issues an OPAQUE token when there is no audience to assign, and an opaque
+ * token cannot be verified offline — it surfaces at the gateway as an ordinary bad-token 401, so
+ * sign-in appears to succeed and then every single call fails.
+ *
+ * All three legs, because omitting it from any one of them reproduces the bug at a different
+ * moment: authorize (never consented for the resource), token (opaque from the start), refresh
+ * (works for an hour, then opaque with nothing having changed).
+ */
+describe("the resource indicator", () => {
+	it("is on the authorize URL", () => {
+		const url = new URL(
+			buildAuthorizeUrl(
+				"https://auth.copal.uk/oauth2/authorize",
+				"cid",
+				{ verifier: "v", challenge: "c" },
+				"st8",
+			),
+		);
+		expect(url.searchParams.get("resource")).toBe("https://api.copal.uk/mcp");
+	});
+
+	it("is on the code exchange", async () => {
+		const f = vi
+			.fn<typeof fetch>()
+			.mockResolvedValue(new Response(JSON.stringify({ access_token: "at", expires_in: 3600 })));
+		await exchangeCode(f, "https://auth.copal.uk/oauth2/token", "cid", "code", "verifier");
+		const body = new URLSearchParams(f.mock.calls[0]![1]!.body as string);
+		expect(body.get("resource")).toBe("https://api.copal.uk/mcp");
+	});
+
+	it("is on the refresh", async () => {
+		const f = vi
+			.fn<typeof fetch>()
+			.mockResolvedValue(new Response(JSON.stringify({ access_token: "at2", expires_in: 3600 })));
+		await refresh(f, "https://auth.copal.uk/oauth2/token", "cid", "rt");
+		const body = new URLSearchParams(f.mock.calls[0]![1]!.body as string);
+		expect(body.get("resource")).toBe("https://api.copal.uk/mcp");
+	});
+});

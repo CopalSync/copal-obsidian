@@ -1,3 +1,18 @@
+/**
+ * A failed call, carrying the status so the CALLER can decide what a person should read.
+ *
+ * ⛔ The status is not the message. It was briefly put straight into a Notice, which is a developer
+ * artefact in a customer's face: "401" tells somebody with an expired session nothing they can act
+ * on. It lives here so the UI can say "your session expired, sign in again" while the number stays
+ * available for a log.
+ */
+export class ApiError extends Error {
+	constructor(readonly status: number) {
+		super(`request failed: ${status}`);
+		this.name = "ApiError";
+	}
+}
+
 import { API_BASE } from "../connect/oauth";
 import { parseBatch, parseChangesResponse, parseManifest, parseSearch } from "./validate";
 
@@ -99,7 +114,7 @@ export class SyncApi {
 	/** The account's vaults — the connect-time "which vault?" list (each an isolated note namespace). */
 	async listVaults(): Promise<Vault[]> {
 		const res = await this.authed("/vaults");
-		if (!res.ok) throw new Error(`list vaults failed: ${res.status}`);
+		if (!res.ok) throw new ApiError(res.status);
 		return ((await res.json()) as { vaults: Vault[] }).vaults;
 	}
 
