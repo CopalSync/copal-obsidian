@@ -222,7 +222,7 @@ export class BinarySync {
 
 	private async resolveConflict(path: string, localBytes: ArrayBuffer): Promise<void> {
 		await this.deps.files.writeBinary(conflictName(path), localBytes);
-		this.deps.log?.(`binary conflict — kept a conflict copy: ${path}`);
+		this.deps.log?.(`binary conflict, kept a conflict copy: ${path}`);
 		await this.pull(path); // server wins in place; the conflict copy propagates on its own next push
 	}
 

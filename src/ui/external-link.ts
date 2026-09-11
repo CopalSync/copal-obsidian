@@ -30,7 +30,7 @@ class ExternalLinkModal extends Modal {
 		const { contentEl } = this;
 		contentEl.createEl("h3", { text: "Finish signing in" });
 		contentEl.createEl("p", {
-			text: "Open the Copal sign-in page in your browser, then return to Obsidian — you'll be connected automatically.",
+			text: "Open the Copal sign-in page in your browser, then return to Obsidian. You will be connected automatically.",
 		});
 		const link = contentEl.createEl("a", {
 			text: "Open sign-in page  →",

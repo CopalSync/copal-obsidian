@@ -338,7 +338,7 @@ export class CrdtSync {
 			// data → keep it as a labelled conflict copy.
 			if (adopt) return;
 			await this.deps.vault.write(conflictName(path), fileText); // keep-both (first-import divergence)
-			this.deps.log?.(`first-import divergence — kept a conflict copy: ${path}`);
+			this.deps.log?.(`first-import divergence, kept a conflict copy: ${path}`);
 		}
 	}
 

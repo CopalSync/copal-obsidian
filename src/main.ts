@@ -382,7 +382,7 @@ export default class CopalPlugin extends Plugin {
 		if (this.warnedNames.has(path)) return;
 		this.warnedNames.add(path);
 		new Notice(
-			`Copal: "${path}" can't sync — its name contains an invalid character (e.g. a line break). ` +
+			`Copal: "${path}" cannot sync. Its name contains an invalid character, such as a line break. ` +
 				`Rename it to sync.`,
 			8000,
 		);
@@ -519,9 +519,22 @@ export default class CopalPlugin extends Plugin {
 			let vaults: Vault[];
 			try {
 				vaults = await this.api.listVaults();
-			} catch {
+			} catch (err) {
+				/*
+				 * ⛔ **SAY WHAT ACTUALLY WENT WRONG.** This used to catch everything and report
+				 * "couldn't reach the server", so a 401, a 403, a 500 and a genuinely unreachable
+				 * network all produced one sentence that named the wrong cause for three of them.
+				 * `listVaults` throws with the status in it and that was being thrown away, leaving
+				 * nobody — user or developer — able to tell an expired session from a dead connection.
+				 *
+				 * ⚠️ Nothing in this plugin reaches Sentry. It runs on the user's device, reports to
+				 * no backend of ours, and a failure here is invisible to us unless the person reads it
+				 * out. That makes the on-screen text the ONLY diagnostic there is, which is exactly
+				 * why it has to carry the reason.
+				 */
 				this.setStatus("offline");
-				new Notice("Copal: couldn't reach the server — try again.");
+				const reason = err instanceof Error ? err.message : String(err);
+				new Notice(`Copal: could not list your vaults. ${reason}`, 10000);
 				return;
 			}
 			const vaultId = await this.store.getVaultId();

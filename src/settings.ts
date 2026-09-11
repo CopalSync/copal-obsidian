@@ -62,7 +62,7 @@ export class CopalSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Connected")
 			.setDesc(
-				`This folder syncs to the Copal vault "${vaultName ?? "your vault"}". Sign out to pause — sign ` +
+				`This folder syncs to the Copal vault "${vaultName ?? "your vault"}". Sign out to pause. Sign ` +
 					`back in and it resumes here. Disconnect to unlink this folder entirely; next login you'll ` +
 					`adopt a vault. Either way your Markdown files stay.`,
 			)
@@ -70,7 +70,7 @@ export class CopalSettingTab extends PluginSettingTab {
 				b.setButtonText("Sign out").onClick(async () => {
 					new Notice("Signing out…");
 					await this.plugin.signOut();
-					new Notice("Signed out — sign back in to resume.");
+					new Notice("Signed out. Sign back in to resume.");
 				}),
 			)
 			.addButton((b) =>
@@ -91,7 +91,7 @@ export class CopalSettingTab extends PluginSettingTab {
 						if (!ok) return;
 						new Notice("Disconnecting…");
 						await this.plugin.disconnect();
-						new Notice("Disconnected — your notes are kept as files.");
+						new Notice("Disconnected. Your notes are kept as files.");
 					}),
 			);
 
@@ -101,14 +101,14 @@ export class CopalSettingTab extends PluginSettingTab {
 			cls: "copal-fineprint",
 			text:
 				"Your Copal sign-in is stored in this vault's plugin data. If you sync this vault elsewhere " +
-				"(iCloud, Obsidian Sync, git…), your sign-in is included — sign out on devices you no longer use.",
+				"(iCloud, Obsidian Sync, git…), your sign-in travels with it. Sign out on devices you no longer use.",
 		});
 	}
 
 	private renderConnect(containerEl: HTMLElement): void {
 		new Setting(containerEl)
 			.setName("Sign in to Copal")
-			.setDesc("Sign in with a one-time link — no token to paste.")
+			.setDesc("Sign in with a one-time link. There is no token to paste.")
 			.addButton((b) =>
 				b
 					.setButtonText("Log in")

@@ -104,7 +104,7 @@ export class ConnectFlow {
 		if (params.error) throw new Error(`authorization failed: ${params.error}`);
 		const pending = this.pending;
 		if (!pending) throw new Error("no pending connect attempt");
-		if (params.state !== pending.state) throw new Error("state mismatch — ignoring callback");
+		if (params.state !== pending.state) throw new Error("state mismatch, ignoring callback");
 		if (!params.code) throw new Error("callback missing authorization code");
 		const tokens = await exchangeCode(
 			this.deps.f,
