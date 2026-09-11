@@ -236,3 +236,11 @@
 	-webkit-box-orient: vertical;
 	overflow: hidden;
 }
+
+/* The safe alternative under the danger panel. Quiet, and deliberately NOT red: it is the way out,
+   not part of the hazard. */
+.copal-modal-hint {
+	margin-top: 10px;
+	font-size: var(--font-ui-small);
+	color: var(--text-muted);
+}

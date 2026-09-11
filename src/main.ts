@@ -709,17 +709,16 @@ class AdoptVaultModal extends Modal {
 			const n = this.localFileCount;
 			const warn = contentEl.createDiv({ cls: "copal-modal-danger" });
 			warn.createEl("p", {
-				text: `This folder already has ${n} file${n === 1 ? "" : "s"}. They will move to Obsidian trash, where you can recover them, and the vault you pick will replace them.`,
+				text: `This replaces the ${n} file${n === 1 ? "" : "s"} here. They go to Obsidian trash.`,
 			});
 			/*
-			 * ⚠️ THE WAY OUT, NOT JUST THE WARNING. Somebody who wants their Copal notes AND their
-			 * existing local notes has a perfectly good option and no way to discover it: this screen
-			 * only offered a destructive choice and a close button. Saying "your files will be
-			 * deleted" without saying what to do instead leaves the honest answer looking like
-			 * cancelling.
+			 * ⚠️ OUTSIDE THE RED BOX, deliberately. This is the SAFE option, and putting it inside the
+			 * danger panel dressed the way out as part of the hazard. It is also the only screen that
+			 * ever mentions it, so somebody who wants both sets of notes finds it here or nowhere.
 			 */
-			warn.createEl("p", {
-				text: "To keep these files, close this and make a new empty vault in Obsidian, then connect Copal from there. One Obsidian vault syncs with one Copal vault.",
+			contentEl.createEl("p", {
+				cls: "copal-modal-hint",
+				text: "Want to keep them? Close this and connect Copal from a new, empty Obsidian vault.",
 			});
 		}
 
