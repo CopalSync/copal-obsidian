@@ -1,223 +1,223 @@
 /* Copal status-bar indicator: the amber shard logo + a standard sync icon that colours by state. */
 .copal-status {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  cursor: pointer;
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	cursor: pointer;
 }
 .copal-gem {
-  display: inline-flex;
+	display: inline-flex;
 }
 .copal-gem svg {
-  width: 15px;
-  height: 15px;
-  display: block;
+	width: 15px;
+	height: 15px;
+	display: block;
 }
 .copal-sync {
-  display: inline-flex;
-  align-items: center;
+	display: inline-flex;
+	align-items: center;
 }
 .copal-sync svg {
-  width: 14px;
-  height: 14px;
+	width: 14px;
+	height: 14px;
 }
 
 /* Not connected / offline — muted. */
 .copal-sync.is-off {
-  color: var(--text-muted);
+	color: var(--text-muted);
 }
 
 /* Syncing — amber, spinning. */
 .copal-sync.is-sync {
-  color: #ef9f2c;
-  animation: copal-spin 0.9s linear infinite;
+	color: #ef9f2c;
+	animation: copal-spin 0.9s linear infinite;
 }
 
 /* Synced & live — green. */
 .copal-sync.is-live {
-  color: #3fb950;
+	color: #3fb950;
 }
 
 /* Ribbon icon — the mobile-visible sync-state surface (mobile has no status bar). Same state colours. */
 .copal-ribbon.is-off {
-  color: var(--text-muted);
+	color: var(--text-muted);
 }
 .copal-ribbon.is-sync {
-  color: #ef9f2c;
-  animation: copal-spin 0.9s linear infinite;
+	color: #ef9f2c;
+	animation: copal-spin 0.9s linear infinite;
 }
 .copal-ribbon.is-live {
-  color: #3fb950;
+	color: #3fb950;
 }
 
 @keyframes copal-spin {
-  to {
-    transform: rotate(360deg);
-  }
+	to {
+		transform: rotate(360deg);
+	}
 }
 
 /* Muted fine-print note in settings (e.g. the credential-storage transparency line). */
 .copal-fineprint {
-  color: var(--text-muted);
-  font-size: var(--font-ui-smaller);
-  margin-top: 16px;
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+	margin-top: 16px;
 }
 
 /* Mobile "continue in browser" prompt: a prominent tappable link (the user's tap opens the system browser). */
 .copal-continue-btn {
-  display: inline-block;
-  margin: 10px 0 4px;
-  padding: 10px 16px;
-  border-radius: 8px;
-  background: var(--interactive-accent);
-  color: var(--text-on-accent);
-  font-weight: 600;
-  text-decoration: none;
+	display: inline-block;
+	margin: 10px 0 4px;
+	padding: 10px 16px;
+	border-radius: 8px;
+	background: var(--interactive-accent);
+	color: var(--text-on-accent);
+	font-weight: 600;
+	text-decoration: none;
 }
 .copal-continue-btn:hover {
-  background: var(--interactive-accent-hover);
+	background: var(--interactive-accent-hover);
 }
 
 /* Adopt screen: a list of vault rows (name left, compact red Adopt button right) + the "clears this folder" note. */
 .copal-vault-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin: 4px 0 8px;
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	margin: 4px 0 8px;
 }
 .copal-vault-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 8px 8px 8px 14px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 9px;
-  background: var(--background-secondary);
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+	padding: 8px 8px 8px 14px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 9px;
+	background: var(--background-secondary);
 }
 .copal-vault-name {
-  font-weight: 500;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+	font-weight: 500;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
 }
 .copal-vault-row button {
-  margin: 0;
-  flex: none;
+	margin: 0;
+	flex: none;
 }
 .copal-modal-danger {
-  border: 1px solid var(--background-modifier-error);
-  border-radius: 8px;
-  background: var(--background-modifier-error-hover);
-  padding: 10px 12px;
-  margin: 8px 0 14px;
+	border: 1px solid var(--background-modifier-error);
+	border-radius: 8px;
+	background: var(--background-modifier-error-hover);
+	padding: 10px 12px;
+	margin: 8px 0 14px;
 }
 .copal-modal-danger p {
-  margin: 4px 0;
+	margin: 4px 0;
 }
 
 /* ── Search-by-meaning pane (right sidebar ItemView) ─────────────────────────────────────────── */
 /* Anchor for the absolutely-positioned pane below. */
 .copal-search-host {
-  position: relative;
+	position: relative;
 }
 .copal-search {
-  /* Fill the view content via absolute positioning — a percentage height is unreliable when the parent's
+	/* Fill the view content via absolute positioning — a percentage height is unreliable when the parent's
      height comes from flex (Obsidian's mobile view-content), which left dead space + clipped the results
      when the keyboard resized the pane. `inset: 0` always fills the (correctly-sized) positioned parent. */
-  position: absolute;
-  inset: 0;
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  padding: 8px 12px 12px;
-  gap: 10px;
-  overflow: hidden;
+	position: absolute;
+	inset: 0;
+	display: flex;
+	flex-direction: column;
+	min-height: 0;
+	padding: 8px 12px 12px;
+	gap: 10px;
+	overflow: hidden;
 }
 .copal-search-header {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  flex: none;
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	flex: none;
 }
 .copal-search-input {
-  width: 100%;
+	width: 100%;
 }
 .copal-search-modes {
-  display: flex;
-  gap: 6px;
+	display: flex;
+	gap: 6px;
 }
 .copal-search-mode {
-  flex: 1;
-  padding: 4px 8px;
-  font-size: var(--font-ui-smaller);
-  border-radius: 6px;
-  border: 1px solid var(--background-modifier-border);
-  background: var(--background-secondary);
-  color: var(--text-muted);
-  cursor: pointer;
+	flex: 1;
+	padding: 4px 8px;
+	font-size: var(--font-ui-smaller);
+	border-radius: 6px;
+	border: 1px solid var(--background-modifier-border);
+	background: var(--background-secondary);
+	color: var(--text-muted);
+	cursor: pointer;
 }
 .copal-search-mode.is-active {
-  border-color: #ef9f2c;
-  color: var(--text-normal);
-  background: var(--background-primary);
+	border-color: #ef9f2c;
+	color: var(--text-normal);
+	background: var(--background-primary);
 }
 .copal-search-results {
-  flex: 1;
-  /* Flexbox: a flex child defaults to min-height:auto (its content height), so without this the results
+	flex: 1;
+	/* Flexbox: a flex child defaults to min-height:auto (its content height), so without this the results
      won't shrink when the keyboard opens — they overflow behind it (clipped mid-result) instead of
      scrolling within the visible pane. */
-  min-height: 0;
-  overflow-y: auto;
-  -webkit-overflow-scrolling: touch; /* momentum touch scrolling on iOS */
-  overscroll-behavior: contain;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  /* A little runway so the last result can always scroll clear of the on-screen keyboard. */
-  padding-bottom: 8px;
+	min-height: 0;
+	overflow-y: auto;
+	-webkit-overflow-scrolling: touch; /* momentum touch scrolling on iOS */
+	overscroll-behavior: contain;
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	/* A little runway so the last result can always scroll clear of the on-screen keyboard. */
+	padding-bottom: 8px;
 }
 .copal-search-empty,
 .copal-search-loading {
-  color: var(--text-muted);
-  font-size: var(--font-ui-smaller);
-  padding: 12px 4px;
-  text-align: center;
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+	padding: 12px 4px;
+	text-align: center;
 }
 .copal-search-hit {
-  padding: 8px 10px;
-  border-radius: 8px;
-  border: 1px solid var(--background-modifier-border);
-  background: var(--background-secondary);
-  cursor: pointer;
+	padding: 8px 10px;
+	border-radius: 8px;
+	border: 1px solid var(--background-modifier-border);
+	background: var(--background-secondary);
+	cursor: pointer;
 }
 .copal-search-hit:hover {
-  background: var(--background-modifier-hover);
+	background: var(--background-modifier-hover);
 }
 .copal-search-hit-title {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-weight: 600;
-  color: var(--text-normal);
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	font-weight: 600;
+	color: var(--text-normal);
 }
 .copal-search-hit-icon {
-  display: inline-flex;
-  color: var(--text-muted);
+	display: inline-flex;
+	color: var(--text-muted);
 }
 .copal-search-hit-path {
-  color: var(--text-muted);
-  font-size: var(--font-ui-smaller);
-  margin-top: 2px;
-  word-break: break-word;
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+	margin-top: 2px;
+	word-break: break-word;
 }
 .copal-search-hit-snippet {
-  color: var(--text-muted);
-  font-size: var(--font-ui-smaller);
-  margin-top: 4px;
-  line-height: 1.4;
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+	margin-top: 4px;
+	line-height: 1.4;
+	display: -webkit-box;
+	-webkit-line-clamp: 3;
+	-webkit-box-orient: vertical;
+	overflow: hidden;
 }

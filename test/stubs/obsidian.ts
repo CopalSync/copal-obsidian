@@ -5,112 +5,112 @@
 
 /** A tiny stand-in for Obsidian's augmented HTMLElement (createEl/setText/empty). */
 class FakeEl {
-  children: FakeEl[] = [];
-  text = "";
-  createEl(_tag: string, o?: { text?: string; cls?: string }): FakeEl {
-    const el = new FakeEl();
-    if (o?.text) el.text = o.text;
-    this.children.push(el);
-    return el;
-  }
-  createDiv(o?: { text?: string; cls?: string }): FakeEl {
-    return this.createEl("div", o);
-  }
-  createSpan(o?: { text?: string; cls?: string }): FakeEl {
-    return this.createEl("span", o);
-  }
-  setText(t: string): this {
-    this.text = t;
-    return this;
-  }
-  empty(): void {
-    this.children = [];
-  }
+	children: FakeEl[] = [];
+	text = "";
+	createEl(_tag: string, o?: { text?: string; cls?: string }): FakeEl {
+		const el = new FakeEl();
+		if (o?.text) el.text = o.text;
+		this.children.push(el);
+		return el;
+	}
+	createDiv(o?: { text?: string; cls?: string }): FakeEl {
+		return this.createEl("div", o);
+	}
+	createSpan(o?: { text?: string; cls?: string }): FakeEl {
+		return this.createEl("span", o);
+	}
+	setText(t: string): this {
+		this.text = t;
+		return this;
+	}
+	empty(): void {
+		this.children = [];
+	}
 }
 
 export class Plugin {}
 export class PluginSettingTab {}
 export class App {}
 export class Notice {
-  constructor(_message: string) {}
+	constructor(_message: string) {}
 }
 
 // A swappable `requestUrl` (Obsidian's CORS-free native request) so the fetch-adapter unit test can drive
 // controlled responses. `__setRequestUrl` replaces the implementation the exported `requestUrl` delegates to.
 export interface RequestUrlParam {
-  url: string;
-  method?: string;
-  headers?: Record<string, string>;
-  body?: string | ArrayBuffer;
-  throw?: boolean;
+	url: string;
+	method?: string;
+	headers?: Record<string, string>;
+	body?: string | ArrayBuffer;
+	throw?: boolean;
 }
 export interface RequestUrlResponse {
-  status: number;
-  headers: Record<string, string>;
-  arrayBuffer: ArrayBuffer;
-  text: string;
-  json: unknown;
+	status: number;
+	headers: Record<string, string>;
+	arrayBuffer: ArrayBuffer;
+	text: string;
+	json: unknown;
 }
 let requestUrlImpl: (p: RequestUrlParam) => Promise<RequestUrlResponse> = () =>
-  Promise.reject(new Error("requestUrl not stubbed in this test"));
+	Promise.reject(new Error("requestUrl not stubbed in this test"));
 export function __setRequestUrl(fn: (p: RequestUrlParam) => Promise<RequestUrlResponse>): void {
-  requestUrlImpl = fn;
+	requestUrlImpl = fn;
 }
 export function requestUrl(p: RequestUrlParam): Promise<RequestUrlResponse> {
-  return requestUrlImpl(p);
+	return requestUrlImpl(p);
 }
 
 export class ButtonComponent {
-  onClickCb: (() => void) | undefined;
-  setButtonText(_t: string): this {
-    return this;
-  }
-  setCta(): this {
-    return this;
-  }
-  setWarning(): this {
-    return this;
-  }
-  setIcon(_i: string): this {
-    return this;
-  }
-  onClick(cb: () => void): this {
-    this.onClickCb = cb;
-    return this;
-  }
+	onClickCb: (() => void) | undefined;
+	setButtonText(_t: string): this {
+		return this;
+	}
+	setCta(): this {
+		return this;
+	}
+	setWarning(): this {
+		return this;
+	}
+	setIcon(_i: string): this {
+		return this;
+	}
+	onClick(cb: () => void): this {
+		this.onClickCb = cb;
+		return this;
+	}
 }
 
 export class Setting {
-  constructor(_containerEl?: unknown) {}
-  setName(_n: string): this {
-    return this;
-  }
-  setDesc(_d: string): this {
-    return this;
-  }
-  setHeading(): this {
-    return this;
-  }
-  addButton(cb: (b: ButtonComponent) => void): this {
-    cb(new ButtonComponent());
-    return this;
-  }
+	constructor(_containerEl?: unknown) {}
+	setName(_n: string): this {
+		return this;
+	}
+	setDesc(_d: string): this {
+		return this;
+	}
+	setHeading(): this {
+		return this;
+	}
+	addButton(cb: (b: ButtonComponent) => void): this {
+		cb(new ButtonComponent());
+		return this;
+	}
 }
 
 export class Modal {
-  contentEl = new FakeEl();
-  titleEl = new FakeEl();
-  constructor(public app: unknown) {}
-  setTitle(t: string): this {
-    this.titleEl.setText(t);
-    return this;
-  }
-  open(): void {
-    this.onOpen();
-  }
-  close(): void {
-    this.onClose();
-  }
-  onOpen(): void {}
-  onClose(): void {}
+	contentEl = new FakeEl();
+	titleEl = new FakeEl();
+	constructor(public app: unknown) {}
+	setTitle(t: string): this {
+		this.titleEl.setText(t);
+		return this;
+	}
+	open(): void {
+		this.onOpen();
+	}
+	close(): void {
+		this.onClose();
+	}
+	onOpen(): void {}
+	onClose(): void {}
 }

@@ -1,13 +1,13 @@
 /** One tracked attachment: the server `etag` we last synced, plus a local content `hash` (FNV-1a) so a
  *  file the plugin just wrote from a pull isn't mistaken for a local edit (echo suppression). */
 export interface BinaryEntry {
-  etag: string;
-  hash: string;
+	etag: string;
+	hash: string;
 }
 
 /** The persisted attachment cursor, under the `binary` key of the plugin's `data.json`. */
 export interface BinaryData {
-  known: Record<string, BinaryEntry>;
+	known: Record<string, BinaryEntry>;
 }
 
 /**
@@ -18,42 +18,42 @@ export interface BinaryData {
  * as `SyncState`/`MutationQueue` (all coexist in the one record).
  */
 export class BinaryCursor {
-  private data: BinaryData = { known: {} };
+	private data: BinaryData = { known: {} };
 
-  constructor(
-    private readonly load: () => Promise<BinaryData | null>,
-    private readonly save: (data: BinaryData) => Promise<void>,
-  ) {}
+	constructor(
+		private readonly load: () => Promise<BinaryData | null>,
+		private readonly save: (data: BinaryData) => Promise<void>,
+	) {}
 
-  async init(): Promise<void> {
-    const loaded = await this.load();
-    this.data = { known: loaded?.known ?? {} };
-  }
+	async init(): Promise<void> {
+		const loaded = await this.load();
+		this.data = { known: loaded?.known ?? {} };
+	}
 
-  get(path: string): BinaryEntry | undefined {
-    return this.data.known[path];
-  }
+	get(path: string): BinaryEntry | undefined {
+		return this.data.known[path];
+	}
 
-  set(path: string, entry: BinaryEntry): void {
-    this.data.known[path] = entry;
-  }
+	set(path: string, entry: BinaryEntry): void {
+		this.data.known[path] = entry;
+	}
 
-  delete(path: string): void {
-    delete this.data.known[path];
-  }
+	delete(path: string): void {
+		delete this.data.known[path];
+	}
 
-  /** Every path with a known etag/hash (the file-level tombstone signal, like `knownServer`). */
-  paths(): string[] {
-    return Object.keys(this.data.known);
-  }
+	/** Every path with a known etag/hash (the file-level tombstone signal, like `knownServer`). */
+	paths(): string[] {
+		return Object.keys(this.data.known);
+	}
 
-  async persist(): Promise<void> {
-    await this.save(this.data);
-  }
+	async persist(): Promise<void> {
+		await this.save(this.data);
+	}
 
-  /** Wipe the cursor (on disconnect) so stale etags can't bleed into the next linked vault's reconcile. */
-  async reset(): Promise<void> {
-    this.data = { known: {} };
-    await this.persist();
-  }
+	/** Wipe the cursor (on disconnect) so stale etags can't bleed into the next linked vault's reconcile. */
+	async reset(): Promise<void> {
+		this.data = { known: {} };
+		await this.persist();
+	}
 }

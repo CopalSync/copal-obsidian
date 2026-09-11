@@ -1,9 +1,9 @@
 /** The persisted sync cursor, under the `sync` key of the plugin's `data.json`. */
 export interface SyncData {
-  lastSeq: number;
-  /** Note paths known to be on the server as of the last reconcile — the tombstone signal: a local note
-   *  absent from the server is a genuinely-new note if it was never here, or a remote delete if it was. */
-  knownServer: string[];
+	lastSeq: number;
+	/** Note paths known to be on the server as of the last reconcile — the tombstone signal: a local note
+	 *  absent from the server is a genuinely-new note if it was never here, or a remote delete if it was. */
+	knownServer: string[];
 }
 
 /**
@@ -14,43 +14,43 @@ export interface SyncData {
  * note (push) from one deleted on the server (remove locally) instead of resurrecting the delete.
  */
 export class SyncState {
-  private data: SyncData = { lastSeq: 0, knownServer: [] };
+	private data: SyncData = { lastSeq: 0, knownServer: [] };
 
-  constructor(
-    private readonly load: () => Promise<SyncData | null>,
-    private readonly save: (data: SyncData) => Promise<void>,
-  ) {}
+	constructor(
+		private readonly load: () => Promise<SyncData | null>,
+		private readonly save: (data: SyncData) => Promise<void>,
+	) {}
 
-  async init(): Promise<void> {
-    const loaded = await this.load();
-    // Back-compat: pre-upgrade `sync` records only had `{ lastSeq }`, so default `knownServer` to `[]`.
-    this.data = { lastSeq: loaded?.lastSeq ?? 0, knownServer: loaded?.knownServer ?? [] };
-  }
+	async init(): Promise<void> {
+		const loaded = await this.load();
+		// Back-compat: pre-upgrade `sync` records only had `{ lastSeq }`, so default `knownServer` to `[]`.
+		this.data = { lastSeq: loaded?.lastSeq ?? 0, knownServer: loaded?.knownServer ?? [] };
+	}
 
-  get lastSeq(): number {
-    return this.data.lastSeq;
-  }
+	get lastSeq(): number {
+		return this.data.lastSeq;
+	}
 
-  set lastSeq(seq: number) {
-    this.data.lastSeq = seq;
-  }
+	set lastSeq(seq: number) {
+		this.data.lastSeq = seq;
+	}
 
-  get knownServer(): string[] {
-    return this.data.knownServer;
-  }
+	get knownServer(): string[] {
+		return this.data.knownServer;
+	}
 
-  set knownServer(paths: string[]) {
-    this.data.knownServer = paths;
-  }
+	set knownServer(paths: string[]) {
+		this.data.knownServer = paths;
+	}
 
-  async persist(): Promise<void> {
-    await this.save(this.data);
-  }
+	async persist(): Promise<void> {
+		await this.save(this.data);
+	}
 
-  /** Wipe the cursor back to a fresh state (on disconnect) so a later connect to any vault starts clean —
-   *  no stale `knownServer` tombstones bleeding into the next vault's reconcile. */
-  async reset(): Promise<void> {
-    this.data = { lastSeq: 0, knownServer: [] };
-    await this.persist();
-  }
+	/** Wipe the cursor back to a fresh state (on disconnect) so a later connect to any vault starts clean —
+	 *  no stale `knownServer` tombstones bleeding into the next vault's reconcile. */
+	async reset(): Promise<void> {
+		this.data = { lastSeq: 0, knownServer: [] };
+		await this.persist();
+	}
 }

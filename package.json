@@ -1,36 +1,39 @@
 {
-  "name": "copal-plugin",
-  "version": "0.1.0",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "dev": "node esbuild.config.mjs",
-    "build": "tsc --noEmit && node esbuild.config.mjs production",
-    "typecheck": "tsc --noEmit",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "lint": "oxlint",
-    "format": "oxfmt",
-    "format:check": "oxfmt --check"
-  },
-  "dependencies": {
-    "@codemirror/state": "^6.7.1",
-    "@codemirror/view": "^6.43.6",
-    "lib0": "^0.2.117",
-    "y-codemirror.next": "^0.3.5",
-    "y-indexeddb": "^9.0.12",
-    "y-protocols": "^1.0.7",
-    "yjs": "^13.6.31"
-  },
-  "devDependencies": {
-    "@types/node": "^26.0.1",
-    "builtin-modules": "^4.0.0",
-    "esbuild": "^0.25.0",
-    "fake-indexeddb": "^6.2.5",
-    "obsidian": "^1.7.2",
-    "oxfmt": "0.55.0",
-    "oxlint": "1.70.0",
-    "typescript": "7.0.2",
-    "vitest": "4.1.9"
-  }
+	"name": "copal-plugin",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "node esbuild.config.mjs",
+		"build": "tsc --noEmit && node esbuild.config.mjs production",
+		"typecheck": "tsc --noEmit",
+		"test": "vitest run",
+		"test:watch": "vitest",
+		"lint": "oxlint",
+		"format": "oxfmt",
+		"format:check": "oxfmt --check"
+	},
+	"dependencies": {
+		"@codemirror/state": "^6.7.1",
+		"@codemirror/view": "^6.43.6",
+		"lib0": "^0.2.117",
+		"y-codemirror.next": "^0.3.5",
+		"y-indexeddb": "^9.0.12",
+		"y-protocols": "^1.0.7",
+		"yjs": "^13.6.31"
+	},
+	"devDependencies": {
+		"@types/node": "^26.0.1",
+		"builtin-modules": "^4.0.0",
+		"esbuild": "^0.25.0",
+		"fake-indexeddb": "^6.2.5",
+		"obsidian": "^1.7.2",
+		"oxfmt": "0.60.0",
+		"oxlint": "1.75.0",
+		"typescript": "7.0.2",
+		"vitest": "4.1.10"
+	},
+	"bison": {
+		"workspaceMember": true
+	}
 }

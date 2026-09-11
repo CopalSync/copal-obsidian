@@ -1,7 +1,7 @@
 /** The durable pending-mutation queue, under the `pending` key of the plugin's `data.json`. */
 export interface MutationData {
-  /** Note paths whose remote delete has NOT yet landed (offline / failed) — retried on reconnect. */
-  deletes: string[];
+	/** Note paths whose remote delete has NOT yet landed (offline / failed) — retried on reconnect. */
+	deletes: string[];
 }
 
 /**
@@ -13,40 +13,40 @@ export interface MutationData {
  * (delete-by-identity is idempotent); the delete-half of a rename flows through the same queue.
  */
 export class MutationQueue {
-  private data: MutationData = { deletes: [] };
+	private data: MutationData = { deletes: [] };
 
-  constructor(
-    private readonly load: () => Promise<MutationData | null>,
-    private readonly save: (data: MutationData) => Promise<void>,
-  ) {}
+	constructor(
+		private readonly load: () => Promise<MutationData | null>,
+		private readonly save: (data: MutationData) => Promise<void>,
+	) {}
 
-  async init(): Promise<void> {
-    const loaded = await this.load();
-    this.data = { deletes: loaded?.deletes ?? [] };
-  }
+	async init(): Promise<void> {
+		const loaded = await this.load();
+		this.data = { deletes: loaded?.deletes ?? [] };
+	}
 
-  /** Queue a delete for `path` (no-op if already queued — deletes are idempotent by identity). */
-  enqueueDelete(path: string): void {
-    if (!this.data.deletes.includes(path)) this.data.deletes.push(path);
-  }
+	/** Queue a delete for `path` (no-op if already queued — deletes are idempotent by identity). */
+	enqueueDelete(path: string): void {
+		if (!this.data.deletes.includes(path)) this.data.deletes.push(path);
+	}
 
-  /** Drop `path` from the queue (its delete landed, or was superseded by a local re-creation). */
-  dequeue(path: string): void {
-    this.data.deletes = this.data.deletes.filter((p) => p !== path);
-  }
+	/** Drop `path` from the queue (its delete landed, or was superseded by a local re-creation). */
+	dequeue(path: string): void {
+		this.data.deletes = this.data.deletes.filter((p) => p !== path);
+	}
 
-  /** The currently-queued delete paths (a copy — mutate via enqueue/dequeue). */
-  list(): string[] {
-    return [...this.data.deletes];
-  }
+	/** The currently-queued delete paths (a copy — mutate via enqueue/dequeue). */
+	list(): string[] {
+		return [...this.data.deletes];
+	}
 
-  async persist(): Promise<void> {
-    await this.save(this.data);
-  }
+	async persist(): Promise<void> {
+		await this.save(this.data);
+	}
 
-  /** Wipe the queue (on disconnect) so a stale delete can't fire against the next linked vault. */
-  async reset(): Promise<void> {
-    this.data = { deletes: [] };
-    await this.persist();
-  }
+	/** Wipe the queue (on disconnect) so a stale delete can't fire against the next linked vault. */
+	async reset(): Promise<void> {
+		this.data = { deletes: [] };
+		await this.persist();
+	}
 }

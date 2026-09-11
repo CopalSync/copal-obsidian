@@ -12,21 +12,21 @@ import type { Text as YText, UndoManager } from "yjs";
  * instances, so the binding must be swappable, not baked into the initial state.
  */
 export class EditorBinding {
-  private readonly compartment = new Compartment();
+	private readonly compartment = new Compartment();
 
-  /** Register once: `this.registerEditorExtension([binding.extension()])`. Empty until a note is bound. */
-  extension(): Extension {
-    return this.compartment.of([]);
-  }
+	/** Register once: `this.registerEditorExtension([binding.extension()])`. Empty until a note is bound. */
+	extension(): Extension {
+		return this.compartment.of([]);
+	}
 
-  /** Bind `ytext` to `view` — edits now flow both ways live; remote (agent) edits appear as you type. */
-  attach(view: EditorView, ytext: YText, awareness: Awareness, undoManager?: UndoManager): void {
-    const collab = yCollab(ytext, awareness, undoManager ? { undoManager } : undefined);
-    view.dispatch({ effects: this.compartment.reconfigure(collab) });
-  }
+	/** Bind `ytext` to `view` — edits now flow both ways live; remote (agent) edits appear as you type. */
+	attach(view: EditorView, ytext: YText, awareness: Awareness, undoManager?: UndoManager): void {
+		const collab = yCollab(ytext, awareness, undoManager ? { undoManager } : undefined);
+		view.dispatch({ effects: this.compartment.reconfigure(collab) });
+	}
 
-  /** Unbind — leave the editor as a plain Obsidian editor (on note switch / disconnect). */
-  detach(view: EditorView): void {
-    view.dispatch({ effects: this.compartment.reconfigure([]) });
-  }
+	/** Unbind — leave the editor as a plain Obsidian editor (on note switch / disconnect). */
+	detach(view: EditorView): void {
+		view.dispatch({ effects: this.compartment.reconfigure([]) });
+	}
 }

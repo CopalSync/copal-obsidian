@@ -11,22 +11,22 @@ import { requestUrl } from "obsidian";
  * because `requestUrl` already decoded the body, so those headers would no longer match.
  */
 export const requestUrlFetch: typeof fetch = async (input, init) => {
-  const url = typeof input === "string" ? input : input.toString();
-  const res = await requestUrl({
-    url,
-    method: init?.method ?? "GET",
-    ...(init?.headers ? { headers: init.headers as Record<string, string> } : {}),
-    ...(init?.body === undefined || init?.body === null
-      ? {}
-      : { body: init.body as string | ArrayBuffer }),
-    throw: false,
-  });
-  const headers = new Headers();
-  for (const [key, value] of Object.entries(res.headers ?? {})) {
-    const lower = key.toLowerCase();
-    if (lower === "content-encoding" || lower === "content-length") continue;
-    headers.set(key, value);
-  }
-  if (!headers.has("content-type")) headers.set("content-type", "application/json");
-  return new Response(res.arrayBuffer, { status: res.status, headers });
+	const url = typeof input === "string" ? input : input.toString();
+	const res = await requestUrl({
+		url,
+		method: init?.method ?? "GET",
+		...(init?.headers ? { headers: init.headers as Record<string, string> } : {}),
+		...(init?.body === undefined || init?.body === null
+			? {}
+			: { body: init.body as string | ArrayBuffer }),
+		throw: false,
+	});
+	const headers = new Headers();
+	for (const [key, value] of Object.entries(res.headers ?? {})) {
+		const lower = key.toLowerCase();
+		if (lower === "content-encoding" || lower === "content-length") continue;
+		headers.set(key, value);
+	}
+	if (!headers.has("content-type")) headers.set("content-type", "application/json");
+	return new Response(res.arrayBuffer, { status: res.status, headers });
 };

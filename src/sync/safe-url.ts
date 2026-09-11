@@ -7,7 +7,7 @@
  * a reconnect (offline), so a downgrade never connects.
  */
 export function assertWssUrl(url: string): void {
-  if (!url.startsWith("wss://")) {
-    throw new Error("insecure socket url (expected wss://)");
-  }
+	if (!url.startsWith("wss://")) {
+		throw new Error("insecure socket url (expected wss://)");
+	}
 }

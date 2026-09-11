@@ -10,19 +10,19 @@
  * defense-in-depth. Callers DROP + log an unsafe path — never throw into the sync engine's hot path.
  */
 export function safePath(raw: string): string | null {
-  if (typeof raw !== "string") return null;
-  if (raw.trim() === "") return null;
-  if (raw.includes("\\")) return null; // backslash → Windows/UNC separator, never a vault path
-  // Reject control chars (NUL…US + DEL) — filesystem / header smuggling.
-  for (let i = 0; i < raw.length; i++) {
-    const c = raw.charCodeAt(i);
-    if (c <= 0x1f || c === 0x7f) return null;
-  }
-  if (raw.startsWith("/")) return null; // POSIX absolute
-  if (raw.startsWith("~")) return null; // home expansion
-  if (/^[A-Za-z]:/.test(raw)) return null; // Windows drive letter
-  for (const seg of raw.split("/")) {
-    if (seg === "" || seg === "." || seg === "..") return null;
-  }
-  return raw;
+	if (typeof raw !== "string") return null;
+	if (raw.trim() === "") return null;
+	if (raw.includes("\\")) return null; // backslash → Windows/UNC separator, never a vault path
+	// Reject control chars (NUL…US + DEL) — filesystem / header smuggling.
+	for (let i = 0; i < raw.length; i++) {
+		const c = raw.charCodeAt(i);
+		if (c <= 0x1f || c === 0x7f) return null;
+	}
+	if (raw.startsWith("/")) return null; // POSIX absolute
+	if (raw.startsWith("~")) return null; // home expansion
+	if (/^[A-Za-z]:/.test(raw)) return null; // Windows drive letter
+	for (const seg of raw.split("/")) {
+		if (seg === "" || seg === "." || seg === "..") return null;
+	}
+	return raw;
 }

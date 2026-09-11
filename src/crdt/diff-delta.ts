@@ -1,7 +1,7 @@
 export interface TextDelta {
-  index: number;
-  delete: number;
-  insert: string;
+	index: number;
+	delete: number;
+	insert: string;
 }
 
 /**
@@ -11,20 +11,20 @@ export interface TextDelta {
  * Returns null when the texts are identical.
  */
 export function diffToDelta(oldText: string, newText: string): TextDelta | null {
-  if (oldText === newText) return null;
-  const max = Math.min(oldText.length, newText.length);
-  let prefix = 0;
-  while (prefix < max && oldText[prefix] === newText[prefix]) prefix++;
-  let suffix = 0;
-  while (
-    suffix < max - prefix &&
-    oldText[oldText.length - 1 - suffix] === newText[newText.length - 1 - suffix]
-  ) {
-    suffix++;
-  }
-  return {
-    index: prefix,
-    delete: oldText.length - prefix - suffix,
-    insert: newText.slice(prefix, newText.length - suffix),
-  };
+	if (oldText === newText) return null;
+	const max = Math.min(oldText.length, newText.length);
+	let prefix = 0;
+	while (prefix < max && oldText[prefix] === newText[prefix]) prefix++;
+	let suffix = 0;
+	while (
+		suffix < max - prefix &&
+		oldText[oldText.length - 1 - suffix] === newText[newText.length - 1 - suffix]
+	) {
+		suffix++;
+	}
+	return {
+		index: prefix,
+		delete: oldText.length - prefix - suffix,
+		insert: newText.slice(prefix, newText.length - suffix),
+	};
 }
