@@ -12,8 +12,10 @@ export class ApiError extends Error {
 		/** The gateway's machine-readable code, where it sends one. `VAULT_LIMIT_REACHED` is the only
 		 *  error on POST /vaults that carries one, precisely so a client can say something specific. */
 		readonly code?: string,
+		/** Which call failed, for the log line. Keeps the old `"<op> failed: <status>"` wording. */
+		readonly op?: string,
 	) {
-		super(`request failed: ${status}`);
+		super(`${op ?? "request"} failed: ${status}`);
 		this.name = "ApiError";
 	}
 }
@@ -103,20 +105,26 @@ const unquoteEtag = (value: string): string => value.replace(/^W\//, "").replace
  * Authenticated client for the Copal `/sync/*` surface. The `fetch` and a current-access-token getter
  * are injected so it's unit-testable (and so `main.ts` can supply the CORS-free `requestUrl` adapter).
  */
-export class SyncApi {
-	constructor(
-		private readonly f: typeof fetch,
-		private readonly getToken: () => Promise<string>,
-		/** The Copal vault this Obsidian vault is linked to → sent as `X-Copal-Vault` so the tenant-scoped
-		 *  token resolves the right vault. Absent ⇒ the account's sole vault (error if it has several). */
-		private readonly getVaultId: () => Promise<string | undefined> = () =>
-			Promise.resolve(undefined),
-	) {}
+export interface SyncApiDeps {
+	f: typeof fetch;
+	getToken: () => Promise<string>;
+	/** The Copal vault this Obsidian vault is linked to → sent as `X-Copal-Vault` so the tenant-scoped
+	 *  token resolves the right vault. Absent ⇒ the account's sole vault (error if it has several). */
+	getVaultId?: () => Promise<string | undefined>;
+	/**
+	 * A 401 came back. Refresh and return a token to retry with, or `null` to surface the 401.
+	 *
+	 * Kept as a callback rather than a `TokenManager` import so this client stays ignorant of OAuth.
+	 */
+	onUnauthorized?: (usedToken: string) => Promise<string | null>;
+}
 
-	private async authed(path: string, init?: RequestInit): Promise<Response> {
-		const token = await this.getToken();
-		const vaultId = await this.getVaultId();
-		return this.f(`${API_BASE}${path}`, {
+export class SyncApi {
+	constructor(private readonly deps: SyncApiDeps) {}
+
+	private async send(path: string, token: string, init?: RequestInit): Promise<Response> {
+		const vaultId = await (this.deps.getVaultId?.() ?? Promise.resolve(undefined));
+		return this.deps.f(`${API_BASE}${path}`, {
 			...init,
 			headers: {
 				...init?.headers,
@@ -124,6 +132,33 @@ export class SyncApi {
 				...(vaultId ? { "X-Copal-Vault": vaultId } : {}),
 			},
 		});
+	}
+
+	/**
+	 * Send with the current bearer, and on a 401 refresh once and send again.
+	 *
+	 * ⛔ **THE REACTIVE PATH IS NOT REDUNDANT WITH THE PROACTIVE ONE.** There is zero clock tolerance
+	 * anywhere in this stack (jose defaults `clockTolerance` to 0), phones sleep and wake with skewed
+	 * clocks, and `expires_at` is absent entirely if a token response ever omits `expires_in`. Any of
+	 * those leaves an expired token that looks fine locally and 401s at the edge.
+	 *
+	 * Retrying blindly is safe here for two reasons worth stating, because a future change could
+	 * quietly break either. **(a)** The gateway's 401 comes from `makePrincipalAuth`, the FIRST
+	 * middleware in the protected chain, so no handler has run and no side effect has happened — a
+	 * retried `POST /vaults` or `DELETE /vault/:p` cannot double-apply. **(b)** Every body this
+	 * client sends is a `string` or an `ArrayBuffer`, both re-sendable; a `ReadableStream` body added
+	 * later would be consumed by the first attempt and silently send empty on the second.
+	 *
+	 * Exactly one retry: `refreshAfterUnauthorized` never recurses into this.
+	 */
+	private async authed(path: string, init?: RequestInit): Promise<Response> {
+		const token = await this.deps.getToken();
+		const res = await this.send(path, token, init);
+		if (res.status !== 401 || !this.deps.onUnauthorized) return res;
+
+		const refreshed = await this.deps.onUnauthorized(token);
+		if (refreshed === null) return res;
+		return this.send(path, refreshed, init);
 	}
 
 	/** The account's vaults — the connect-time "which vault?" list (each an isolated note namespace). */
@@ -157,7 +192,7 @@ export class SyncApi {
 				cursor === undefined ? "since=0" : `since=0&cursor=${encodeURIComponent(cursor)}`;
 			// oxlint-disable-next-line no-await-in-loop -- pages are inherently sequential (each needs the prior cursor)
 			const res = await this.authed(`/sync/changes?${query}`);
-			if (!res.ok) throw new Error(`manifest failed: ${res.status}`);
+			if (!res.ok) throw new ApiError(res.status, undefined, "manifest");
 			// oxlint-disable-next-line no-await-in-loop
 			const page = parseManifest(await res.json()); // validate + drop any unsafe (traversal) paths
 			if (cursor === undefined) head = page.head; // page 1 anchors the cursor
@@ -182,28 +217,28 @@ export class SyncApi {
 		const res = await this.authed(`/search?${params.toString()}`, {
 			headers: { "cache-control": "no-cache" },
 		});
-		if (!res.ok) throw new Error(`search failed: ${res.status}`);
+		if (!res.ok) throw new ApiError(res.status, undefined, "search");
 		return parseSearch(await res.json());
 	}
 
 	/** The journal delta after `since`. */
 	async changesSince(since: number): Promise<{ head: number; changes: Change[] }> {
 		const res = await this.authed(`/sync/changes?since=${since}`);
-		if (!res.ok) throw new Error(`changes failed: ${res.status}`);
+		if (!res.ok) throw new ApiError(res.status, undefined, "changes");
 		return parseChangesResponse(await res.json());
 	}
 
 	/** Mint a single-use WebSocket ticket. */
 	async ticket(): Promise<{ ticket: string; url: string }> {
 		const res = await this.authed("/sync/ticket", { method: "POST" });
-		if (!res.ok) throw new Error(`ticket failed: ${res.status}`);
+		if (!res.ok) throw new ApiError(res.status, undefined, "ticket");
 		return (await res.json()) as { ticket: string; url: string };
 	}
 
 	/** Mint a single-use ticket for a per-note CRDT WebSocket (`${url}/<path>?ticket=…`). */
 	async ycrdtTicket(): Promise<{ ticket: string; url: string }> {
 		const res = await this.authed("/ycrdt/ticket", { method: "POST" });
-		if (!res.ok) throw new Error(`ycrdt ticket failed: ${res.status}`);
+		if (!res.ok) throw new ApiError(res.status, undefined, "ycrdt ticket");
 		return (await res.json()) as { ticket: string; url: string };
 	}
 
@@ -212,7 +247,7 @@ export class SyncApi {
 		const res = await this.authed(`/vault/${path.split("/").map(encodeURIComponent).join("/")}`, {
 			method: "DELETE",
 		});
-		if (!res.ok && res.status !== 404) throw new Error(`delete failed: ${res.status}`);
+		if (!res.ok && res.status !== 404) throw new ApiError(res.status, undefined, "delete");
 	}
 
 	/** History-preserving rename: `POST /vault/:from/move` transfers the note's CRDT log + R2 object to `to`
@@ -227,7 +262,7 @@ export class SyncApi {
 				body: JSON.stringify({ to }),
 			},
 		);
-		if (!res.ok && res.status !== 404) throw new Error(`move failed: ${res.status}`);
+		if (!res.ok && res.status !== 404) throw new ApiError(res.status, undefined, "move");
 	}
 
 	/** Read a binary attachment: `GET /file/:path` → raw bytes + content type + the R2 etag (unquoted).
@@ -235,7 +270,7 @@ export class SyncApi {
 	async getFile(path: string): Promise<RemoteFile | null> {
 		const res = await this.authed(`/file/${encodePath(path)}`);
 		if (res.status === 404) return null;
-		if (!res.ok) throw new Error(`get file failed: ${res.status}`);
+		if (!res.ok) throw new ApiError(res.status, undefined, "get file");
 		return {
 			bytes: await res.arrayBuffer(),
 			contentType: res.headers.get("content-type") ?? "application/octet-stream",
@@ -264,7 +299,7 @@ export class SyncApi {
 		if (res.status === 412) {
 			throw new PreconditionError(unquoteEtag(res.headers.get("ETag") ?? "") || undefined);
 		}
-		if (!res.ok) throw new Error(`put file failed: ${res.status}`);
+		if (!res.ok) throw new ApiError(res.status, undefined, "put file");
 		return { etag: unquoteEtag(res.headers.get("ETag") ?? "") };
 	}
 
@@ -272,7 +307,7 @@ export class SyncApi {
 	 *  swallowed (already gone). */
 	async deleteFile(path: string): Promise<void> {
 		const res = await this.authed(`/file/${encodePath(path)}`, { method: "DELETE" });
-		if (!res.ok && res.status !== 404) throw new Error(`delete file failed: ${res.status}`);
+		if (!res.ok && res.status !== 404) throw new ApiError(res.status, undefined, "delete file");
 	}
 
 	/** Fetch the content of many notes in one round-trip; missing/errored paths are omitted. */
@@ -282,7 +317,7 @@ export class SyncApi {
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({ get: paths }),
 		});
-		if (!res.ok) throw new Error(`batch failed: ${res.status}`);
+		if (!res.ok) throw new ApiError(res.status, undefined, "batch");
 		return parseBatch(await res.json()); // keep only found notes with a safe path + string content
 	}
 }

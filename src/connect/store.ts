@@ -7,6 +7,17 @@ export interface PersistedData {
 	 *  the note on `ConnectFlow.start`. A registration the server has forgotten is otherwise a dead
 	 *  end with no way out from inside the plugin. */
 	clientId?: string;
+	/**
+	 * The scope `clientId` was REGISTERED with — the registration's identity, not a preference.
+	 *
+	 * ⛔ `/oauth2/authorize` validates the requested scope against `client.scopes` as captured at
+	 * registration, so a client registered with one scope can never be authorized with another: it
+	 * is refused with `invalid_scope` before any redirect we can observe. Reusing a registration is
+	 * therefore only safe when it was made with the scope we are about to ask for, and this field is
+	 * how `ConnectFlow.start` knows. `undefined` means "registered before this was recorded", which
+	 * is not the same as "matches" — see the migration note there.
+	 */
+	clientScope?: string;
 	/** Set when a connect attempt opens the browser, cleared when the callback lands. Still set at
 	 *  the start of the next attempt means the last one died somewhere the plugin cannot see —
 	 *  `/oauth2/authorize` refusing an unknown client never reaches our redirect. */
@@ -53,6 +64,28 @@ export class TokenStore {
 		await this.save({ ...data, clientId: id });
 	}
 
+	async getClientScope(): Promise<string | undefined> {
+		return (await this.read()).clientScope;
+	}
+
+	/**
+	 * Record a fresh registration: the id and the scope it was made with, in ONE write.
+	 *
+	 * ⚠️ One write, not two. `data.json` is rewritten concurrently by `SyncState`, `MutationQueue`,
+	 * `BinaryCursor` and the binary queue, each doing its own read-modify-write; and a crash between
+	 * two sequential mutators would leave an id with no scope, which reads as "stale" and
+	 * re-registers on every single connect thereafter.
+	 */
+	async setClientRegistration(id: string, scope: string): Promise<void> {
+		await this.save({ ...(await this.read()), clientId: id, clientScope: scope });
+	}
+
+	/** Discard the registration entirely — both keys, one write. See `setClientRegistration`. */
+	async clearClientRegistration(): Promise<void> {
+		const { clientId: _id, clientScope: _scope, ...rest } = await this.read();
+		await this.save(rest);
+	}
+
 	async getTokens(): Promise<Tokens | undefined> {
 		return (await this.read()).tokens;
 	}
@@ -93,6 +126,22 @@ export class TokenStore {
 		delete data.vaultId;
 		delete data.vaultName;
 		await this.save(data);
+	}
+
+	/**
+	 * Signed in on a credential that CANNOT be renewed — an access token with no refresh token.
+	 *
+	 * This is the state every install was in before `offline_access` was added to `SCOPE`: it works
+	 * until the access token expires, then 401s forever with no way back except signing out and in.
+	 * Two things consume it — a notice on load, and the "Sign in again" button in settings, which is
+	 * the ONLY route back for someone whose token is still valid (the connect screen renders only
+	 * when disconnected, so without it the fix would ship inert for exactly the affected users).
+	 *
+	 * Self-deleting: once an install has re-authenticated it can never re-enter this state.
+	 */
+	async needsReauth(): Promise<boolean> {
+		const tokens = (await this.read()).tokens;
+		return tokens?.access_token !== undefined && tokens.refresh_token === undefined;
 	}
 
 	async isConnected(): Promise<boolean> {

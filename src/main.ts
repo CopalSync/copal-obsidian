@@ -16,9 +16,8 @@ import { CrdtSync } from "./crdt/crdt-sync";
 import { EditorBinding } from "./crdt/editor-binding";
 import { LocalDocStore } from "./crdt/local-doc-store";
 import { LocalNoteRegistry } from "./crdt/local-note-registry";
-import { discover, refresh } from "./connect/oauth";
 import { type PersistedData, TokenStore } from "./connect/store";
-import type { Tokens } from "./types";
+import { type ReauthReason, TokenManager } from "./connect/token-manager";
 import { CopalSettingTab } from "./settings";
 import { ApiError, type SearchHit, type SearchMode, SyncApi, type Vault } from "./sync/api";
 import { type BinaryData, BinaryCursor } from "./sync/binary-cursor";
@@ -73,6 +72,9 @@ function colorFromId(id: string): string {
 export default class CopalPlugin extends Plugin {
 	store!: TokenStore;
 	flow!: ConnectFlow;
+	private tokens!: TokenManager;
+	/** Once per session: a burst of 401s must not become a burst of notices. */
+	private reauthPrompted = false;
 	sync: SyncClient | undefined;
 	crdt: CrdtSync | undefined;
 	private vault: ObsidianVault | undefined;
@@ -105,13 +107,20 @@ export default class CopalPlugin extends Plugin {
 			randomState: () => crypto.randomUUID(),
 		});
 
+		this.tokens = new TokenManager({
+			f: requestUrlFetch,
+			store: this.store,
+			onReauthRequired: (reason) => this.onReauthRequired(reason),
+		});
+
 		// Sync stack. SyncState persists under the `sync` key of data.json, alongside the connect tokens;
 		// both read-modify-write the whole record, so they coexist.
-		const api = new SyncApi(
-			requestUrlFetch,
-			() => this.getValidToken(),
-			() => this.store.getVaultId(),
-		);
+		const api = new SyncApi({
+			f: requestUrlFetch,
+			getToken: () => this.tokens.getValid(),
+			getVaultId: () => this.store.getVaultId(),
+			onUnauthorized: (used) => this.tokens.refreshAfterUnauthorized(used),
+		});
 		this.api = api;
 		const syncState = new SyncState(
 			async () =>
@@ -225,11 +234,29 @@ export default class CopalPlugin extends Plugin {
 		// The magic-link sign-in redirects to obsidian://copal-connect?code=…&state=… — caught here.
 		this.registerObsidianProtocolHandler("copal-connect", async (params) => {
 			try {
-				await this.flow.handleCallback({
+				const tokens = await this.flow.handleCallback({
 					code: params.code,
 					state: params.state,
 					error: params.error,
 				});
+				/*
+				 * ⛔ **THE REGRESSION ALARM.** A sign-in that returns no refresh token is the exact
+				 * outage this plugin shipped with for its whole life, and nothing noticed because
+				 * nothing looked. If `offline_access` ever stops being granted — a scope config change,
+				 * a resource row with a non-null `allowed_scopes` — this is where it becomes visible.
+				 *
+				 * Deliberately not a throw: refusing the sign-in would turn a degraded hour into a total
+				 * outage. Store the token and shout.
+				 */
+				if (!tokens.refresh_token) {
+					console.error(
+						"[copal] sign-in returned no refresh_token. This session expires in about an hour and cannot renew. Check that SCOPE requests offline_access and that the authorization server still grants it.",
+					);
+					new Notice(
+						"Copal: signed in, but this session can't renew itself and will stop working in about an hour. Please report this.",
+						12000,
+					);
+				}
 				new Notice("Copal connected ✓");
 				await this.settingsTab?.refresh();
 				void this.startSync(); // fresh bind → the connect flow selects the vault (create vs pull)
@@ -299,6 +326,17 @@ export default class CopalPlugin extends Plugin {
 		// `startBound`, so the `create` replays Obsidian fires for existing files at startup are ignored.
 		this.app.workspace.onLayoutReady(() => {
 			void (async () => {
+				/*
+				 * An install signed in before `offline_access` holds a token that cannot be renewed. It
+				 * still works until it expires, so do NOT sign them out — interrupting sync that is
+				 * working right now would be gratuitous. Say it once and let Settings offer the button.
+				 */
+				if (await this.store.needsReauth()) {
+					new Notice(
+						"Copal: this sign-in can't renew itself and will stop working soon. Open Settings → Copal and choose Sign in again.",
+						10000,
+					);
+				}
 				if (await this.store.isConnected()) await this.startSync();
 			})();
 		});
@@ -631,34 +669,30 @@ export default class CopalPlugin extends Plugin {
 	}
 
 	/**
-	 * The current access token, transparently refreshed if it's expired (or within 60s of expiring) using
-	 * the stored refresh token. Access tokens are short-lived (~1h); without this the plugin would break an
-	 * hour after connecting.
+	 * The credential is dead. Stop, and say so.
+	 *
+	 * ⛔ **`stopSync()` IS THE POINT OF THIS METHOD.** Neither socket ever gives up on its own:
+	 * `SyncClient.scheduleReconnect` re-fires every 3s forever and `WsTransport` backs off to a 15s
+	 * cap and then keeps going, both swallowing the ticket 401 that caused them. That is how one
+	 * expired token produced 6550 requests in a week while the UI said nothing worse than "offline".
+	 *
+	 * Sign-out keeps the vault link, so signing back in resumes the same vault with no adopt screen.
 	 */
-	private async getValidToken(): Promise<string> {
-		const tokens = await this.store.getTokens();
-		if (!tokens?.access_token) throw new Error("not connected");
-		const expiringSoon = tokens.expires_at !== undefined && tokens.expires_at < Date.now() + 60_000;
-		if (expiringSoon && tokens.refresh_token) {
-			const clientId = await this.store.getClientId();
-			if (clientId) {
-				const disc = await discover(requestUrlFetch);
-				const fresh = await refresh(
-					requestUrlFetch,
-					disc.token_endpoint,
-					clientId,
-					tokens.refresh_token,
-				);
-				// The refresh response may omit a new refresh token — keep the existing one if so.
-				const merged: Tokens =
-					tokens.refresh_token !== undefined
-						? { refresh_token: tokens.refresh_token, ...fresh }
-						: fresh;
-				await this.store.setTokens(merged);
-				return merged.access_token;
-			}
-		}
-		return tokens.access_token;
+	private onReauthRequired(reason: ReauthReason): void {
+		if (this.reauthPrompted) return;
+		this.reauthPrompted = true;
+		void (async () => {
+			this.stopSync();
+			await this.store.signOut();
+			this.setStatus("idle");
+			await this.settingsTab?.refresh();
+			new Notice(
+				reason === "revoked"
+					? "Copal: this vault's access was revoked. Sign in again from Settings."
+					: "Copal: your sign-in has expired. Sign in again from Settings.",
+				10000,
+			);
+		})();
 	}
 
 	private setStatus(status: SyncStatus): void {

@@ -1,6 +1,7 @@
 import type { SyncStatus } from "../ui/status";
 import type { Change, SyncApi } from "./api";
 import { assertWssUrl } from "./safe-url";
+import { closeCode, WS_REAUTH_CLOSE } from "./ws-close";
 import type { SyncState } from "./state";
 import { parseChange } from "./validate";
 
@@ -94,7 +95,7 @@ export class SyncClient {
 				void this.sink.drainPending?.(); // came back online → replay any queued offline deletes
 			});
 			ws.addEventListener("message", (e) => this.onMessage(e.data as string));
-			ws.addEventListener("close", () => this.scheduleReconnect());
+			ws.addEventListener("close", (e) => this.scheduleReconnect(closeCode(e)));
 			ws.addEventListener("error", () => ws.close());
 		} catch {
 			this.scheduleReconnect();
@@ -133,10 +134,15 @@ export class SyncClient {
 		}
 	}
 
-	private scheduleReconnect(): void {
+	/**
+	 * @param code the close code, where the caller saw one. `WS_REAUTH_CLOSE` is the gateway retiring
+	 * this socket on schedule — reconnect without telling the user they are offline, because they are
+	 * not. Anything else is a genuine drop and keeps the "offline" status it always had.
+	 */
+	private scheduleReconnect(code?: number): void {
 		this.ws = undefined;
 		if (this.stopped) return;
-		this.onStatus("offline");
+		if (code !== WS_REAUTH_CLOSE) this.onStatus("offline");
 		this.reconnectTimer = setTimeout(() => this.openWs(), 3000);
 	}
 }

@@ -1,5 +1,5 @@
 import type { Tokens } from "../types";
-import { buildAuthorizeUrl, discover, exchangeCode, registerClient } from "./oauth";
+import { buildAuthorizeUrl, discover, exchangeCode, registerClient, SCOPE } from "./oauth";
 import { createPkce } from "./pkce";
 import type { TokenStore } from "./store";
 
@@ -18,6 +18,15 @@ interface Pending {
 	state: string;
 	tokenEndpoint: string;
 	clientId: string;
+}
+
+/**
+ * Scope strings compared as SETS, because that is what the server compares. `undefined` normalises
+ * to `""`, which matches nothing real — an install that predates `clientScope` has no evidence its
+ * registration is usable, so it re-registers once. That is the migration.
+ */
+function normaliseScope(scope: string | undefined): string {
+	return (scope ?? "").split(" ").filter(Boolean).sort().join(" ");
 }
 
 /**
@@ -50,6 +59,15 @@ export class ConnectFlow {
 	 *
 	 * So the only exit was deleting `data.json` by hand, on a phone.
 	 *
+	 * ⛔ **A REGISTRATION IS ALSO DEAD IF IT WAS MADE WITH A DIFFERENT SCOPE**, and that failure
+	 * looks nothing like the one above. `/oauth2/authorize` validates the requested scope against
+	 * `client.scopes` captured at registration and refuses a mismatch with `invalid_scope`. When
+	 * `offline_access` was added to `SCOPE` on 2026-09-12, every existing install held a client
+	 * registered narrower — and every one of them had `connectAttemptPending === false`, so the
+	 * mark below would have happily kept it and turned a silent hourly breakage into a hard
+	 * "cannot sign in at all". Hence `clientScope`: a registration is reusable only when it was
+	 * made with the scope we are about to request.
+	 *
 	 * The fix is to notice a connect that never came back. `start()` marks an attempt pending and
 	 * `handleCallback` clears it; a second `start()` that finds the mark still set knows the last
 	 * attempt died somewhere it could not observe, and discards the registration before trying
@@ -74,8 +92,14 @@ export class ConnectFlow {
 		 * `false` — the last attempt completed. Keep it.
 		 */
 		const lastAttempt = await store.getConnectAttemptPending();
-		if (lastAttempt !== false) {
-			await store.setClientId(undefined);
+		/*
+		 * Compared NORMALISED, so reordering `SCOPE` is not a change. A raw string compare would
+		 * re-register every install on the planet for a purely cosmetic edit, and the authorization
+		 * server accumulates a client row for each one.
+		 */
+		const scopeChanged = normaliseScope(await store.getClientScope()) !== normaliseScope(SCOPE);
+		if (lastAttempt !== false || scopeChanged) {
+			await store.clearClientRegistration();
 		}
 		await store.setConnectAttemptPending(true);
 
@@ -83,7 +107,7 @@ export class ConnectFlow {
 		if (!clientId) {
 			const reg = await registerClient(f, disc.registration_endpoint);
 			clientId = reg.client_id;
-			await store.setClientId(clientId);
+			await store.setClientRegistration(clientId, SCOPE);
 		}
 		const pkce = await createPkce();
 		const state = randomState();

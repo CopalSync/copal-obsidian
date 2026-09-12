@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { ApiError, SyncApi } from "../../src/sync/api";
 
-const api = () => new SyncApi(f, async () => "token");
+const api = () => new SyncApi({ f, getToken: async () => "token" });
 let f: ReturnType<typeof vi.fn<typeof fetch>>;
 
 /**

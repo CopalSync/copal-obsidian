@@ -143,7 +143,7 @@ export class CrdtSync {
 	}): Promise<void> {
 		if (this.active?.path === change.path) return; // the editor binding owns the live note
 		// The CRDT engine is markdown-only (Yjs text). A non-.md journal entry (e.g. a binary written via
-		// WebDAV/MCP/another device) must never be CRDT-pulled as text — route an attachment to the file-level
+		// MCP/another device) must never be CRDT-pulled as text — route an attachment to the file-level
 		// last-writer-wins transport (BinarySync) instead; anything else (e.g. config) is skipped.
 		if (!isMarkdownPath(change.path)) {
 			if (this.deps.binarySync && isAttachmentPath(change.path)) {

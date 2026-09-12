@@ -1,4 +1,5 @@
 import { assertWssUrl } from "../sync/safe-url";
+import { closeCode, WS_REAUTH_CLOSE } from "../sync/ws-close";
 import type { YTransport } from "./crdt-note";
 
 /** Reconnect backoff: base delay, doubled per attempt, capped. */
@@ -53,8 +54,18 @@ export class WsTransport implements YTransport {
 			this.openCb?.(); // (re)handshake
 		});
 		ws.addEventListener("message", (e) => this.msgCb?.(e.data as ArrayBuffer));
-		ws.addEventListener("close", () => {
+		ws.addEventListener("close", (e) => {
 			if (this.ws === ws) this.ws = undefined;
+			/*
+			 * A scheduled retirement is not a failure, so it must not inherit the backoff. Without this
+			 * reset, a note left open all day walks its way to the 15s cap through nothing but healthy
+			 * half-hourly rotations, and then a real drop waits 15s to recover.
+			 *
+			 * ⚠️ Read defensively. A real CloseEvent always carries a code, but `close` is also fired
+			 * by `error` handlers and by test doubles with no event at all — and a throw in here would
+			 * lose the reconnect entirely, turning a momentary blip into a permanently dead socket.
+			 */
+			if (closeCode(e) === WS_REAUTH_CLOSE) this.attempt = 0;
 			if (!this.closed) this.scheduleReconnect();
 		});
 		ws.addEventListener("error", () => ws.close());

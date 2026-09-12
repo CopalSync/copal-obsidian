@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
 	buildAuthorizeUrl,
+	SCOPE,
 	discover,
 	exchangeCode,
 	refresh,
@@ -26,7 +27,13 @@ describe("buildAuthorizeUrl", () => {
 		expect(url.searchParams.get("redirect_uri")).toBe(REDIRECT_URI);
 		expect(url.searchParams.get("code_challenge")).toBe("chal");
 		expect(url.searchParams.get("code_challenge_method")).toBe("S256");
-		expect(url.searchParams.get("scope")).toBe("vault.read vault.write");
+		expect(url.searchParams.get("scope")).toBe(SCOPE);
+		// ⛔ Named explicitly, not just "whatever SCOPE says": this single word is what buys a refresh
+		// token, and without it every install dies an hour after signing in. See the note on SCOPE.
+		expect(
+			url.searchParams.get("scope")?.split(" "),
+			"offline_access left the authorize request — sign-ins will expire in an hour with no way to renew",
+		).toContain("offline_access");
 		expect(url.searchParams.get("state")).toBe("st8");
 	});
 });

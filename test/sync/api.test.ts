@@ -5,11 +5,11 @@ const json = (b: unknown, status = 200) => new Response(JSON.stringify(b), { sta
 const bin = (bytes: number[], status = 200, headers: Record<string, string> = {}) =>
 	new Response(new Uint8Array(bytes), { status, headers });
 const makeApi = (f: typeof fetch, vaultId: string | undefined = "vlt_x") =>
-	new SyncApi(
+	new SyncApi({
 		f,
-		() => Promise.resolve("tok"),
-		() => Promise.resolve(vaultId),
-	);
+		getToken: () => Promise.resolve("tok"),
+		getVaultId: () => Promise.resolve(vaultId),
+	});
 
 describe("SyncApi", () => {
 	it("manifest() GETs /sync/changes?since=0 with a bearer", async () => {
@@ -127,7 +127,7 @@ describe("SyncApi", () => {
 
 	it("omits X-Copal-Vault when no vault is linked (server resolves the sole vault)", async () => {
 		const f = vi.fn<typeof fetch>().mockResolvedValue(json({ head: 0, manifest: [] }));
-		await new SyncApi(f, () => Promise.resolve("tok")).manifest(); // ctor default getVaultId → undefined
+		await new SyncApi({ f, getToken: () => Promise.resolve("tok") }).manifest(); // no getVaultId → undefined
 		const headers = f.mock.calls[0]![1]!.headers as Record<string, string>;
 		expect(headers["X-Copal-Vault"]).toBeUndefined();
 	});

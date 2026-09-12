@@ -32,6 +32,40 @@ export class CopalSettingTab extends PluginSettingTab {
 			return;
 		}
 
+		/*
+		 * ⛔ **THE ONLY ROUTE BACK FOR AN INSTALL THAT PREDATES `offline_access`.**
+		 *
+		 * Such an install holds a token it cannot renew. It is still `isConnected()`, so the block
+		 * above never fires and the Log in button is never shown — meaning without this branch the
+		 * whole fix ships INERT for exactly the people who have the bug. `flow.start()` re-registers
+		 * the client (the stored one was registered with the old, narrower scope and would be refused
+		 * `invalid_scope`) and signs in again, keeping the vault link.
+		 *
+		 * Self-deleting: once re-authenticated, `needsReauth()` can never be true again.
+		 */
+		if (await this.plugin.store.needsReauth()) {
+			new Setting(containerEl)
+				.setName("Sign in again")
+				.setDesc(
+					"This sign-in can't renew itself, so syncing will stop when it expires. Signing in " +
+						"again fixes it for good and keeps this vault linked.",
+				)
+				.addButton((b) =>
+					b
+						.setButtonText("Sign in again")
+						.setCta()
+						.onClick(async () => {
+							try {
+								await this.plugin.flow.start();
+							} catch (err) {
+								new Notice(
+									`Copal sign-in failed: ${err instanceof Error ? err.message : String(err)}`,
+								);
+							}
+						}),
+				);
+		}
+
 		if (!(await this.plugin.store.getVaultId())) {
 			// Signed in, but this folder isn't linked to a vault (the adopt screen was closed). Nothing syncs.
 			new Setting(containerEl)

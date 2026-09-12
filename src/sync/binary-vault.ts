@@ -84,7 +84,7 @@ export class ObsidianBinaryVault implements BinaryFiles {
 }
 
 /** Guess a content type from a path's extension so `putFile` stores a useful `Content-Type` (Obsidian
- *  itself renders attachments by extension; this is for WebDAV/browser fetches). Defaults to octet-stream. */
+ *  itself renders attachments by extension; this is for browser and REST fetches). Defaults to octet-stream. */
 export function mimeForPath(path: string): string {
 	const ext = path.slice(path.lastIndexOf(".") + 1).toLowerCase();
 	return MIME[ext] ?? "application/octet-stream";

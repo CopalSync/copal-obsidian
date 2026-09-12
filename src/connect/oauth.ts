@@ -16,7 +16,25 @@ export const API_BASE = "https://api.copal.uk";
  * this plugin, so a code seen in the browser is not redeemable by anyone else.
  */
 export const REDIRECT_URI = "https://copal.uk/plugin/connect";
-export const SCOPE = "vault.read vault.write";
+/**
+ * ⛔ **`offline_access` IS WHAT BUYS A REFRESH TOKEN. REMOVING IT BREAKS EVERY INSTALL IN AN HOUR.**
+ *
+ * This read `"vault.read vault.write"` until 2026-09-12, and the consequence was total: Better
+ * Auth issues a refresh token only when the granted scopes include `offline_access`
+ * (`isRefreshToken`, `@better-auth/oauth-provider/dist/index.mjs`). Without it the plugin holds a
+ * ONE-HOUR access token and nothing else, `getValidToken`'s refresh branch is unreachable because
+ * `tokens.refresh_token` is never set, and at T+1h every call 401s — both WebSockets dropping into
+ * a silent forever-reconnect that reads as "offline" and is indistinguishable from a dead network.
+ * 6550 such 401s in one week, and the only cure a user could find was signing out and back in.
+ *
+ * ⚠️ Changing this string invalidates a stored client registration. `/oauth2/authorize` validates
+ * the requested scope against `client.scopes` as captured at registration, so a client registered
+ * with one scope can never be authorized with another — which is why `ConnectFlow.start` discards
+ * the registration when this value changes. Do not change it without reading that comment.
+ *
+ * Gated by `copal-auth/test/integration/plugin-grant.test.ts`, which drives this exact constant.
+ */
+export const SCOPE = "vault.read vault.write offline_access";
 
 interface Discovery {
 	registration_endpoint: string;
@@ -167,6 +185,51 @@ export async function exchangeCode(
 	return toTokens(await res.json());
 }
 
+/**
+ * A failed refresh, carrying whether the credential is DEAD or merely unreachable.
+ *
+ * ⛔ The distinction is the whole point, and getting it wrong is worse than the bug it guards.
+ * Signing someone out because their train went into a tunnel would lose unsynced work and make the
+ * product look broken. So `terminal` is true ONLY for the OAuth errors that mean the grant itself
+ * is gone; a 500, a timeout, a captive portal and a DNS failure are all transient, and the caller
+ * keeps the tokens and retries later.
+ */
+export class TokenRefreshError extends Error {
+	constructor(
+		readonly status: number | undefined,
+		readonly oauthError: string | undefined,
+		/** The grant is gone and no retry will help — the user must sign in again. */
+		readonly terminal: boolean,
+	) {
+		super(`token refresh failed: ${status ?? "network"}${oauthError ? ` (${oauthError})` : ""}`);
+		this.name = "TokenRefreshError";
+	}
+
+	/**
+	 * Classify a non-ok token response. RFC 6749 §5.2 error codes; anything else (5xx, an HTML error
+	 * page from a proxy, a body that is not JSON) is treated as transient, because the one thing we
+	 * must not do is discard a live credential on a server hiccup.
+	 */
+	static async from(res: Response): Promise<TokenRefreshError> {
+		let oauthError: string | undefined;
+		try {
+			const body = (await res.json()) as { error?: unknown };
+			if (typeof body.error === "string") oauthError = body.error;
+		} catch {
+			// A non-JSON body tells us nothing; fall through and let the status decide.
+		}
+		const dead = new Set([
+			"invalid_grant",
+			"invalid_client",
+			"unauthorized_client",
+			"invalid_scope",
+		]);
+		const terminal =
+			res.status >= 400 && res.status < 500 && oauthError !== undefined && dead.has(oauthError);
+		return new TokenRefreshError(res.status, oauthError, terminal);
+	}
+}
+
 export async function refresh(
 	f: typeof fetch,
 	tokenEndpoint: string,
@@ -180,12 +243,22 @@ export async function refresh(
 			grant_type: "refresh_token",
 			refresh_token: refreshToken,
 			client_id: clientId,
+			/*
+			 * ⛔ **`scope` IS DELIBERATELY ABSENT. DO NOT "FIX" THIS BY ADDING IT.**
+			 *
+			 * Omitting it makes the server reuse `refreshToken.scopes` — the full granted set,
+			 * `offline_access` included. Sending it is a DOWN-SCOPE request, and a rotated token that
+			 * loses `offline_access` stops being refreshable: the next refresh returns no
+			 * `refresh_token` at all, the chain silently terminates, and every device logs out
+			 * together weeks later when the last token expires. `plugin-grant.test.ts` refreshes
+			 * TWICE for exactly this reason — one refresh cannot see it.
+			 */
 			// The refresh leg needs it too, and forgetting it here is the nastiest version of this bug:
 			// connecting works, everything works, and then an hour later the refreshed token comes back
 			// opaque and every call 401s with nothing having changed.
 			resource: MCP_RESOURCE,
 		}).toString(),
 	});
-	if (!res.ok) throw new Error(`token refresh failed: ${res.status}`);
+	if (!res.ok) throw await TokenRefreshError.from(res);
 	return toTokens(await res.json());
 }

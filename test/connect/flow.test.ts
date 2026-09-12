@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { ConnectFlow } from "../../src/connect/flow";
+import { SCOPE } from "../../src/connect/oauth";
 import { type PersistedData, TokenStore } from "../../src/connect/store";
 
 // Discovery is two hops: the gateway's protected-resource document names the authorization
@@ -91,10 +92,10 @@ describe("ConnectFlow", () => {
 
 	it("reuses a previously-registered client id (no re-registration)", async () => {
 		const store = memStore();
-		await store.setClientId("existing");
-		// A COMPLETED attempt is what makes a stored registration trustworthy. Setting the id alone
-		// now describes an install that predates the mark, which re-registers on purpose — see the
-		// migration case below.
+		// A COMPLETED attempt AND a matching scope are what make a stored registration trustworthy.
+		// An id alone now describes an install that predates one or both marks, which re-registers on
+		// purpose — see the migration cases below.
+		await store.setClientRegistration("existing", SCOPE);
 		await store.setConnectAttemptPending(false);
 		const f = discovery(vi.fn<typeof fetch>());
 		const openUrl = vi.fn<(u: string) => void>();
@@ -139,7 +140,7 @@ describe("ConnectFlow — recovering from a registration the server has forgotte
 		// The falsifier for the test above. If `start()` simply discarded the client every time, that
 		// test would pass while the plugin registered a new client on every single connect.
 		const store = memStore();
-		await store.setClientId("known-good");
+		await store.setClientRegistration("known-good", SCOPE);
 		await store.setConnectAttemptPending(false);
 
 		const f = discovery(vi.fn<typeof fetch>());
@@ -183,5 +184,85 @@ describe("ConnectFlow — the migration for installs that predate the mark", () 
 
 		expect(await store.getClientId()).toBe("fresh");
 		expect(new URL(openUrl.mock.calls[0]![0]).searchParams.get("client_id")).toBe("fresh");
+	});
+});
+
+/**
+ * ⛔ **A REGISTRATION MADE WITH A DIFFERENT SCOPE IS DEAD, AND FAILS WHERE NOBODY CAN SEE IT.**
+ *
+ * `/oauth2/authorize` validates the requested scope against `client.scopes` captured at
+ * registration and answers `invalid_scope`. When `offline_access` was added to `SCOPE`, every
+ * install held a narrower registration AND had `connectAttemptPending === false` — so without this
+ * the mark would have kept the dead client and turned a silent hourly breakage into "cannot sign in
+ * at all", on software already on people's phones.
+ */
+describe("ConnectFlow — a registration is only reusable at the scope it was made with", () => {
+	it("⛔ re-registers when the stored scope is narrower than SCOPE", async () => {
+		const store = memStore();
+		await store.setClientRegistration("narrow-client", "vault.read vault.write");
+		await store.setConnectAttemptPending(false);
+
+		const f = discovery(vi.fn<typeof fetch>()).mockResolvedValueOnce(
+			json({ client_id: "wide" }, 201),
+		);
+		const openUrl = vi.fn<(u: string) => void>();
+		await new ConnectFlow({ f, store, openUrl, randomState: () => "st8" }).start();
+
+		expect(await store.getClientId()).toBe("wide");
+		expect(new URL(openUrl.mock.calls[0]![0]).searchParams.get("scope")).toBe(SCOPE);
+	});
+
+	it("re-registers when the scope was never recorded (the migration)", async () => {
+		const store = memStore();
+		await store.setClientId("pre-scope-client");
+		await store.setConnectAttemptPending(false);
+		expect(await store.getClientScope()).toBeUndefined();
+
+		const f = discovery(vi.fn<typeof fetch>()).mockResolvedValueOnce(
+			json({ client_id: "fresh" }, 201),
+		);
+		await new ConnectFlow({
+			f,
+			store,
+			openUrl: vi.fn<(u: string) => void>(),
+			randomState: () => "st8",
+		}).start();
+
+		expect(await store.getClientId()).toBe("fresh");
+	});
+
+	it("persists the scope it registered with, so the NEXT connect reuses the client", async () => {
+		const store = memStore();
+		const f = discovery(vi.fn<typeof fetch>()).mockResolvedValueOnce(
+			json({ client_id: "cid" }, 201),
+		);
+		const flow = new ConnectFlow({
+			f,
+			store,
+			openUrl: vi.fn<(u: string) => void>(),
+			randomState: () => "st8",
+		});
+
+		await flow.start();
+		expect(await store.getClientScope()).toBe(SCOPE);
+
+		await flow.handleCallback.call(flow, { code: "x", state: "st8" }).catch(() => undefined);
+	});
+
+	/**
+	 * The falsifier for the normaliser. A raw string compare would re-register every install on the
+	 * planet for a purely cosmetic reorder, and the server accumulates a client row for each.
+	 */
+	it("⛔ does NOT re-register when the scope is merely REORDERED", async () => {
+		const reordered = SCOPE.split(" ").reverse().join(" ");
+		const store = memStore();
+		await store.setClientRegistration("known-good", reordered);
+		await store.setConnectAttemptPending(false);
+
+		const f = discovery(vi.fn<typeof fetch>());
+		const openUrl = vi.fn<(u: string) => void>();
+		await new ConnectFlow({ f, store, openUrl, randomState: () => "st8" }).start();
+
+		expect(await store.getClientId()).toBe("known-good");
 	});
 });
