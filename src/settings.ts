@@ -151,9 +151,9 @@ export class CopalSettingTab extends PluginSettingTab {
 			cls: "copal-fineprint",
 			text:
 				"Your Copal sign-in is stored in this vault's plugin data. If you sync this vault elsewhere " +
-				"(iCloud, Obsidian Sync, git…), your sign-in travels with it. Signing out revokes that " +
-				"sign-in with Copal, so the copies cannot renew it. Access already granted can take up to " +
-				"an hour to lapse.",
+				"(iCloud, Obsidian Sync, git…), your sign-in travels with it. Signing out asks Copal to " +
+				"revoke that sign-in so the copies cannot renew it, and tells you if it could not reach " +
+				"Copal to do so. Access already granted can take up to an hour to lapse.",
 		});
 	}
 

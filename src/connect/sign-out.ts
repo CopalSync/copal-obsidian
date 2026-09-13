@@ -1,5 +1,5 @@
 import type { TokenStore } from "./store";
-import type { RevokeOutcome, TokenManager } from "./token-manager";
+import type { RevokeOutcome, RevokeScope, TokenManager } from "./token-manager";
 
 /**
  * Narrowed to the two things a teardown touches, so a test can drive the ordering with fakes instead
@@ -9,11 +9,13 @@ export interface TearDownDeps {
 	tokens: Pick<TokenManager, "revokeAndAbandon" | "abandon">;
 	store: Pick<TokenStore, "signOut">;
 	/**
-	 * `false` where the credential is already known dead (a terminal refresh failure). The race still
-	 * has to be closed, but a revoke round trip for a token the server has already discarded is a
-	 * pointless call on a path that is usually taken because the network is misbehaving.
+	 * `"none"` where the credential is already known dead (a terminal refresh failure): the race still
+	 * has to be closed, but a round trip for a token the server has already discarded is a pointless
+	 * call on a path usually taken because the network is misbehaving.
+	 *
+	 * `"token"` for sign-out and `"grant"` for disconnect — see `RevokeScope`.
 	 */
-	revoke: boolean;
+	revoke: RevokeScope | "none";
 }
 
 /**
@@ -33,11 +35,11 @@ export interface TearDownDeps {
  */
 export async function tearDownCredential(deps: TearDownDeps): Promise<RevokeOutcome> {
 	try {
-		if (!deps.revoke) {
+		if (deps.revoke === "none") {
 			await deps.tokens.abandon();
 			return "nothing-to-revoke";
 		}
-		return await deps.tokens.revokeAndAbandon();
+		return await deps.tokens.revokeAndAbandon(deps.revoke);
 	} finally {
 		await deps.store.signOut();
 	}

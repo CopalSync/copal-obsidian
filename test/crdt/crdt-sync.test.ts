@@ -761,3 +761,79 @@ describe("CrdtSync — durable delete queue (offline mutation durability)", () =
 		expect(registry.get("gone.md")).toBeUndefined();
 	});
 });
+
+/**
+ * ⛔ **THE PRICE OF THE LEGACY PURGE, measured rather than assumed.**
+ *
+ * Discarding the constant-tenant documents (F3) throws away the lineage that tells a stale local file
+ * apart from a genuinely unknown one. `reconcileFileAfterSync` treats an empty local doc as a first
+ * import, so a note this device was BEHIND on comes back as a keep-both conflict copy instead of a
+ * silent merge. Nothing is lost either way — that is what keep-both is for — but a vault can sprout one
+ * copy per note that had drifted, and that must be a stated cost rather than a surprise.
+ *
+ * Both halves run against the same server docs and the same files on disk. The only difference is
+ * whether the local CRDT store survived the upgrade.
+ */
+describe("a note this device was behind on, across an upgrade", () => {
+	/** A second process against an EXISTING server: same docs, fresh local store. */
+	function reopenWithEmptyStore(vault: InMemoryVault, serverDocs: Map<string, Y.Doc>) {
+		const registry = new LocalNoteRegistry(new LocalDocStore(vaultIdOf(`t${++tenantN}`)), vault);
+		const crdt = new CrdtSync({
+			api: {
+				manifest: () => Promise.resolve({ head: 0, manifest: [] }),
+				deleteNote: () => Promise.resolve(),
+				moveNote: () => Promise.resolve(),
+			} as unknown as SyncApi,
+			registry,
+			vault,
+			transportFor: (path: string) => {
+				const { a, b } = pairedTransports();
+				let doc = serverDocs.get(path);
+				if (!doc) {
+					doc = new Y.Doc();
+					serverDocs.set(path, doc);
+				}
+				new CrdtNote(b, doc);
+				return Promise.resolve(a);
+			},
+			settleMs: 0,
+			bind: () => undefined,
+		});
+		return crdt;
+	}
+
+	/** Replace the server's text the way another device would: as ops on the shared doc. */
+	function serverEdit(serverDocs: Map<string, Y.Doc>, path: string, text: string): void {
+		const t = serverDocs.get(path)!.getText("content");
+		t.delete(0, t.length);
+		t.insert(0, text);
+	}
+
+	async function behindByOneEdit() {
+		const first = makeSync({ "n.md": "OLD" });
+		await first.crdt.open("n.md");
+		await waitFor(() => serverText(first.serverDocs, "n.md") === "OLD");
+		await first.crdt.close();
+		serverEdit(first.serverDocs, "n.md", "NEW"); // edited on another device
+		return first;
+	}
+
+	it("merges silently when the local history survived", async () => {
+		const first = await behindByOneEdit();
+		await first.crdt.open("n.md");
+		await waitFor(() => first.vault.snapshot()["n.md"] === "NEW");
+		expect(first.vault.snapshot()["n (conflicted copy).md"]).toBeUndefined();
+	});
+
+	it("leaves a conflict copy when the purge took the local history with it", async () => {
+		const first = await behindByOneEdit();
+
+		const after = reopenWithEmptyStore(first.vault, first.serverDocs);
+		await after.open("n.md");
+		await waitFor(() => first.vault.snapshot()["n.md"] === "NEW");
+
+		// The note itself ends up correct; the stale local text is kept beside it rather than dropped.
+		expect(first.vault.snapshot()["n.md"]).toBe("NEW");
+		expect(first.vault.snapshot()["n (conflicted copy).md"]).toBe("OLD");
+	});
+});

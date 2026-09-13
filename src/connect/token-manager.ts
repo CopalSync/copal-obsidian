@@ -1,5 +1,5 @@
 import type { Tokens } from "../types";
-import { discover, refresh, revoke, TokenRefreshError } from "./oauth";
+import { discover, refresh, revoke, revokeGrant, TokenRefreshError } from "./oauth";
 import type { TokenStore } from "./store";
 
 /** Refresh this long before `expires_at`, so a call in flight does not race the expiry. */
@@ -18,6 +18,12 @@ const REVOKE_BUDGET_MS = 4_000;
 /** What a sign-out was able to do at the authorization server. Only `failed` is worth telling a
  *  person about: `nothing-to-revoke` is the ordinary pre-`offline_access` install. */
 export type RevokeOutcome = "revoked" | "nothing-to-revoke" | "failed";
+
+/**
+ * How much to take back. `token` kills the credential and keeps the consent, so signing back in is the
+ * ordinary pause-and-resume; `grant` takes the consent too, which is what disconnecting a folder means.
+ */
+export type RevokeScope = "token" | "grant";
 
 /** Resolve to `onTimeout` rather than hanging past `ms`. Clears the timer, so a caller inside a test
  *  runner does not keep the event loop alive for the full budget after it resolves. */
@@ -51,6 +57,7 @@ export interface TokenManagerDeps {
 interface Discovery {
 	token_endpoint: string;
 	revocation_endpoint?: string;
+	issuer?: string;
 }
 
 /**
@@ -245,8 +252,8 @@ export class TokenManager {
 	 * tokens immediately afterwards whatever this returns: a sign-out that fails because revocation
 	 * failed is a worse bug than the one revocation exists to fix.
 	 */
-	async revokeAndAbandon(): Promise<RevokeOutcome> {
-		return withBudget(this.doRevoke(), REVOKE_BUDGET_MS, "failed");
+	async revokeAndAbandon(scope: RevokeScope = "token"): Promise<RevokeOutcome> {
+		return withBudget(this.doRevoke(scope), REVOKE_BUDGET_MS, "failed");
 	}
 
 	/**
@@ -259,7 +266,7 @@ export class TokenManager {
 		return undefined;
 	}
 
-	private async doRevoke(): Promise<RevokeOutcome> {
+	private async doRevoke(scope: RevokeScope): Promise<RevokeOutcome> {
 		const { store } = this.deps;
 		// Set BEFORE settling, so a refresh suspended on the network cannot persist when it resumes.
 		this.abandoned = true;
@@ -273,7 +280,24 @@ export class TokenManager {
 			// The endpoint answers 200 and revokes NOTHING for a client id that does not own the token,
 			// so guessing one would report success over a no-op. Without the real id, say we failed.
 			if (clientId === undefined) return "failed";
-			const { revocation_endpoint: endpoint } = await this.discovered();
+			const disc = await this.discovered();
+			/*
+			 * A DISCONNECT takes the whole grant: consent plus both token families. RFC 7009 cannot do
+			 * that — it leaves the consent standing, so the server keeps reporting the grant active and
+			 * the account page keeps listing this plugin. Falls through to the token-scoped revoke when
+			 * the server does not serve the route, so the credential dies either way.
+			 */
+			if (scope === "grant" && disc.issuer !== undefined) {
+				try {
+					await revokeGrant(this.deps.f, disc.issuer, token);
+					return "revoked";
+				} catch (err) {
+					console.warn(
+						`[copal] grant revoke failed, falling back to token revoke: ${err instanceof Error ? err.message : String(err)}`,
+					);
+				}
+			}
+			const endpoint = disc.revocation_endpoint;
 			if (endpoint === undefined) return "failed";
 			await revoke(this.deps.f, endpoint, clientId, token);
 			return "revoked";

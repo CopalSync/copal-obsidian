@@ -1,7 +1,13 @@
 // Minimal stub of the `obsidian` module so vitest can import the plugin's module graph. The pure
-// connect/*, sync/*, and crdt/* modules never import obsidian; only main.ts/settings.ts (live-tested) and
-// the small ui/* modules do. This provides just enough of the Modal/Setting/ButtonComponent surface for
-// the ui/confirm unit test to run onOpen() and drive the confirm/cancel resolve logic.
+// connect/*, sync/*, and crdt/* modules never import obsidian; main.ts, settings.ts and the small ui/*
+// modules do. It provides enough of the Modal/Setting/ButtonComponent surface for the ui/confirm unit
+// test to drive onOpen(), and enough of the rest for `main-signout.test.ts` to IMPORT main.ts and call
+// its sign-out paths.
+//
+// ⚠️ This file used to say main.ts was "live-tested" and stop there, which is the reason two security
+// findings survived a green suite: the ordering that mattered lived in the one file nothing could load.
+// Everything below that is not in the Modal/Setting surface exists so that file can be loaded. It is a
+// stub, not an emulator — it makes main.ts importable and its plain methods callable, nothing more.
 
 /** A tiny stand-in for Obsidian's augmented HTMLElement (createEl/setText/empty). */
 class FakeEl {
@@ -31,6 +37,28 @@ class FakeEl {
 export class Plugin {}
 export class PluginSettingTab {}
 export class App {}
+export class ItemView {
+	constructor(readonly leaf?: unknown) {}
+}
+export class MarkdownView {}
+export class Menu {
+	addItem(): this {
+		return this;
+	}
+	showAtMouseEvent(): void {}
+}
+export interface WorkspaceLeaf {
+	view?: unknown;
+}
+export type TAbstractFile = { path: string };
+export type TFile = { path: string; extension: string };
+export const Platform = { isMobile: false };
+export function setIcon(_el: unknown, _icon: string): void {}
+export function setTooltip(_el: unknown, _text: string, _opts?: unknown): void {}
+/** Obsidian collapses duplicate separators and strips a leading one; paths here are already safe. */
+export function normalizePath(p: string): string {
+	return p.replace(/\/{2,}/g, "/").replace(/^\//, "");
+}
 export class Notice {
 	constructor(_message: string) {}
 }

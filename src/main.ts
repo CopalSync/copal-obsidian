@@ -19,7 +19,12 @@ import { purgeLegacyCrdtDocs } from "./crdt/legacy-purge";
 import type { LocalNoteRegistry } from "./crdt/local-note-registry";
 import { tearDownCredential } from "./connect/sign-out";
 import { type PersistedData, TokenStore } from "./connect/store";
-import { type ReauthReason, type RevokeOutcome, TokenManager } from "./connect/token-manager";
+import {
+	type ReauthReason,
+	type RevokeOutcome,
+	type RevokeScope,
+	TokenManager,
+} from "./connect/token-manager";
 import { CopalSettingTab } from "./settings";
 import { ApiError, type SearchHit, type SearchMode, SyncApi, type Vault } from "./sync/api";
 import { type BinaryData, BinaryCursor } from "./sync/binary-cursor";
@@ -185,8 +190,11 @@ export default class CopalPlugin extends Plugin {
 		 * constant tenant, so nothing that runs after this can see or touch them.
 		 */
 		if (!(await this.store.getLegacyCrdtPurged())) {
-			const purged = await purgeLegacyCrdtDocs();
-			await this.store.markLegacyCrdtPurged();
+			const { names: purged, completed } = await purgeLegacyCrdtDocs();
+			// Only recorded when it actually finished: marking a timed-out run as done would skip it
+			// forever and leave the shared-tenant databases in place with nothing left to notice them.
+			if (completed) await this.store.markLegacyCrdtPurged();
+			else console.warn("[copal] legacy CRDT purge timed out; will retry on next load");
 			if (purged.length > 0) {
 				console.info(
 					`[copal] discarded ${purged.length} local CRDT document(s) keyed under the old shared ` +
@@ -503,8 +511,9 @@ export default class CopalPlugin extends Plugin {
 		}
 		this.stopSync();
 		// Revoke at the authorization server, then drop the tokens locally. The vault link is kept for
-		// resume. See `tearDownCredential` for why the order is the security property.
-		const outcome = await this.clearCredential(true);
+		// resume, and so is the CONSENT: taking that back too would put a consent screen in front of
+		// every ordinary sign-in. See `tearDownCredential` for why the order is the security property.
+		const outcome = await this.clearCredential("token");
 		await this.settingsTab?.refresh();
 		return outcome;
 	}
@@ -525,7 +534,9 @@ export default class CopalPlugin extends Plugin {
 			}
 		}
 		this.stopSync();
-		const outcome = await this.clearCredential(true); // revoke at the server, then drop the tokens
+		// The WHOLE grant, consent included: this folder is detaching for good, so leaving the account
+		// page listing it as a connected agent would be a lie of exactly the kind `revoke.ts` warns about.
+		const outcome = await this.clearCredential("grant");
 		await this.resetLocalVaultState(); // unlink + wipe cursor + CRDT docs (keeps .md)
 		await this.settingsTab?.refresh();
 		return outcome;
@@ -569,7 +580,7 @@ export default class CopalPlugin extends Plugin {
 	 * `SyncApi` reads `this.tokens` through a thunk on every call, so swapping the field is enough — no
 	 * restart, and nothing holds a reference to the abandoned manager.
 	 */
-	private async clearCredential(revoke: boolean): Promise<RevokeOutcome> {
+	private async clearCredential(revoke: RevokeScope | "none"): Promise<RevokeOutcome> {
 		let outcome: RevokeOutcome = "failed";
 		try {
 			outcome = await tearDownCredential({ tokens: this.tokens, store: this.store, revoke });
@@ -762,7 +773,7 @@ export default class CopalPlugin extends Plugin {
 			 * moment, and its write would resurrect the credential that just died. No revoke, though —
 			 * the server has already discarded this grant, which is how we got here.
 			 */
-			await this.clearCredential(false);
+			await this.clearCredential("none");
 			this.reauthPrompted = true; // `clearCredential` clears the latch; this path owns the notice.
 			this.setStatus("idle");
 			await this.settingsTab?.refresh();

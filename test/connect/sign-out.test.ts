@@ -8,7 +8,7 @@ function fakes(outcome: RevokeOutcome | Error) {
 		calls,
 		deps: {
 			tokens: {
-				revokeAndAbandon: vi.fn(async () => {
+				revokeAndAbandon: vi.fn(async (_scope?: unknown) => {
 					calls.push("revoke");
 					if (outcome instanceof Error) throw outcome;
 					return outcome;
@@ -29,7 +29,7 @@ function fakes(outcome: RevokeOutcome | Error) {
 describe("tearDownCredential", () => {
 	it("revokes before deleting locally, because the delete destroys the token to revoke", async () => {
 		const { calls, deps } = fakes("revoked");
-		expect(await tearDownCredential({ ...deps, revoke: true })).toBe("revoked");
+		expect(await tearDownCredential({ ...deps, revoke: "token" })).toBe("revoked");
 		expect(calls).toEqual(["revoke", "local-delete"]);
 	});
 
@@ -39,20 +39,26 @@ describe("tearDownCredential", () => {
 	 */
 	it("still deletes locally when revocation reports failure", async () => {
 		const { calls, deps } = fakes("failed");
-		expect(await tearDownCredential({ ...deps, revoke: true })).toBe("failed");
+		expect(await tearDownCredential({ ...deps, revoke: "token" })).toBe("failed");
 		expect(calls).toEqual(["revoke", "local-delete"]);
 	});
 
 	it("still deletes locally when revocation throws outright", async () => {
 		const { calls, deps } = fakes(new Error("boom"));
-		await expect(tearDownCredential({ ...deps, revoke: true })).rejects.toThrow("boom");
+		await expect(tearDownCredential({ ...deps, revoke: "token" })).rejects.toThrow("boom");
 		// The throw propagates (the caller logs it), but the credential is gone from disk regardless.
 		expect(calls).toEqual(["revoke", "local-delete"]);
 	});
 
+	it("passes the scope through, so disconnect can take the consent as well as the token", async () => {
+		const { deps } = fakes("revoked");
+		await tearDownCredential({ ...deps, revoke: "grant" });
+		expect(deps.tokens.revokeAndAbandon).toHaveBeenCalledWith("grant");
+	});
+
 	it("abandons without a network call when the credential is already dead", async () => {
 		const { calls, deps } = fakes("revoked");
-		expect(await tearDownCredential({ ...deps, revoke: false })).toBe("nothing-to-revoke");
+		expect(await tearDownCredential({ ...deps, revoke: "none" })).toBe("nothing-to-revoke");
 		expect(calls).toEqual(["abandon", "local-delete"]);
 		expect(deps.tokens.revokeAndAbandon).not.toHaveBeenCalled();
 	});

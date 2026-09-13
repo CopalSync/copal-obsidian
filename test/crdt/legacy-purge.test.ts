@@ -56,8 +56,9 @@ describe("purgeLegacyCrdtDocs", () => {
 		expect(await names()).toContain("copal:vault:legacy.md");
 		expect(await legacyIndexRecord()).toContain("legacy.md");
 
-		const purged = await purgeLegacyCrdtDocs();
+		const { names: purged, completed } = await purgeLegacyCrdtDocs();
 
+		expect(completed).toBe(true);
 		expect(purged).toContain("copal:vault:legacy.md");
 		expect(await names()).not.toContain("copal:vault:legacy.md");
 		/*
@@ -82,8 +83,8 @@ describe("purgeLegacyCrdtDocs", () => {
 
 	it("is idempotent, so a second load is a no-op rather than a second wipe", async () => {
 		await seedLegacyNote("twice.md", "y");
-		expect((await purgeLegacyCrdtDocs()).length).toBeGreaterThan(0);
-		expect(await purgeLegacyCrdtDocs()).toEqual([]);
+		expect((await purgeLegacyCrdtDocs()).names.length).toBeGreaterThan(0);
+		expect((await purgeLegacyCrdtDocs()).names).toEqual([]);
 	});
 
 	it("finds the legacy documents on iOS, where databases() does not exist", async () => {
@@ -91,9 +92,30 @@ describe("purgeLegacyCrdtDocs", () => {
 		await withoutDatabasesApi(async () => {
 			// The index record is the whole inventory here. Without that branch the purge would report
 			// nothing to do on every iPhone and the bug would simply survive there.
-			const purged = await purgeLegacyCrdtDocs();
+			const { names: purged } = await purgeLegacyCrdtDocs();
 			expect(purged).toEqual(["copal:vault:ios-legacy.md"]);
 		});
 		expect(await names()).not.toContain("copal:vault:ios-legacy.md");
+	});
+
+	/**
+	 * ⛔ The caller awaits this inside `onload`. An IndexedDB open can block indefinitely, and a plugin
+	 * that never finishes loading is far worse than a purge that waits for the next launch — so it gives
+	 * up, and reports `completed: false` so the caller does not record it as done and skip it forever.
+	 */
+	it("gives up rather than hanging the plugin load, and does not mark itself done", async () => {
+		const real = globalThis.indexedDB;
+		// An IndexedDB whose every open hangs, which is what a blocked version change looks like.
+		globalThis.indexedDB = {
+			databases: () => new Promise(() => {}),
+			open: () => ({}) as IDBOpenDBRequest,
+			deleteDatabase: () => ({}) as IDBOpenDBRequest,
+		} as unknown as IDBFactory;
+		try {
+			const result = await purgeLegacyCrdtDocs(50);
+			expect(result).toEqual({ names: [], completed: false });
+		} finally {
+			globalThis.indexedDB = real;
+		}
 	});
 });

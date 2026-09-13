@@ -37,6 +37,8 @@ export const REDIRECT_URI = "https://copal.uk/plugin/connect";
 export const SCOPE = "vault.read vault.write offline_access";
 
 interface Discovery {
+	/** RFC 8414 identifier of the authorization server, and the origin Copal's own routes live on. */
+	issuer: string;
 	registration_endpoint: string;
 	authorization_endpoint: string;
 	token_endpoint: string;
@@ -311,4 +313,34 @@ export async function revoke(
 		}).toString(),
 	});
 	if (!res.ok) throw new Error(`token revocation failed: ${res.status}`);
+}
+
+/**
+ * Take the whole grant back, not just the token: Copal's own endpoint, which deletes the consent AND
+ * both token families.
+ *
+ * ⛔ **WHY THIS EXISTS ALONGSIDE `revoke`.** RFC 7009 kills the token family, which is what stops a
+ * copied `data.json` renewing itself — but the authorization server keeps the consent row, so its grant
+ * check keeps answering "active" (an access token already issued survives its hour) and the account page
+ * still lists this plugin under Connected agents. Disconnect says it detaches the folder entirely, so it
+ * has to mean the whole grant. Sign-out deliberately does NOT call this: dropping consent would put a
+ * consent screen in front of every ordinary pause-and-resume.
+ *
+ * Possession of the refresh token is the authentication — the same proof RFC 7009 accepts, and the same
+ * credential that can already mint access tokens, so it grants nothing new.
+ *
+ * Throws on a non-ok response. The caller falls back to `revoke`, so a server that does not serve this
+ * route yet still gets the credential killed.
+ */
+export async function revokeGrant(
+	f: typeof fetch,
+	issuer: string,
+	refreshToken: string,
+): Promise<void> {
+	const res = await f(`${issuer.replace(/\/+$/, "")}/account/revoke-grant-by-token`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ refresh_token: refreshToken }),
+	});
+	if (!res.ok) throw new Error(`grant revocation failed: ${res.status}`);
 }

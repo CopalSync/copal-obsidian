@@ -16,6 +16,7 @@ function memStore(initial: PersistedData = {}): TokenStore {
 }
 
 const DISCOVERY = {
+	issuer: "https://auth.copal.uk",
 	registration_endpoint: "https://api.copal.uk/oauth2/register",
 	authorization_endpoint: "https://api.copal.uk/oauth2/authorize",
 	token_endpoint: "https://api.copal.uk/oauth2/token",
@@ -57,15 +58,25 @@ function fetchWith(
 	onToken: () => Promise<Response>,
 	onRevoke: () => Promise<Response> = () => Promise.resolve(new Response(null, { status: 200 })),
 	discovery: unknown = DISCOVERY,
+	onGrantRevoke: () => Promise<Response> = () =>
+		Promise.resolve(new Response(null, { status: 200 })),
 ): {
 	f: ReturnType<typeof vi.fn>;
 	tokenCalls: () => number;
 	revokedTokens: () => string[];
+	grantRevokes: () => string[];
 } {
 	let tokenCalls = 0;
 	const revokedTokens: string[] = [];
+	const grantRevokes: string[] = [];
 	const f = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
 		const url = String(input);
+		if (url.includes("/account/revoke-grant-by-token")) {
+			grantRevokes.push(
+				(JSON.parse(String(init?.body ?? "{}")) as { refresh_token?: string }).refresh_token ?? "",
+			);
+			return onGrantRevoke();
+		}
 		if (url.includes("/oauth2/revoke")) {
 			revokedTokens.push(new URLSearchParams(init?.body as string).get("token") ?? "");
 			return onRevoke();
@@ -84,6 +95,7 @@ function fetchWith(
 		f: f as unknown as ReturnType<typeof vi.fn>,
 		tokenCalls: () => tokenCalls,
 		revokedTokens: () => revokedTokens,
+		grantRevokes: () => grantRevokes,
 	};
 }
 
@@ -380,5 +392,41 @@ describe("sign-out", () => {
 		expect(peek().tokens?.refresh_token).toBe("old-rt");
 		// The credential was already dead on this path; revoking it would be a pointless round trip.
 		expect(revokedTokens()).toEqual([]);
+	});
+
+	/**
+	 * ⛔ Disconnect means the WHOLE grant. RFC 7009 kills the token family but leaves the consent, so the
+	 * server keeps reporting the grant active and the account page keeps listing the plugin. `revoke.ts`
+	 * in copal-auth calls consent-plus-both-families the honest definition, and this is the client half.
+	 */
+	it("takes the whole grant when asked, instead of just the token", async () => {
+		const { f, grantRevokes, revokedTokens } = fetchWith(() =>
+			Promise.reject(new Error("no refresh expected")),
+		);
+		const tm = make(memStore({ clientId: "cid", tokens: EXPIRED }), f);
+
+		expect(await tm.revokeAndAbandon("grant")).toBe("revoked");
+
+		expect(grantRevokes()).toEqual(["old-rt"]);
+		expect(revokedTokens()).toEqual([]); // no need for the token-scoped call as well
+	});
+
+	/*
+	 * A server that does not serve the route yet must still end up with a dead credential — otherwise
+	 * shipping the plugin before the auth deploy would silently stop revoking anything at all.
+	 */
+	it("falls back to the token revoke when the grant route is not there", async () => {
+		const { f, grantRevokes, revokedTokens } = fetchWith(
+			() => Promise.reject(new Error("no refresh expected")),
+			undefined,
+			DISCOVERY,
+			() => Promise.resolve(new Response(null, { status: 404 })),
+		);
+		const tm = make(memStore({ clientId: "cid", tokens: EXPIRED }), f);
+
+		expect(await tm.revokeAndAbandon("grant")).toBe("revoked");
+
+		expect(grantRevokes()).toEqual(["old-rt"]); // tried
+		expect(revokedTokens()).toEqual(["old-rt"]); // and fell back, so the credential still dies
 	});
 });
