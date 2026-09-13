@@ -19,7 +19,26 @@ const DISCOVERY = {
 	registration_endpoint: "https://api.copal.uk/oauth2/register",
 	authorization_endpoint: "https://api.copal.uk/oauth2/authorize",
 	token_endpoint: "https://api.copal.uk/oauth2/token",
+	revocation_endpoint: "https://api.copal.uk/oauth2/revoke",
 };
+
+/** `memStore`, but the raw record stays readable so a test can prove what was NOT written. */
+function peekableStore(initial: PersistedData = {}): {
+	store: TokenStore;
+	peek: () => PersistedData;
+} {
+	let data: PersistedData = { ...initial };
+	return {
+		store: new TokenStore(
+			() => Promise.resolve(data),
+			(next) => {
+				data = next;
+				return Promise.resolve();
+			},
+		),
+		peek: () => data,
+	};
+}
 
 function json(body: unknown, status = 200): Response {
 	return new Response(JSON.stringify(body), {
@@ -28,14 +47,29 @@ function json(body: unknown, status = 200): Response {
 	});
 }
 
-/** A fetch that answers discovery from cache and routes token posts to `onToken`. */
-function fetchWith(onToken: () => Promise<Response>): {
+/**
+ * A fetch that answers discovery from cache and routes token posts to `onToken`.
+ *
+ * `onRevoke` is optional so every existing caller is unchanged; revocation bodies are captured so a
+ * test can assert WHICH token was revoked, which is the whole question in the sign-out race.
+ */
+function fetchWith(
+	onToken: () => Promise<Response>,
+	onRevoke: () => Promise<Response> = () => Promise.resolve(new Response(null, { status: 200 })),
+	discovery: unknown = DISCOVERY,
+): {
 	f: ReturnType<typeof vi.fn>;
 	tokenCalls: () => number;
+	revokedTokens: () => string[];
 } {
 	let tokenCalls = 0;
-	const f = vi.fn(async (input: string | URL | Request) => {
+	const revokedTokens: string[] = [];
+	const f = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
 		const url = String(input);
+		if (url.includes("/oauth2/revoke")) {
+			revokedTokens.push(new URLSearchParams(init?.body as string).get("token") ?? "");
+			return onRevoke();
+		}
 		if (url.includes("/oauth2/token")) {
 			tokenCalls += 1;
 			return onToken();
@@ -44,9 +78,25 @@ function fetchWith(onToken: () => Promise<Response>): {
 		if (url.includes(".well-known/oauth-protected-resource")) {
 			return json({ authorization_servers: ["https://api.copal.uk"] });
 		}
-		return json(DISCOVERY);
+		return json(discovery);
 	});
-	return { f: f as unknown as ReturnType<typeof vi.fn>, tokenCalls: () => tokenCalls };
+	return {
+		f: f as unknown as ReturnType<typeof vi.fn>,
+		tokenCalls: () => tokenCalls,
+		revokedTokens: () => revokedTokens,
+	};
+}
+
+/**
+ * Drain microtasks until `cond` holds.
+ *
+ * ⚠️ A single `await Promise.resolve()` is NOT enough to get a refresh onto the network: `getValid`
+ * awaits the store first, so the mutex is not even armed yet. Driving the sign-out race against that
+ * tests the wrong interleaving and passes for the wrong reason.
+ */
+async function until(cond: () => boolean, what: string): Promise<void> {
+	for (let i = 0; i < 100 && !cond(); i += 1) await Promise.resolve();
+	if (!cond()) throw new Error(`never happened: ${what}`);
 }
 
 const EXPIRED: Tokens = {
@@ -223,5 +273,112 @@ describe("TokenManager token merge", () => {
 		const handed = await make(store, f).getValid();
 		expect((await store.getTokens())?.access_token).toBe(handed);
 		expect((await store.getTokens())?.refresh_token).toBe("new-rt");
+	});
+});
+
+/**
+ * ⛔ **The sign-out race (C14), driven rather than asserted.**
+ *
+ * Every case here holds the token POST open on a gate so sign-out lands in the exact window that
+ * matters: after the server has rotated the refresh token, before the plugin has written it down.
+ * A happy-path test cannot see any of this.
+ */
+describe("sign-out", () => {
+	it("does not re-persist a rotated token when sign-out lands mid-refresh", async () => {
+		let release!: (r: Response) => void;
+		const gate = new Promise<Response>((res) => {
+			release = res;
+		});
+		const { f, revokedTokens, tokenCalls } = fetchWith(() => gate);
+		const { store, peek } = peekableStore({ clientId: "cid", tokens: EXPIRED });
+		const tm = make(store, f);
+
+		// A refresh is in flight and suspended on the network.
+		const inFlight = tm.getValid().catch(() => "threw");
+		await until(() => tokenCalls() === 1, "the refresh reached the token endpoint");
+
+		// The user signs out while it is suspended.
+		const outcome = tm.revokeAndAbandon();
+		// Only now does the server's rotation land.
+		release(json({ access_token: "new-at", refresh_token: "new-rt", expires_in: 3600 }));
+
+		expect(await inFlight).toBe("threw");
+		expect(await outcome).toBe("revoked");
+
+		// THE ASSERTION. `data.json` must still hold the pre-sign-out record: had the rotated token
+		// been written, a copy of this vault could renew from it for another 14 days.
+		expect(peek().tokens?.refresh_token).toBe("old-rt");
+		expect(peek().tokens?.access_token).toBe("old-at");
+		// And the orphan is what got revoked: the stored token was already dead, killed by the very
+		// rotation this refresh completed, so revoking it would have reported success over a no-op.
+		expect(revokedTokens()).toEqual(["new-rt"]);
+	});
+
+	it("revokes the stored refresh token when nothing is in flight", async () => {
+		const { f, revokedTokens, tokenCalls } = fetchWith(() =>
+			Promise.reject(new Error("no refresh expected")),
+		);
+		const tm = make(memStore({ clientId: "cid", tokens: EXPIRED }), f);
+		expect(await tm.revokeAndAbandon()).toBe("revoked");
+		expect(revokedTokens()).toEqual(["old-rt"]);
+		expect(tokenCalls()).toBe(0);
+	});
+
+	it("reports failure without throwing when the server refuses the revocation", async () => {
+		const { f } = fetchWith(
+			() => Promise.reject(new Error("no refresh expected")),
+			() => Promise.resolve(new Response(null, { status: 503 })),
+		);
+		const tm = make(memStore({ clientId: "cid", tokens: EXPIRED }), f);
+		// Must RESOLVE. Sign-out deletes the local tokens straight after this and cannot be allowed to
+		// die on the way there.
+		expect(await tm.revokeAndAbandon()).toBe("failed");
+	});
+
+	it("reports failure without throwing when the network is dead", async () => {
+		const { f } = fetchWith(
+			() => Promise.reject(new Error("no refresh expected")),
+			() => Promise.reject(new TypeError("Failed to fetch")),
+		);
+		const tm = make(memStore({ clientId: "cid", tokens: EXPIRED }), f);
+		expect(await tm.revokeAndAbandon()).toBe("failed");
+	});
+
+	it("has nothing to revoke on a pre-offline_access install, and calls nothing", async () => {
+		const { f } = fetchWith(() => Promise.reject(new Error("no refresh expected")));
+		const tm = make(memStore({ clientId: "cid", tokens: { access_token: "at" } }), f);
+		expect(await tm.revokeAndAbandon()).toBe("nothing-to-revoke");
+		expect(f).not.toHaveBeenCalled();
+	});
+
+	it("reports failure when the server publishes no revocation endpoint", async () => {
+		const { f } = fetchWith(
+			() => Promise.reject(new Error("no refresh expected")),
+			() => Promise.resolve(new Response(null, { status: 200 })),
+			{ ...DISCOVERY, revocation_endpoint: undefined },
+		);
+		const tm = make(memStore({ clientId: "cid", tokens: EXPIRED }), f);
+		expect(await tm.revokeAndAbandon()).toBe("failed");
+	});
+
+	it("abandon() closes the same race with no network call at all", async () => {
+		let release!: (r: Response) => void;
+		const gate = new Promise<Response>((res) => {
+			release = res;
+		});
+		const { f, revokedTokens, tokenCalls } = fetchWith(() => gate);
+		const { store, peek } = peekableStore({ clientId: "cid", tokens: EXPIRED });
+		const tm = make(store, f);
+
+		const inFlight = tm.getValid().catch(() => "threw");
+		await until(() => tokenCalls() === 1, "the refresh reached the token endpoint");
+		const abandoned = tm.abandon();
+		release(json({ access_token: "new-at", refresh_token: "new-rt", expires_in: 3600 }));
+		expect(await inFlight).toBe("threw");
+		await abandoned;
+
+		expect(peek().tokens?.refresh_token).toBe("old-rt");
+		// The credential was already dead on this path; revoking it would be a pointless round trip.
+		expect(revokedTokens()).toEqual([]);
 	});
 });

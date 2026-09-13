@@ -85,6 +85,13 @@ export class SyncClient {
 	private async connect(): Promise<void> {
 		try {
 			const { ticket, url } = await this.api.ticket();
+			/*
+			 * ⛔ Re-checked AFTER the await, because `stop()` could not have closed a socket that did not
+			 * exist yet: it ran while `this.ws` was still undefined. Opening one now leaves a live channel
+			 * on a credential the user has just signed out of and revoked, and nothing would ever close it
+			 * — `scheduleReconnect` bails on `stopped`, so not even a drop brings it back through here.
+			 */
+			if (this.stopped) return;
 			assertWssUrl(url); // never let a compromised server downgrade the channel to cleartext ws://
 			const ws = new WebSocket(
 				`${url}?ticket=${encodeURIComponent(ticket)}&since=${this.state.lastSeq}`,

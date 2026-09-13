@@ -2,7 +2,10 @@ import "fake-indexeddb/auto";
 import { describe, expect, it } from "vitest";
 import { IndexeddbPersistence } from "y-indexeddb";
 import * as Y from "yjs";
-import { LocalDocStore } from "../../src/crdt/local-doc-store";
+import { asVaultId, LocalDocStore } from "../../src/crdt/local-doc-store";
+
+/** A fixed vault id, supplied the way the production factory supplies one. */
+const vaultIdOf = (id: string) => () => Promise.resolve(asVaultId(id));
 
 type DbEnum = { databases?: (() => Promise<IDBDatabaseInfo[]>) | undefined };
 
@@ -20,7 +23,7 @@ async function withoutDatabasesApi(fn: () => Promise<void>): Promise<void> {
 
 describe("LocalDocStore", () => {
 	it("rename transfers a note's persisted doc LINEAGE old→new (same state vector), destroying the old", async () => {
-		const s = new LocalDocStore("tr");
+		const s = new LocalDocStore(vaultIdOf("tr"));
 		const a = s.open("a.md");
 		await a.whenLoaded;
 		a.doc.getText("content").insert(0, "shared history");
@@ -37,7 +40,7 @@ describe("LocalDocStore", () => {
 	});
 
 	it("persists a note's Y.Doc across store instances (survives a reload)", async () => {
-		const s1 = new LocalDocStore("t1");
+		const s1 = new LocalDocStore(vaultIdOf("t1"));
 		const a = s1.open("a.md");
 		await a.whenLoaded;
 		a.doc.getText("content").insert(0, "hi");
@@ -45,7 +48,7 @@ describe("LocalDocStore", () => {
 		s1.close("a.md");
 
 		// A fresh store (a "reload") rehydrates the same content — no server round-trip.
-		const s2 = new LocalDocStore("t1");
+		const s2 = new LocalDocStore(vaultIdOf("t1"));
 		const b = s2.open("a.md");
 		await b.whenLoaded;
 		expect(b.doc.getText("content").toString()).toBe("hi");
@@ -53,7 +56,7 @@ describe("LocalDocStore", () => {
 	});
 
 	it("lists persisted notes (so reconcile can skip them)", async () => {
-		const s = new LocalDocStore("tp");
+		const s = new LocalDocStore(vaultIdOf("tp"));
 		const a = s.open("a.md");
 		await a.whenLoaded;
 		a.doc.getText("content").insert(0, "x");
@@ -64,7 +67,7 @@ describe("LocalDocStore", () => {
 	});
 
 	it("destroyAll() removes every persisted doc for the store (clean disconnect)", async () => {
-		const s = new LocalDocStore("tall");
+		const s = new LocalDocStore(vaultIdOf("tall"));
 		for (const p of ["a.md", "dir/b.md", "c.md"]) {
 			const e = s.open(p);
 			// oxlint-disable-next-line no-await-in-loop
@@ -78,7 +81,7 @@ describe("LocalDocStore", () => {
 	});
 
 	it("iOS (no indexedDB.databases): listPersisted() reads the maintained index", async () => {
-		const s = new LocalDocStore("ios1");
+		const s = new LocalDocStore(vaultIdOf("ios1"));
 		const a = s.open("a.md");
 		const b = s.open("dir/b.md");
 		await a.whenLoaded;
@@ -91,7 +94,7 @@ describe("LocalDocStore", () => {
 	});
 
 	it("iOS: destroy + rename keep the index correct (no databases() fallback)", async () => {
-		const s = new LocalDocStore("ios2");
+		const s = new LocalDocStore(vaultIdOf("ios2"));
 		for (const p of ["a.md", "b.md"]) {
 			const e = s.open(p);
 			// oxlint-disable-next-line no-await-in-loop
@@ -116,7 +119,7 @@ describe("LocalDocStore", () => {
 		await p.destroy(); // close the connection but keep the DB on disk
 		await new Promise((r) => setTimeout(r, 30));
 
-		const s = new LocalDocStore(tenant);
+		const s = new LocalDocStore(vaultIdOf(tenant));
 		expect(await s.listPersisted()).toContain("legacy.md"); // found via databases() despite the empty index
 
 		// …and the index was healed, so an iOS read now sees it too.
@@ -127,7 +130,7 @@ describe("LocalDocStore", () => {
 	});
 
 	it("returns the same live doc for repeated open() of one path", async () => {
-		const s = new LocalDocStore("t1");
+		const s = new LocalDocStore(vaultIdOf("t1"));
 		const first = s.open("b.md");
 		const second = s.open("b.md");
 		expect(second.doc).toBe(first.doc);
@@ -135,18 +138,18 @@ describe("LocalDocStore", () => {
 	});
 
 	it("isolates tenants (same path, different tenant → different data)", async () => {
-		const sa = new LocalDocStore("ta");
+		const sa = new LocalDocStore(vaultIdOf("ta"));
 		const da = sa.open("n.md");
 		await da.whenLoaded;
 		da.doc.getText("content").insert(0, "alpha");
 		await new Promise((r) => setTimeout(r, 60));
 		sa.close("n.md");
 
-		const sb = new LocalDocStore("tb");
+		const sb = new LocalDocStore(vaultIdOf("tb"));
 		const db = sb.open("n.md");
 		await db.whenLoaded;
 		expect(db.doc.getText("content").toString()).toBe(""); // tenant tb never wrote n.md
 		await sb.destroy("n.md");
-		await new LocalDocStore("ta").destroy("n.md");
+		await new LocalDocStore(vaultIdOf("ta")).destroy("n.md");
 	});
 });

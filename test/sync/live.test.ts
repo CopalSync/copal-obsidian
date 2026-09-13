@@ -35,10 +35,13 @@ describe("SyncClient", () => {
 	});
 	afterEach(() => vi.unstubAllGlobals());
 
-	function make(sink: RemoteSink, onSave?: (d: SyncData) => void): SyncClient {
-		const api = {
-			ticket: () => Promise.resolve({ ticket: "t", url: "wss://x/sync" }),
-		} as unknown as SyncApi;
+	function make(
+		sink: RemoteSink,
+		onSave?: (d: SyncData) => void,
+		ticket: () => Promise<{ ticket: string; url: string }> = () =>
+			Promise.resolve({ ticket: "t", url: "wss://x/sync" }),
+	): SyncClient {
+		const api = { ticket } as unknown as SyncApi;
 		const state = new SyncState(
 			() => Promise.resolve({ lastSeq: 0, knownServer: [] }),
 			(d) => {
@@ -170,5 +173,34 @@ describe("SyncClient", () => {
 		expect(reconcile).toHaveBeenCalledWith([], "merge");
 		expect(created[0]!.url).toContain("since=9");
 		expect(saved.at(-1)).toEqual({ lastSeq: 9, knownServer: ["a.md"] });
+	});
+
+	/**
+	 * ⛔ The other half of the sign-out race. `stop()` runs while the ticket is still in flight, so
+	 * `this.ws` is undefined and there is nothing for it to close; without a re-check the socket opens
+	 * afterwards, on a credential that has just been revoked, and nothing ever closes it —
+	 * `scheduleReconnect` bails on `stopped`, so not even a drop brings it back through `connect`.
+	 */
+	it("opens no socket when stop() lands while the ticket is still in flight", async () => {
+		let release!: (t: { ticket: string; url: string }) => void;
+		const pending = new Promise<{ ticket: string; url: string }>((res) => {
+			release = res;
+		});
+		const client = make(
+			{
+				reconcile: vi.fn().mockResolvedValue({ knownServer: [], head: 0 }),
+				onRemoteChange: vi.fn().mockResolvedValue(undefined),
+			},
+			undefined,
+			() => pending,
+		);
+
+		await client.start();
+		client.stop();
+		release({ ticket: "t", url: "wss://x/sync" });
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(created).toHaveLength(0);
 	});
 });

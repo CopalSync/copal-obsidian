@@ -1,9 +1,39 @@
 import type { Tokens } from "../types";
-import { discover, refresh, TokenRefreshError } from "./oauth";
+import { discover, refresh, revoke, TokenRefreshError } from "./oauth";
 import type { TokenStore } from "./store";
 
 /** Refresh this long before `expires_at`, so a call in flight does not race the expiry. */
 const REFRESH_SKEW_MS = 60_000;
+
+/**
+ * The whole budget for tearing a credential down at sign-out: settling an in-flight refresh AND the
+ * revocation round trip.
+ *
+ * ⚠️ Bounded because **a sign-out that hangs is worse than one that fails to revoke.** Obsidian's
+ * `requestUrl` has no timeout of its own, so a captive portal or a dead socket would otherwise leave
+ * the settings pane wedged mid sign-out. The same 4s shape as `serverReachable()` in `main.ts`.
+ */
+const REVOKE_BUDGET_MS = 4_000;
+
+/** What a sign-out was able to do at the authorization server. Only `failed` is worth telling a
+ *  person about: `nothing-to-revoke` is the ordinary pre-`offline_access` install. */
+export type RevokeOutcome = "revoked" | "nothing-to-revoke" | "failed";
+
+/** Resolve to `onTimeout` rather than hanging past `ms`. Clears the timer, so a caller inside a test
+ *  runner does not keep the event loop alive for the full budget after it resolves. */
+async function withBudget<T>(work: Promise<T>, ms: number, onTimeout: T): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			work,
+			new Promise<T>((resolve) => {
+				timer = setTimeout(() => resolve(onTimeout), ms);
+			}),
+		]);
+	} finally {
+		if (timer !== undefined) clearTimeout(timer);
+	}
+}
 
 export type ReauthReason = "expired" | "revoked" | "no-refresh-token";
 
@@ -20,6 +50,7 @@ export interface TokenManagerDeps {
 
 interface Discovery {
 	token_endpoint: string;
+	revocation_endpoint?: string;
 }
 
 /**
@@ -52,6 +83,14 @@ export class TokenManager {
 	private inFlight: Promise<string> | undefined;
 	private discovery: Discovery | undefined;
 	private reauthAnnounced = false;
+	/** Set by sign-out. One-way: an abandoned manager never persists a token again. */
+	private abandoned = false;
+	/**
+	 * A refresh token the server minted for a rotation this manager then refused to persist, because
+	 * sign-out landed mid-flight. Nobody holds it, so it is the one that has to be revoked — the token
+	 * still in `data.json` was invalidated by that very rotation.
+	 */
+	private orphanedRefreshToken: string | undefined;
 
 	constructor(private readonly deps: TokenManagerDeps) {}
 
@@ -166,8 +205,82 @@ export class TokenManager {
 				? { expires_at: tokens.expires_at }
 				: {}),
 		};
+
+		/*
+		 * ⛔ **THE SIGN-OUT RACE (C14). THE WRITE BELOW IS WHAT RESURRECTS A REVOKED CREDENTIAL.**
+		 *
+		 * Everything above this point happened across an `await` on the network. A sign-out inside that
+		 * window has already deleted `tokens` from `data.json`, and persisting here would put a
+		 * **freshly rotated** refresh token back — one the server considers live for another 14 days,
+		 * written into a file that syncs to iCloud, Obsidian Sync and git. The user watched themselves
+		 * sign out and is now signed in.
+		 *
+		 * So the rotated token is kept only in memory, for `revokeAndAbandon` to kill at the server.
+		 * Throwing rather than returning it is deliberate: a caller handed a token here would use it,
+		 * and it belongs to a session that no longer exists.
+		 */
+		if (this.abandoned) {
+			this.orphanedRefreshToken = merged.refresh_token;
+			throw new Error("refresh abandoned by sign-out");
+		}
 		await store.setTokens(merged);
 		return merged.access_token;
+	}
+
+	/**
+	 * Stop refreshing, for good, and settle anything already in flight.
+	 *
+	 * Used where the credential is already dead (a terminal refresh failure), so there is nothing
+	 * worth revoking — but the race still has to be closed, or the dying refresh re-persists itself.
+	 */
+	async abandon(): Promise<void> {
+		this.abandoned = true;
+		await withBudget(this.settleInFlight(), REVOKE_BUDGET_MS, undefined);
+	}
+
+	/**
+	 * Sign-out: kill the credential at the authorization server, then stop refreshing.
+	 *
+	 * ⚠️ **Never throws, and never blocks past `REVOKE_BUDGET_MS`.** The caller deletes the local
+	 * tokens immediately afterwards whatever this returns: a sign-out that fails because revocation
+	 * failed is a worse bug than the one revocation exists to fix.
+	 */
+	async revokeAndAbandon(): Promise<RevokeOutcome> {
+		return withBudget(this.doRevoke(), REVOKE_BUDGET_MS, "failed");
+	}
+
+	/**
+	 * Settled, not raced. The in-flight call's outcome decides WHICH token is live at the server: if it
+	 * completed a rotation, the token in `data.json` is already dead and the live one is the orphan it
+	 * handed back. Revoking before knowing that revokes the wrong token and reports success.
+	 */
+	private async settleInFlight(): Promise<undefined> {
+		await this.inFlight?.catch(() => {});
+		return undefined;
+	}
+
+	private async doRevoke(): Promise<RevokeOutcome> {
+		const { store } = this.deps;
+		// Set BEFORE settling, so a refresh suspended on the network cannot persist when it resumes.
+		this.abandoned = true;
+		await this.settleInFlight();
+		try {
+			const token = this.orphanedRefreshToken ?? (await store.getTokens())?.refresh_token;
+			// No refresh token at all: a pre-`offline_access` install. The access token expires within
+			// the hour and cannot be revoked anyway (it is a JWT), so the local delete is the whole job.
+			if (token === undefined) return "nothing-to-revoke";
+			const clientId = await store.getClientId();
+			// The endpoint answers 200 and revokes NOTHING for a client id that does not own the token,
+			// so guessing one would report success over a no-op. Without the real id, say we failed.
+			if (clientId === undefined) return "failed";
+			const { revocation_endpoint: endpoint } = await this.discovered();
+			if (endpoint === undefined) return "failed";
+			await revoke(this.deps.f, endpoint, clientId, token);
+			return "revoked";
+		} catch (err) {
+			console.warn(`[copal] revoke failed: ${err instanceof Error ? err.message : String(err)}`);
+			return "failed";
+		}
 	}
 
 	/** Once per manager: a burst of concurrent 401s must not become a burst of notices. */

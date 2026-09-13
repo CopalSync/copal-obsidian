@@ -30,6 +30,14 @@ export interface PersistedData {
 	 *  shows the adopt screen. */
 	vaultId?: string;
 	vaultName?: string;
+	/**
+	 * Set once the constant-tenant CRDT databases have been discarded. See `purgeLegacyCrdtDocs`.
+	 *
+	 * `undefined` means "not yet purged", which is correct for both a pre-upgrade install and a brand
+	 * new one: a new install has no legacy databases, so the purge is a cheap no-op that marks itself
+	 * done. Deliberately one-way — there is no state in which they should come back.
+	 */
+	legacyCrdtPurged?: true;
 }
 
 /**
@@ -92,6 +100,16 @@ export class TokenStore {
 
 	async setTokens(tokens: Tokens): Promise<void> {
 		await this.save({ ...(await this.read()), tokens });
+	}
+
+	async getLegacyCrdtPurged(): Promise<boolean> {
+		return (await this.read()).legacyCrdtPurged === true;
+	}
+
+	/** One write, for the reason `setClientRegistration` documents: four other stores read-modify-write
+	 *  this same record concurrently, so a two-step mutation can lose the flag and purge twice. */
+	async markLegacyCrdtPurged(): Promise<void> {
+		await this.save({ ...(await this.read()), legacyCrdtPurged: true });
 	}
 
 	async getVaultId(): Promise<string | undefined> {

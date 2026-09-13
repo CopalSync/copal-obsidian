@@ -3,11 +3,14 @@ import { describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import { CrdtNote, type YTransport } from "../../src/crdt/crdt-note";
 import { CrdtSync, type CrdtSyncDeps } from "../../src/crdt/crdt-sync";
-import { LocalDocStore } from "../../src/crdt/local-doc-store";
+import { asVaultId, LocalDocStore } from "../../src/crdt/local-doc-store";
 import { LocalNoteRegistry } from "../../src/crdt/local-note-registry";
 import type { SyncApi } from "../../src/sync/api";
 import { type MutationData, MutationQueue } from "../../src/sync/mutation-queue";
 import { InMemoryVault } from "../sync/fake-vault";
+
+/** A fixed vault id, supplied the way the production factory supplies one. */
+const vaultIdOf = (id: string) => () => Promise.resolve(asVaultId(id));
 
 /** A MutationQueue backed by an in-memory `data.json` record (mirrors the real `pending`-key persistence). */
 function makeQueue(initial: MutationData | null = null) {
@@ -77,7 +80,7 @@ function makeSync(
 		moveNote?: (from: string, to: string) => Promise<void>;
 	} = {},
 ) {
-	const store = new LocalDocStore(`t${++tenantN}`);
+	const store = new LocalDocStore(vaultIdOf(`t${++tenantN}`));
 	const vault = new InMemoryVault(vaultFiles);
 	const registry = new LocalNoteRegistry(store, vault);
 	const serverDocs = new Map<string, Y.Doc>();

@@ -13,11 +13,13 @@ import {
 import { decideConnect } from "./connect/decide";
 import { ConnectFlow } from "./connect/flow";
 import { CrdtSync } from "./crdt/crdt-sync";
+import { createLocalNoteRegistry } from "./crdt/create-registry";
 import { EditorBinding } from "./crdt/editor-binding";
-import { LocalDocStore } from "./crdt/local-doc-store";
-import { LocalNoteRegistry } from "./crdt/local-note-registry";
+import { purgeLegacyCrdtDocs } from "./crdt/legacy-purge";
+import type { LocalNoteRegistry } from "./crdt/local-note-registry";
+import { tearDownCredential } from "./connect/sign-out";
 import { type PersistedData, TokenStore } from "./connect/store";
-import { type ReauthReason, TokenManager } from "./connect/token-manager";
+import { type ReauthReason, type RevokeOutcome, TokenManager } from "./connect/token-manager";
 import { CopalSettingTab } from "./settings";
 import { ApiError, type SearchHit, type SearchMode, SyncApi, type Vault } from "./sync/api";
 import { type BinaryData, BinaryCursor } from "./sync/binary-cursor";
@@ -107,11 +109,7 @@ export default class CopalPlugin extends Plugin {
 			randomState: () => crypto.randomUUID(),
 		});
 
-		this.tokens = new TokenManager({
-			f: requestUrlFetch,
-			store: this.store,
-			onReauthRequired: (reason) => this.onReauthRequired(reason),
-		});
+		this.tokens = this.newTokenManager();
 
 		// Sync stack. SyncState persists under the `sync` key of data.json, alongside the connect tokens;
 		// both read-modify-write the whole record, so they coexist.
@@ -182,8 +180,24 @@ export default class CopalPlugin extends Plugin {
 			},
 		});
 		this.binarySync = binarySync;
-		// Local-first: every note is a persisted local Y.Doc (IndexedDB); the registry hands one out per path.
-		const registry = new LocalNoteRegistry(new LocalDocStore("vault"), vault);
+		/*
+		 * One-shot, and BEFORE the registry exists: the databases being deleted are keyed under the old
+		 * constant tenant, so nothing that runs after this can see or touch them.
+		 */
+		if (!(await this.store.getLegacyCrdtPurged())) {
+			const purged = await purgeLegacyCrdtDocs();
+			await this.store.markLegacyCrdtPurged();
+			if (purged.length > 0) {
+				console.info(
+					`[copal] discarded ${purged.length} local CRDT document(s) keyed under the old shared ` +
+						`tenant; note files are untouched and sync will rebuild from the server`,
+				);
+			}
+		}
+
+		// Local-first: every note is a persisted local Y.Doc (IndexedDB); the registry hands one out per
+		// path, keyed by the vault this folder is linked to (see `createLocalNoteRegistry`).
+		const registry = createLocalNoteRegistry(this.store, vault);
 		this.registry = registry;
 		// Register the CM6 compartment once; it's reconfigured per note as the binding attaches/detaches.
 		this.registerEditorExtension([this.editorBinding.extension()]);
@@ -313,7 +327,7 @@ export default class CopalPlugin extends Plugin {
 					this.warnUnsyncableName(file.path);
 					return;
 				}
-				void this.crdt?.open(file.path);
+				this.openForSync(file.path);
 			}),
 		);
 
@@ -475,8 +489,11 @@ export default class CopalPlugin extends Plugin {
 	 * in resumes this same vault exactly as it was — the everyday pause/re-auth. (Adopting a *different* vault
 	 * is a fresh, unlinked folder's job.) The flush is skipped when the server is unreachable (dead sockets);
 	 * the `.md` files are the safety net.
+	 *
+	 * Returns what it managed to do at the authorization server, so the settings pane can tell the truth
+	 * when the credential could not be revoked.
 	 */
-	async signOut(): Promise<void> {
+	async signOut(): Promise<RevokeOutcome> {
 		if (await this.serverReachable()) {
 			try {
 				await this.crdt?.flushAll();
@@ -485,8 +502,11 @@ export default class CopalPlugin extends Plugin {
 			}
 		}
 		this.stopSync();
-		await this.store.signOut(); // drop tokens only — the vault link is kept for resume
+		// Revoke at the authorization server, then drop the tokens locally. The vault link is kept for
+		// resume. See `tearDownCredential` for why the order is the security property.
+		const outcome = await this.clearCredential(true);
 		await this.settingsTab?.refresh();
+		return outcome;
 	}
 
 	/**
@@ -494,7 +514,7 @@ export default class CopalPlugin extends Plugin {
 	 * vault** + wipe the local sync state (cursor + persisted CRDT docs). The `.md` files stay. Unlike sign-out,
 	 * the next login sees an unlinked folder → the adopt screen (re-adopt this vault or a different one).
 	 */
-	async disconnect(): Promise<void> {
+	async disconnect(): Promise<RevokeOutcome> {
 		if (await this.serverReachable()) {
 			try {
 				await this.crdt?.flushAll();
@@ -505,9 +525,10 @@ export default class CopalPlugin extends Plugin {
 			}
 		}
 		this.stopSync();
-		await this.store.signOut(); // drop tokens
+		const outcome = await this.clearCredential(true); // revoke at the server, then drop the tokens
 		await this.resetLocalVaultState(); // unlink + wipe cursor + CRDT docs (keeps .md)
 		await this.settingsTab?.refresh();
+		return outcome;
 	}
 
 	/**
@@ -515,13 +536,66 @@ export default class CopalPlugin extends Plugin {
 	 * sign-in): unlink it and wipe the stale local sync state — the cursor + persisted CRDT docs — so the next
 	 * connect starts clean. The `.md` files are untouched.
 	 */
+	/**
+	 * Open a note for live sync, fire-and-forget but never silently.
+	 *
+	 * `open()` can reject — a persisted doc now needs the linked vault id to load at all, so a vault that
+	 * vanishes mid-session turns a bare `void` into an unhandled rejection with no clue what caused it.
+	 */
+	private openForSync(path: string): void {
+		void this.crdt?.open(path).catch((err: unknown) => {
+			console.warn(
+				`[copal] could not open ${path} for sync: ${err instanceof Error ? err.message : err}`,
+			);
+		});
+	}
+
+	/**
+	 * One construction site, because a `TokenManager` is **not reusable after a sign-out**: `abandoned`
+	 * is one-way by design, and `reauthAnnounced` is a latch that would otherwise stay closed for the
+	 * rest of the session, silencing the next expiry. Every teardown therefore replaces it.
+	 */
+	private newTokenManager(): TokenManager {
+		return new TokenManager({
+			f: requestUrlFetch,
+			store: this.store,
+			onReauthRequired: (reason) => this.onReauthRequired(reason),
+		});
+	}
+
+	/**
+	 * Give up the credential and get back into a state that can sign in again.
+	 *
+	 * `SyncApi` reads `this.tokens` through a thunk on every call, so swapping the field is enough — no
+	 * restart, and nothing holds a reference to the abandoned manager.
+	 */
+	private async clearCredential(revoke: boolean): Promise<RevokeOutcome> {
+		let outcome: RevokeOutcome = "failed";
+		try {
+			outcome = await tearDownCredential({ tokens: this.tokens, store: this.store, revoke });
+		} catch (err) {
+			// `tearDownCredential` deletes the local tokens in a `finally`, so the user IS signed out
+			// even here. Log and carry on: throwing would leave the settings pane mid-sign-out.
+			console.warn(`[copal] revoke failed: ${err instanceof Error ? err.message : err}`);
+		}
+		this.tokens = this.newTokenManager();
+		this.reauthPrompted = false;
+		return outcome;
+	}
+
 	private async resetLocalVaultState(): Promise<void> {
+		/*
+		 * ⛔ **THE CRDT WIPE COMES FIRST, BEFORE THE UNLINK.** The persisted docs are keyed by the linked
+		 * vault id, so `destroyAll()` has to enumerate them while this folder still HAS one. Unlinking
+		 * first leaves it unable to name a single database, and the wipe silently becomes a no-op whose
+		 * leftovers the next link would push into a different vault.
+		 */
+		await this.registry?.destroyAll();
 		await this.store.unlinkVault();
 		await this.syncState?.reset();
 		await this.mutationQueue?.reset(); // drop queued deletes so they can't fire against the next vault
 		await this.binaryCursor?.reset(); // drop the attachment etag cursor so it can't bleed into the next vault
 		await this.binaryQueue?.reset(); // drop queued binary deletes
-		await this.registry?.destroyAll();
 	}
 
 	/** Quick liveness probe (bounded) so `signOut` only sync-flushes when the server is actually reachable. */
@@ -665,7 +739,7 @@ export default class CopalPlugin extends Plugin {
 		this.syncActive = true;
 		await this.settingsTab?.refresh();
 		const active = this.app.workspace.getActiveFile();
-		if (active && active.extension === "md") void this.crdt?.open(active.path);
+		if (active && active.extension === "md") this.openForSync(active.path);
 	}
 
 	/**
@@ -683,7 +757,13 @@ export default class CopalPlugin extends Plugin {
 		this.reauthPrompted = true;
 		void (async () => {
 			this.stopSync();
-			await this.store.signOut();
+			/*
+			 * The SAME race as sign-out (C14): another refresh may be suspended on the network this very
+			 * moment, and its write would resurrect the credential that just died. No revoke, though —
+			 * the server has already discarded this grant, which is how we got here.
+			 */
+			await this.clearCredential(false);
+			this.reauthPrompted = true; // `clearCredential` clears the latch; this path owns the notice.
 			this.setStatus("idle");
 			await this.settingsTab?.refresh();
 			new Notice(

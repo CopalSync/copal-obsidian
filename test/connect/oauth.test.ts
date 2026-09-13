@@ -6,6 +6,7 @@ import {
 	exchangeCode,
 	refresh,
 	registerClient,
+	revoke,
 	REDIRECT_URI,
 } from "../../src/connect/oauth";
 
@@ -151,6 +152,37 @@ describe("exchangeCode", () => {
 			.fn<typeof fetch>()
 			.mockResolvedValue(jsonResponse({ error: "invalid_grant" }, 400));
 		await expect(exchangeCode(f, "https://api.copal.uk/token", "cid", "c", "v")).rejects.toThrow();
+	});
+});
+
+describe("revoke", () => {
+	it("posts the refresh token to the revocation endpoint, form-encoded", async () => {
+		const f = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 200 }));
+		await revoke(f, "https://auth.copal.uk/oauth2/revoke", "cid", "rt");
+		const [url, init] = f.mock.calls[0]!;
+		expect(String(url)).toBe("https://auth.copal.uk/oauth2/revoke");
+		expect(init!.method).toBe("POST");
+		/*
+		 * The provider declares `allowedMediaTypes: ["application/x-www-form-urlencoded"]` and rejects a
+		 * JSON body. Asserted as the content type AND a parseable form body, because sending JSON with
+		 * the right header would pass a header-only check and still be refused by the server.
+		 */
+		expect((init!.headers as Record<string, string>)["content-type"]).toBe(
+			"application/x-www-form-urlencoded",
+		);
+		const body = new URLSearchParams(init!.body as string);
+		expect(body.get("token")).toBe("rt");
+		expect(body.get("token_type_hint")).toBe("refresh_token");
+		// A mismatched client id makes the server answer 200 and revoke NOTHING, so the id travelling
+		// with the token is the whole difference between a revoke and a silent no-op.
+		expect(body.get("client_id")).toBe("cid");
+	});
+
+	it("throws on a non-ok response, so a failed revoke can be reported rather than assumed", async () => {
+		const f = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 503 }));
+		await expect(revoke(f, "https://auth.copal.uk/oauth2/revoke", "cid", "rt")).rejects.toThrow(
+			/503/,
+		);
 	});
 });
 

@@ -1,12 +1,15 @@
 import "fake-indexeddb/auto";
 import { describe, expect, it } from "vitest";
-import { LocalDocStore } from "../../src/crdt/local-doc-store";
+import { asVaultId, LocalDocStore } from "../../src/crdt/local-doc-store";
 import { LocalNoteRegistry } from "../../src/crdt/local-note-registry";
 import { InMemoryVault } from "../sync/fake-vault";
 
+/** A fixed vault id, supplied the way the production factory supplies one. */
+const vaultIdOf = (id: string) => () => Promise.resolve(asVaultId(id));
+
 describe("LocalNoteRegistry", () => {
 	it("returns a cached LocalNote per path and persists edits through the store", async () => {
-		const store = new LocalDocStore("t1");
+		const store = new LocalDocStore(vaultIdOf("t1"));
 		const vault = new InMemoryVault({ "a.md": "hello" });
 		const reg = new LocalNoteRegistry(store, vault);
 
@@ -20,7 +23,7 @@ describe("LocalNoteRegistry", () => {
 		reg.close("a.md");
 
 		// A fresh registry (reload) rehydrates the note from persistence.
-		const reg2 = new LocalNoteRegistry(new LocalDocStore("t1"), vault);
+		const reg2 = new LocalNoteRegistry(new LocalDocStore(vaultIdOf("t1")), vault);
 		const again = reg2.note("a.md");
 		await again.whenLoaded;
 		expect(again.note.text()).toBe("hello!");
@@ -28,7 +31,7 @@ describe("LocalNoteRegistry", () => {
 	});
 
 	it("rename moves the note's lineage old→new and drops the stale cached LocalNote", async () => {
-		const store = new LocalDocStore("tr2");
+		const store = new LocalDocStore(vaultIdOf("tr2"));
 		const vault = new InMemoryVault({ "old.md": "content" });
 		const reg = new LocalNoteRegistry(store, vault);
 		const old = reg.note("old.md");

@@ -3,8 +3,48 @@ import * as Y from "yjs";
 
 interface Entry {
 	doc: Y.Doc;
-	provider: IndexeddbPersistence;
+	/**
+	 * Resolves once the y-indexeddb provider exists. Deferred, because the database NAME needs the
+	 * linked vault id and that is an async read of `data.json`.
+	 */
+	provider: Promise<IndexeddbPersistence>;
 	whenLoaded: Promise<void>;
+}
+
+/**
+ * The Copal vault a local doc belongs to, proven rather than asserted.
+ *
+ * ⛔ **THIS TYPE EXISTS TO STOP ONE SPECIFIC BUG COMING BACK.** The store has always keyed databases
+ * `copal:${tenant}:${path}` and a test has always asserted that shape, but production passed the
+ * literal string `"vault"` for the tenant, so every install shared one namespace. Obsidian desktop
+ * loads every vault window from the same `app://obsidian.md` origin, so two folders linked to
+ * different Copal vaults (or different accounts) shared every database and the `copal-index` record:
+ * note contents crossed accounts, same-path notes converged into one document, and a disconnect in
+ * one folder destroyed the other's history.
+ *
+ * A branded type makes that regression a **compile** error rather than something review has to catch.
+ * `new LocalDocStore("vault")` does not typecheck, and CI runs `pnpm typecheck` across the workspace.
+ */
+export type VaultId = string & { readonly __vaultId: unique symbol };
+
+/** How the store learns its vault. Async because the id lives in `data.json`, and a provider rather
+ *  than a value because a folder can be unlinked at construction and linked later. */
+export type VaultIdProvider = () => Promise<VaultId>;
+
+/**
+ * The only way to make a `VaultId`. Throws rather than inventing a fallback: a default tenant is
+ * precisely the bug above, and silently persisting a note under the wrong vault is worse than not
+ * persisting it at all.
+ */
+export function asVaultId(raw: string | undefined): VaultId {
+	if (raw === undefined || raw.trim() === "") {
+		throw new Error("no linked Copal vault: this folder has nothing to persist against");
+	}
+	// `:` separates the key's three parts, so an id containing one could be read back as a path
+	// prefix by `enumerateDatabases`. Server-minted ids are `vlt_<uuid>`, so this only ever fires on
+	// something malformed.
+	if (raw.includes(":")) throw new Error(`malformed vault id: ${raw}`);
+	return raw as VaultId;
 }
 
 /**
@@ -12,15 +52,31 @@ interface Entry {
  * client-side in IndexedDB (via y-indexeddb), so an edit — offline, closed, or active — is an op on shared
  * history that survives a reload with **no server round-trip**. This makes the client symmetric with the
  * server DO (which persists the same per-note log); the `.md` file is this doc's projection. Keyed
- * `copal:${tenant}:${path}` so tenants are isolated. IndexedDB is a browser global present in Obsidian's
- * Electron renderer and the mobile Capacitor webview (tests shim it with `fake-indexeddb`).
+ * `copal:${vaultId}:${path}` so vaults are isolated — see `VaultId` for why that is load-bearing and
+ * why it is a branded type. IndexedDB is a browser global present in Obsidian's Electron renderer and
+ * the mobile Capacitor webview (tests shim it with `fake-indexeddb`).
  */
 export class LocalDocStore {
 	private readonly entries = new Map<string, Entry>();
 	private readonly index: PersistedIndex;
+	private vaultIdPromise: Promise<VaultId> | undefined;
 
-	constructor(private readonly tenant: string) {
-		this.index = new PersistedIndex(tenant);
+	constructor(private readonly vaultIdProvider: VaultIdProvider) {
+		this.index = new PersistedIndex(() => this.vaultId());
+	}
+
+	/**
+	 * The vault id, resolved once.
+	 *
+	 * ⚠️ A FAILURE IS NOT CACHED, the same way `PersistedIndex.db()` does not cache a failed open: an
+	 * unlinked folder throws here, and it can be linked a moment later without a reload.
+	 */
+	private vaultId(): Promise<VaultId> {
+		this.vaultIdPromise ??= this.vaultIdProvider().catch((err: unknown) => {
+			this.vaultIdPromise = undefined;
+			throw err;
+		});
+		return this.vaultIdPromise;
 	}
 
 	/** Open (or reuse) a note's persisted local Y.Doc. `whenLoaded` resolves once IndexedDB rehydrates it. */
@@ -28,8 +84,11 @@ export class LocalDocStore {
 		const existing = this.entries.get(path);
 		if (existing) return { doc: existing.doc, whenLoaded: existing.whenLoaded };
 		const doc = new Y.Doc();
-		const provider = new IndexeddbPersistence(this.key(path), doc);
-		const whenLoaded = provider.whenSynced.then(() => undefined);
+		// Synchronous signature, async key: the caller gets its `Y.Doc` immediately (editors bind to it
+		// before anything is loaded) while the database name waits on the vault id.
+		const provider = this.key(path).then((name) => new IndexeddbPersistence(name, doc));
+		void provider.catch(() => {}); // the real failure surfaces through `whenLoaded`, which callers await
+		const whenLoaded = provider.then((p) => p.whenSynced).then(() => undefined);
 		this.entries.set(path, { doc, provider, whenLoaded });
 		void this.index.add(path); // record it so `listPersisted()` is correct even where `databases()` is absent
 		return { doc, whenLoaded };
@@ -55,9 +114,13 @@ export class LocalDocStore {
 	close(path: string): void {
 		const entry = this.entries.get(path);
 		if (!entry) return;
-		void entry.provider.destroy(); // closes the idb connection; data is retained
-		entry.doc.destroy();
 		this.entries.delete(path);
+		// Fire-and-forget as before, but the provider may not exist yet (its name needed the vault id).
+		// Close it FIRST where it does, so y-indexeddb never flushes into a destroyed doc.
+		void entry.provider.then(
+			(p) => p.destroy().then(() => entry.doc.destroy()),
+			() => entry.doc.destroy(), // never opened; nothing to close
+		);
 	}
 
 	/** Permanently delete a note's persisted local data (on a confirmed remote delete / bring-existing purge).
@@ -68,9 +131,13 @@ export class LocalDocStore {
 	async destroy(path: string): Promise<void> {
 		const entry = this.entries.get(path);
 		if (entry) {
-			await entry.provider.destroy(); // close the IndexedDB connection so the delete isn't blocked
-			entry.doc.destroy();
 			this.entries.delete(path);
+			try {
+				await (await entry.provider).destroy(); // close the connection so the delete isn't blocked
+			} catch {
+				/* never opened (no vault id): there is no connection to close */
+			}
+			entry.doc.destroy();
 		}
 		await this.deleteDb(path);
 		await this.index.remove(path); // keep the persisted index in step with the actual DB deletion
@@ -85,11 +152,17 @@ export class LocalDocStore {
 	}
 
 	/** Delete the whole per-note database, resolving once done (or if unavailable). */
-	private deleteDb(path: string): Promise<void> {
+	private async deleteDb(path: string): Promise<void> {
 		const idb = globalThis.indexedDB;
-		if (!idb?.deleteDatabase) return Promise.resolve();
-		return new Promise((resolve) => {
-			const req = idb.deleteDatabase(this.key(path));
+		if (!idb?.deleteDatabase) return;
+		let name: string;
+		try {
+			name = await this.key(path);
+		} catch {
+			return; // no vault id, so no database of ours can exist under one
+		}
+		await new Promise<void>((resolve) => {
+			const req = idb.deleteDatabase(name);
 			req.onsuccess = () => resolve();
 			req.onerror = () => resolve();
 			req.onblocked = () => resolve(); // an open connection elsewhere; the delete completes when it closes
@@ -123,7 +196,7 @@ export class LocalDocStore {
 
 	/** Persisted paths derived from `indexedDB.databases()` (desktop only). */
 	private async enumerateDatabases(): Promise<string[]> {
-		const prefix = `copal:${this.tenant}:`;
+		const prefix = `copal:${await this.vaultId()}:`;
 		const dbs = (await globalThis.indexedDB.databases()) ?? [];
 		return dbs
 			.map((d) => d.name ?? "")
@@ -131,15 +204,15 @@ export class LocalDocStore {
 			.map((n) => n.slice(prefix.length));
 	}
 
-	private key(path: string): string {
-		return `copal:${this.tenant}:${path}`;
+	private async key(path: string): Promise<string> {
+		return `copal:${await this.vaultId()}:${path}`;
 	}
 }
 
 /**
  * A tiny persisted set of the note paths that HAVE a local doc — the iOS-safe replacement for enumerating
  * `indexedDB.databases()` (which iOS/WebKit does not implement). One dedicated IndexedDB database
- * (`copal-index`), object store `paths` keyed by tenant → the array of persisted paths. All operations run
+ * (`copal-index`), object store `paths` keyed by VAULT ID → the array of persisted paths. All operations run
  * through a serial queue so concurrent add/remove can't lose an update (read-modify-write races). Every
  * method fails **open** (errors resolve to a no-op / empty list), so a broken index never blocks the store
  * or throws into the sync engine — the caller's `databases()` path still works on desktop.
@@ -150,7 +223,12 @@ class PersistedIndex {
 	private chain: Promise<unknown> = Promise.resolve();
 	private dbPromise: Promise<IDBDatabase> | undefined;
 
-	constructor(private readonly tenant: string) {}
+	/**
+	 * ⚠️ The `copal-index` DATABASE is shared by every vault in the origin; the vault id is the record
+	 * KEY inside it. That is why scoping this key is enough, and why passing a constant meant two
+	 * different vaults read and wrote each other's path list.
+	 */
+	constructor(private readonly vaultId: () => Promise<VaultId>) {}
 
 	add(path: string): Promise<void> {
 		return this.mutate((set) => set.add(path));
@@ -196,33 +274,35 @@ class PersistedIndex {
 	}
 
 	private read(): Promise<string[]> {
-		return this.tx("readonly", (store) => store.get(this.tenant)).then(
+		return this.tx("readonly", (store, key) => store.get(key)).then(
 			(v) => (Array.isArray(v) ? (v as string[]) : []),
 			() => [],
 		);
 	}
 
 	private write(paths: string[]): Promise<void> {
-		return this.tx("readwrite", (store) => store.put(paths, this.tenant)).then(
+		return this.tx("readwrite", (store, key) => store.put(paths, key)).then(
 			() => undefined,
 			() => undefined,
 		);
 	}
 
-	private tx<T>(
+	/** Resolves the record key (the vault id) as part of the transaction, so an unlinked folder fails
+	 *  into the same fail-open paths as a broken database rather than throwing into the store. */
+	private async tx<T>(
 		mode: IDBTransactionMode,
-		fn: (store: IDBObjectStore) => IDBRequest<T>,
+		fn: (store: IDBObjectStore, key: string) => IDBRequest<T>,
 	): Promise<T> {
-		return this.db().then(
-			(db) =>
-				new Promise<T>((resolve, reject) => {
-					const req = fn(
-						db.transaction(PersistedIndex.STORE, mode).objectStore(PersistedIndex.STORE),
-					);
-					req.onsuccess = () => resolve(req.result);
-					req.onerror = () => reject(req.error ?? new Error("index request failed"));
-				}),
-		);
+		const key = await this.vaultId();
+		const db = await this.db();
+		return new Promise<T>((resolve, reject) => {
+			const req = fn(
+				db.transaction(PersistedIndex.STORE, mode).objectStore(PersistedIndex.STORE),
+				key,
+			);
+			req.onsuccess = () => resolve(req.result);
+			req.onerror = () => reject(req.error ?? new Error("index request failed"));
+		});
 	}
 
 	private db(): Promise<IDBDatabase> {

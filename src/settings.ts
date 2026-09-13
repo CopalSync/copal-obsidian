@@ -77,7 +77,15 @@ export class CopalSettingTab extends PluginSettingTab {
 				.addButton((b) =>
 					b.setButtonText("Sign out").onClick(async () => {
 						new Notice("Signing out…");
-						await this.plugin.signOut();
+						// Silent on success here (the screen changing is the feedback), but a sign-in that
+						// could not be revoked is never silent.
+						if ((await this.plugin.signOut()) === "failed") {
+							new Notice(
+								"Signed out on this device. Copal could not be reached, so the sign-in was not " +
+									"revoked. Sign out again when you are online.",
+								10000,
+							);
+						}
 					}),
 				)
 				.addButton((b) =>
@@ -102,8 +110,17 @@ export class CopalSettingTab extends PluginSettingTab {
 			.addButton((b) =>
 				b.setButtonText("Sign out").onClick(async () => {
 					new Notice("Signing out…");
-					await this.plugin.signOut();
-					new Notice("Signed out. Sign back in to resume.");
+					const outcome = await this.plugin.signOut();
+					// Honest either way. A failed revoke still signs you out HERE, but every copy of this
+					// vault keeps a sign-in that can renew itself, so it has to be said rather than
+					// covered by the same cheerful notice as a clean one.
+					new Notice(
+						outcome === "failed"
+							? "Signed out on this device. Copal could not be reached, so the sign-in was not " +
+									"revoked. Sign out again when you are online."
+							: "Signed out. Sign back in to resume.",
+						outcome === "failed" ? 10000 : undefined,
+					);
 				}),
 			)
 			.addButton((b) =>
@@ -134,7 +151,9 @@ export class CopalSettingTab extends PluginSettingTab {
 			cls: "copal-fineprint",
 			text:
 				"Your Copal sign-in is stored in this vault's plugin data. If you sync this vault elsewhere " +
-				"(iCloud, Obsidian Sync, git…), your sign-in travels with it. Sign out on devices you no longer use.",
+				"(iCloud, Obsidian Sync, git…), your sign-in travels with it. Signing out revokes that " +
+				"sign-in with Copal, so the copies cannot renew it. Access already granted can take up to " +
+				"an hour to lapse.",
 		});
 	}
 

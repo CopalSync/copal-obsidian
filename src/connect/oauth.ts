@@ -40,6 +40,8 @@ interface Discovery {
 	registration_endpoint: string;
 	authorization_endpoint: string;
 	token_endpoint: string;
+	/** RFC 7009. Optional: a server that publishes none must degrade to a local-only sign-out. */
+	revocation_endpoint?: string;
 }
 
 /** The MCP resource this plugin authenticates against — the identifier tokens are minted for. */
@@ -261,4 +263,52 @@ export async function refresh(
 	});
 	if (!res.ok) throw await TokenRefreshError.from(res);
 	return toTokens(await res.json());
+}
+
+/**
+ * RFC 7009: tell the authorization server to forget this refresh token.
+ *
+ * ⛔ **THIS IS WHAT MAKES SIGN-OUT MEAN SOMETHING.** `data.json` lives inside the vault, so every
+ * copy of the vault (iCloud, Obsidian Sync, git) carries the refresh token with it. Deleting the
+ * local key alone leaves every one of those copies able to mint fresh access tokens for the rest of
+ * the token's 14-day sliding life, with no client secret needed. The settings pane's advice to
+ * "sign out on devices you no longer use" is only true because of this call.
+ *
+ * Revoking the REFRESH token, not the access token, is deliberate three times over:
+ *  - A JWT access token cannot be revoked at all here. The provider answers `unsupported_token_type`
+ *    for one, because it is self-contained and the gateway verifies it offline.
+ *  - Rotation means the token we hold is the only live one in its family, so killing it leaves the
+ *    family with no live member.
+ *  - The next refresh attempt with a revoked token trips the server's `invalidateRefreshFamily`,
+ *    which deletes every access and refresh token for the (client, user) pair.
+ *
+ * ⚠️ `clientId` MUST be the registration the token was issued to. The endpoint answers **200 with no
+ * effect** when the client id does not match the token's (RFC 7009 says an unknown token is not an
+ * error), so a wrong or invented id is a silent no-op that looks exactly like success.
+ *
+ * ⚠️ Form-encoded, not JSON: the provider declares `allowedMediaTypes:
+ * ["application/x-www-form-urlencoded"]` and rejects a JSON body outright.
+ *
+ * Throws on a non-ok response so the caller can report honestly. The caller is also the one that
+ * decides to swallow: a failed revoke must never block the local sign-out.
+ */
+export async function revoke(
+	f: typeof fetch,
+	revocationEndpoint: string,
+	clientId: string,
+	refreshToken: string,
+): Promise<void> {
+	const res = await f(revocationEndpoint, {
+		method: "POST",
+		headers: { "content-type": "application/x-www-form-urlencoded" },
+		body: new URLSearchParams({
+			token: refreshToken,
+			// Explicit, though the server would fall through to it anyway. Without the hint it first
+			// tries to read the token as an access token, which costs a JWKS verify and turns a clean
+			// revoke into a confusing `unsupported_token_type` in the server's logs.
+			token_type_hint: "refresh_token",
+			client_id: clientId,
+		}).toString(),
+	});
+	if (!res.ok) throw new Error(`token revocation failed: ${res.status}`);
 }
