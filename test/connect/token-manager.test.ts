@@ -15,12 +15,18 @@ function memStore(initial: PersistedData = {}): TokenStore {
 	);
 }
 
+/**
+ * Production-shaped, and it has to be: the gateway is the RESOURCE and `auth.copal.uk` is the
+ * authorization server, so the issuer and every endpoint share that origin. This fixture used to name
+ * `api.copal.uk` as the server while claiming `auth.copal.uk` as the issuer, which is precisely the
+ * mismatch RFC 8414 §3.3 exists to refuse.
+ */
 const DISCOVERY = {
 	issuer: "https://auth.copal.uk",
-	registration_endpoint: "https://api.copal.uk/oauth2/register",
-	authorization_endpoint: "https://api.copal.uk/oauth2/authorize",
-	token_endpoint: "https://api.copal.uk/oauth2/token",
-	revocation_endpoint: "https://api.copal.uk/oauth2/revoke",
+	registration_endpoint: "https://auth.copal.uk/oauth2/register",
+	authorization_endpoint: "https://auth.copal.uk/oauth2/authorize",
+	token_endpoint: "https://auth.copal.uk/oauth2/token",
+	revocation_endpoint: "https://auth.copal.uk/oauth2/revoke",
 };
 
 /** `memStore`, but the raw record stays readable so a test can prove what was NOT written. */
@@ -87,7 +93,10 @@ function fetchWith(
 		}
 		// Both discovery candidates (RFC 9728 with-path, then the bare fallback).
 		if (url.includes(".well-known/oauth-protected-resource")) {
-			return json({ authorization_servers: ["https://api.copal.uk"] });
+			return json({
+				resource: "https://api.copal.uk/mcp",
+				authorization_servers: ["https://auth.copal.uk"],
+			});
 		}
 		return json(discovery);
 	});
@@ -230,7 +239,10 @@ describe("TokenManager failure classification", () => {
 		const f = vi.fn(async (input: string | URL | Request) => {
 			if (String(input).includes("/oauth2/token")) throw new TypeError("network down");
 			if (String(input).includes(".well-known/oauth-protected-resource")) {
-				return json({ authorization_servers: ["https://api.copal.uk"] });
+				return json({
+					resource: "https://api.copal.uk/mcp",
+					authorization_servers: ["https://auth.copal.uk"],
+				});
 			}
 			return json(DISCOVERY);
 		});

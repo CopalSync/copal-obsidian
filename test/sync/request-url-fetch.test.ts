@@ -44,9 +44,12 @@ describe("requestUrlFetch adapter", () => {
 			headers: { "If-Match": '"e1"' },
 			body,
 		});
-		expect(captured?.method).toBe("PUT");
-		expect((captured?.headers as Record<string, string>)["If-Match"]).toBe('"e1"');
-		expect(captured?.body).toBe(body);
+		// Narrowed rather than optional-chained: indexing `headers` off an undefined `captured` would
+		// throw a TypeError that reads as a broken test rather than as "requestUrl was never called".
+		if (captured === undefined) throw new Error("requestUrl was never called");
+		expect(captured.method).toBe("PUT");
+		expect((captured.headers as Record<string, string>)["If-Match"]).toBe('"e1"');
+		expect(captured.body).toBe(body);
 	});
 
 	it("parses a JSON response body so the text endpoints keep working", async () => {

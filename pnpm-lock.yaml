@@ -19,16 +19,16 @@ importers:
         version: 0.2.117
       y-codemirror.next:
         specifier: ^0.3.5
-        version: 0.3.5(@codemirror/state@6.7.1)(@codemirror/view@6.43.6)(yjs@13.6.31)
+        version: 0.3.5(@codemirror/state@6.7.1)(@codemirror/view@6.43.6)(yjs@13.6.32)
       y-indexeddb:
         specifier: ^9.0.12
-        version: 9.0.12(yjs@13.6.31)
+        version: 9.0.12(yjs@13.6.32)
       y-protocols:
         specifier: ^1.0.7
-        version: 1.0.7(yjs@13.6.31)
+        version: 1.0.7(yjs@13.6.32)
       yjs:
-        specifier: ^13.6.31
-        version: 13.6.31
+        specifier: ^13.6.32
+        version: 13.6.32
     devDependencies:
       '@types/node':
         specifier: ^26.0.1
@@ -1121,8 +1121,8 @@ packages:
     peerDependencies:
       yjs: ^13.0.0
 
-  yjs@13.6.31:
-    resolution: {integrity: sha512-Eq+5BRfbeGyqGVrTJL3bEcr8gKkxPuyuoHmAwpk52fDb8kOVMrfVSTRPd6yiGgX5Fskb96qCRjzjbRjrL4YEnw==}
+  yjs@13.6.32:
+    resolution: {integrity: sha512-lfiJIIC4Xayt5ItynE407ehlE03pCjeOc4hkR4yxxvvNJ4kuiN25B0g+Qp8XagYz361LLL7DCzR5bvFJ81QKtQ==}
     engines: {node: '>=16.0.0', npm: '>=8.0.0'}
 
 snapshots:
@@ -1845,23 +1845,23 @@ snapshots:
       siginfo: 2.0.0
       stackback: 0.0.2
 
-  y-codemirror.next@0.3.5(@codemirror/state@6.7.1)(@codemirror/view@6.43.6)(yjs@13.6.31):
+  y-codemirror.next@0.3.5(@codemirror/state@6.7.1)(@codemirror/view@6.43.6)(yjs@13.6.32):
     dependencies:
       '@codemirror/state': 6.7.1
       '@codemirror/view': 6.43.6
       lib0: 0.2.117
-      yjs: 13.6.31
+      yjs: 13.6.32
 
-  y-indexeddb@9.0.12(yjs@13.6.31):
+  y-indexeddb@9.0.12(yjs@13.6.32):
     dependencies:
       lib0: 0.2.117
-      yjs: 13.6.31
+      yjs: 13.6.32
 
-  y-protocols@1.0.7(yjs@13.6.31):
+  y-protocols@1.0.7(yjs@13.6.32):
     dependencies:
       lib0: 0.2.117
-      yjs: 13.6.31
+      yjs: 13.6.32
 
-  yjs@13.6.31:
+  yjs@13.6.32:
     dependencies:
       lib0: 0.2.117

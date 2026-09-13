@@ -455,7 +455,12 @@ export default class CopalPlugin extends Plugin {
 			// The active note is owned by the CM6 editor binding (Obsidian saves it). Every other note's local
 			// edit is read + applied as an op to its persisted Y.Doc, then op-synced.
 			if (this.crdt?.ownsPath(file.path)) return;
-			void this.pushLocalChange(file.path);
+			// Caught for the same reason the attachment branch below catches: this is fire-and-forget, and a
+			// sync that cannot reach the server is normal (offline). A burst now resolves several queued
+			// waiters, so an uncaught rejection would be logged once per edit rather than once per sync.
+			void this.pushLocalChange(file.path).catch((err: unknown) => {
+				if (debugEnabled()) console.debug(`[copal] local push failed for ${file.path}: ${err}`);
+			});
 			return;
 		}
 		// A non-`.md` attachment → the file-level last-writer-wins channel (never the text CRDT).
@@ -466,16 +471,11 @@ export default class CopalPlugin extends Plugin {
 		}
 	}
 
+	/** Hand the PATH to the sync engine and let it read the file when the queue reaches it. Reading here
+	 *  would snapshot text that is stale by the time it syncs — which is how a burst of autosaves lost its
+	 *  newest edit. Existence and readability are checked at dequeue for the same reason. */
 	private async pushLocalChange(path: string): Promise<void> {
-		if (!this.vault) return;
-		let text: string;
-		try {
-			if (!(await this.vault.exists(path))) return; // deletion → file-level (P5)
-			text = await this.vault.read(path);
-		} catch {
-			return;
-		}
-		await this.crdt?.onLocalChange(path, text);
+		await this.crdt?.onLocalChange(path);
 	}
 
 	/** The active note's underlying CodeMirror 6 view (Obsidian's `Editor.cm`), for the Y.Text binding. */

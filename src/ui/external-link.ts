@@ -1,4 +1,5 @@
 import { type App, Modal, Platform } from "obsidian";
+import { asTrustedUrl, type TrustedUrl } from "../sync/safe-url";
 
 /**
  * Open an external URL cross-platform.
@@ -10,18 +11,23 @@ import { type App, Modal, Platform } from "obsidian";
  * one-tap prompt with a real `<a href>` — the user's tap IS a gesture, and Obsidian's built-in mobile link
  * handler opens it in the system browser (the same path as tapping a link in a note).
  */
-export function openExternal(app: App, url: string): void {
+export function openExternal(app: App, url: TrustedUrl): void {
+	// Belt and braces. The type already says this URL was checked, but this function is the one place in
+	// the plugin where a bad URL is EXECUTED rather than merely fetched — `javascript:` reaches both the
+	// `window.open` below and the real `<a href>` the mobile branch renders. A runtime check costs
+	// nothing and does not depend on every future caller being in TypeScript's reach.
+	const checked = asTrustedUrl(url);
 	if (Platform.isDesktop) {
-		window.open(url, "_blank");
+		window.open(checked, "_blank");
 		return;
 	}
-	new ExternalLinkModal(app, url).open();
+	new ExternalLinkModal(app, checked).open();
 }
 
 class ExternalLinkModal extends Modal {
 	constructor(
 		app: App,
-		private readonly url: string,
+		private readonly url: TrustedUrl,
 	) {
 		super(app);
 	}

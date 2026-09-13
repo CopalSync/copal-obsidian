@@ -78,13 +78,16 @@ function makeSync(
 	opts: {
 		deleteNote?: (p: string) => Promise<void>;
 		moveNote?: (from: string, to: string) => Promise<void>;
+		/** Awaited before each transient connect, so a test can hold a sync open mid-flight. */
+		beforeTransport?: (path: string) => Promise<void>;
 	} = {},
 ) {
 	const store = new LocalDocStore(vaultIdOf(`t${++tenantN}`));
 	const vault = new InMemoryVault(vaultFiles);
 	const registry = new LocalNoteRegistry(store, vault);
 	const serverDocs = new Map<string, Y.Doc>();
-	const transportFor = (path: string): Promise<YTransport> => {
+	const transportFor = async (path: string): Promise<YTransport> => {
+		await opts.beforeTransport?.(path);
 		const { a, b } = pairedTransports();
 		let serverDoc = serverDocs.get(path);
 		if (!serverDoc) {
@@ -92,7 +95,7 @@ function makeSync(
 			serverDocs.set(path, serverDoc);
 		}
 		new CrdtNote(b, serverDoc); // a fresh server peer wrapping the persistent server doc
-		return Promise.resolve(a);
+		return a;
 	};
 	const bound: CrdtNote[] = [];
 	const deleted: string[] = [];
@@ -139,7 +142,7 @@ const serverText = (docs: Map<string, Y.Doc>, path: string) =>
 describe("CrdtSync (local-first op-sync)", () => {
 	it("onLocalChange applies a file edit as an op and syncs it up to the server", async () => {
 		const { crdt, serverDocs } = makeSync({ "n.md": "hello world" });
-		await crdt.onLocalChange("n.md", "hello world");
+		await crdt.onLocalChange("n.md");
 		await waitFor(() => serverText(serverDocs, "n.md") === "hello world");
 		expect(serverText(serverDocs, "n.md")).toBe("hello world");
 	});
@@ -182,7 +185,7 @@ describe("CrdtSync (local-first op-sync)", () => {
 
 	it("onLocalChange skips a control-character path (never transient-syncs an unsyncable filename)", async () => {
 		const { crdt, serverDocs } = makeSync({});
-		await crdt.onLocalChange("bad\nname.md", "text");
+		await crdt.onLocalChange("bad\nname.md");
 		expect(serverDocs.has("bad\nname.md")).toBe(false);
 	});
 
@@ -260,8 +263,8 @@ describe("CrdtSync (local-first op-sync)", () => {
 	});
 
 	it("UNIONS an offline local edit with a concurrent server edit — zero loss", async () => {
-		const { crdt, serverDocs, registry } = makeSync({ "n.md": "" });
-		await crdt.onLocalChange("n.md", "BASE\n"); // establish shared history
+		const { crdt, serverDocs, registry } = makeSync({ "n.md": "BASE\n" });
+		await crdt.onLocalChange("n.md"); // establish shared history (read from the file at dequeue)
 		await waitFor(() => serverText(serverDocs, "n.md") === "BASE\n");
 
 		// Both diverge OFFLINE (no connection between the two edits).
@@ -652,10 +655,11 @@ describe("CrdtSync (local-first op-sync)", () => {
 	});
 
 	it("ignores onLocalChange / onRemoteChange for the active note (the editor owns it)", async () => {
-		const { crdt, serverDocs } = makeSync({ "act.md": "x" });
+		const { crdt, serverDocs, vault } = makeSync({ "act.md": "x" });
 		await crdt.open("act.md");
 		await waitFor(() => serverText(serverDocs, "act.md").includes("x")); // open seeded + synced "x"
-		await crdt.onLocalChange("act.md", "y"); // no-op (active — the editor binding owns it)
+		await vault.write("act.md", "xy"); // a real on-disk change for the watcher path to pick up
+		await crdt.onLocalChange("act.md"); // no-op (active — the editor binding owns it)
 		await crdt.onRemoteChange({ path: "act.md", op: "put" }); // no-op (active)
 		await new Promise((r) => setTimeout(r, 20));
 		expect(crdt.ownsPath("act.md")).toBe(true);
@@ -835,5 +839,129 @@ describe("a note this device was behind on, across an upgrade", () => {
 		// The note itself ends up correct; the stale local text is kept beside it rather than dropped.
 		expect(first.vault.snapshot()["n.md"]).toBe("NEW");
 		expect(first.vault.snapshot()["n (conflicted copy).md"]).toBe("OLD");
+	});
+});
+
+/**
+ * P6. The in-flight guard used to hand a second caller the FIRST call's promise and drop its text, so a
+ * burst of autosaves lost everything after the first. The fix queues the *path* and reads the file when
+ * the job runs, which is why these tests drive the vault rather than passing text in.
+ */
+describe("P6: a local edit is never lost", () => {
+	it("syncs the newest text after a burst, not the text current when the burst started", async () => {
+		let connects = 0;
+		let gate: Promise<void> | undefined;
+		let open!: () => void;
+		const { crdt, vault, serverDocs } = makeSync(
+			{ "n.md": "A" },
+			{},
+			{
+				beforeTransport: async () => {
+					connects += 1;
+					await gate;
+				},
+			},
+		);
+
+		// ⚠️ Establish shared history FIRST. With an empty doc the sync takes the seed-from-file branch,
+		// which reads the file late and would make this pass for the wrong reason.
+		await crdt.onLocalChange("n.md");
+		await waitFor(() => serverText(serverDocs, "n.md") === "A");
+		gate = new Promise<void>((r) => (open = r));
+		connects = 0;
+
+		await vault.write("n.md", "A first edit");
+		const first = crdt.onLocalChange("n.md");
+		// ⚠️ NOT a bare `await Promise.resolve()`. The first job has to genuinely reach the network before
+		// the second call, or this coalesces against a job that never started and passes for the wrong reason.
+		await waitFor(() => connects > 0);
+
+		await vault.write("n.md", "A second edit, moments later");
+		const second = crdt.onLocalChange("n.md");
+
+		open();
+		await Promise.all([first, second]);
+
+		await waitFor(() => serverText(serverDocs, "n.md") === "A second edit, moments later");
+		expect(serverText(serverDocs, "n.md"), "the newest text never reached the server").toBe(
+			"A second edit, moments later",
+		);
+	});
+
+	/**
+	 * The other half of the same data loss. `lastHash` is in-memory and starts empty, so a LocalNote that
+	 * has just been created knows nothing about what is on disk — and the code used to read that "unknown"
+	 * as "safe to overwrite", materializing the doc straight over a newer `.md`.
+	 */
+	it("merges a .md that changed while its LocalNote was gone, instead of overwriting it", async () => {
+		const { crdt, registry, vault, serverDocs } = makeSync({ "n.md": "the original" });
+		await crdt.onLocalChange("n.md");
+		await waitFor(() => serverText(serverDocs, "n.md") === "the original");
+
+		// A reload: the cached LocalNote — the only record of what was last written to disk — is gone,
+		// while the file has since changed. Nothing queues a local edit for it, so nothing heals it.
+		registry.close("n.md");
+		await vault.write("n.md", "the original, edited while nothing was watching");
+
+		await crdt.flushAll(); // sign-out / disconnect syncs every persisted note
+
+		expect(vault.snapshot()["n.md"], "the newer .md was overwritten by the older doc").toBe(
+			"the original, edited while nothing was watching",
+		);
+		expect(serverText(serverDocs, "n.md"), "the edit never reached the server either").toBe(
+			"the original, edited while nothing was watching",
+		);
+	});
+
+	/** Read-at-dequeue means the job routinely reads back the plugin's OWN materialize. `applyFileEdit`'s
+	 *  hash guard is the only thing stopping that becoming a fresh edit — and another sync after it. */
+	it("does not re-apply its own materialize as a user edit", async () => {
+		const { crdt, registry, vault, serverDocs } = makeSync({ "n.md": "start" });
+		await crdt.onLocalChange("n.md");
+		await waitFor(() => serverText(serverDocs, "n.md") === "start");
+
+		const sd = serverDocs.get("n.md")!;
+		sd.getText("content").insert(sd.getText("content").length, " plus remote");
+		await crdt.onRemoteChange({ path: "n.md", op: "put" });
+		await waitFor(() => vault.snapshot()["n.md"] === "start plus remote");
+
+		// Obsidian's watcher now fires for the write we just made ourselves.
+		await crdt.onLocalChange("n.md");
+
+		const { note } = registry.note("n.md");
+		expect(note.text(), "the echo was applied as a second edit").toBe("start plus remote");
+		expect(serverText(serverDocs, "n.md")).toBe("start plus remote");
+		expect(vault.snapshot()["n.md"]).toBe("start plus remote");
+	});
+
+	it("lets a remote-driven sync ride a local one rather than queueing behind it", async () => {
+		let connects = 0;
+		let gate: Promise<void> | undefined;
+		let open!: () => void;
+		const { crdt, serverDocs } = makeSync(
+			{ "n.md": "A" },
+			{},
+			{
+				beforeTransport: async () => {
+					connects += 1;
+					await gate;
+				},
+			},
+		);
+		await crdt.onLocalChange("n.md");
+		await waitFor(() => serverText(serverDocs, "n.md") === "A");
+		gate = new Promise<void>((r) => (open = r));
+		connects = 0;
+
+		const local = crdt.onLocalChange("n.md");
+		await waitFor(() => connects > 0);
+		const remote = crdt.onRemoteChange({ path: "n.md", op: "put" });
+
+		open();
+		await Promise.all([local, remote]);
+
+		expect(connects, "the remote change queued its own run instead of riding the local one").toBe(
+			1,
+		);
 	});
 });

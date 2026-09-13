@@ -1,3 +1,4 @@
+import { asTrustedUrl, type TrustedUrl } from "../sync/safe-url";
 import type { ClientReg, PkcePair, Tokens } from "../types";
 
 export const API_BASE = "https://api.copal.uk";
@@ -36,20 +37,48 @@ export const REDIRECT_URI = "https://copal.uk/plugin/connect";
  */
 export const SCOPE = "vault.read vault.write offline_access";
 
-interface Discovery {
+/**
+ * The authorization server's RFC 8414 metadata, with every URL already checked.
+ *
+ * The fields are `TrustedUrl`, not `string`, and `asTrustedUrl` is the only way to make one — so a sink
+ * added later cannot send a token to a URL nobody validated without failing `tsc`. That matters here
+ * more than usual: this type grew two new sinks in a single afternoon, both added by someone who had
+ * just finished reading this file.
+ */
+export interface Discovery {
 	/** RFC 8414 identifier of the authorization server, and the origin Copal's own routes live on. */
-	issuer: string;
-	registration_endpoint: string;
-	authorization_endpoint: string;
-	token_endpoint: string;
+	issuer: TrustedUrl;
+	registration_endpoint: TrustedUrl;
+	authorization_endpoint: TrustedUrl;
+	token_endpoint: TrustedUrl;
 	/** RFC 7009. Optional: a server that publishes none must degrade to a local-only sign-out. */
-	revocation_endpoint?: string;
+	revocation_endpoint?: TrustedUrl;
+}
+
+/**
+ * The one door to the network in this module. Taking a `TrustedUrl` is what makes the branding
+ * load-bearing rather than decorative: branding the `Discovery` fields protects today's sinks, and this
+ * protects the next one, including a sink that reads some other server-supplied field entirely.
+ */
+function trustedFetch(f: typeof fetch, url: TrustedUrl, init?: RequestInit): Promise<Response> {
+	return f(url, init);
+}
+
+/** Read a required string field out of a server-supplied document. */
+function required(doc: Record<string, unknown>, field: string): string {
+	const value = doc[field];
+	if (typeof value !== "string" || value === "") {
+		throw new Error(`discovery failed: metadata has no ${field}`);
+	}
+	return value;
 }
 
 /** The MCP resource this plugin authenticates against — the identifier tokens are minted for. */
 const MCP_RESOURCE = `${API_BASE}/mcp`;
 
 interface ProtectedResource {
+	/** RFC 9728 requires it, and it must name the resource we actually authenticate against. */
+	resource?: string;
 	authorization_servers?: string[];
 }
 
@@ -67,8 +96,20 @@ async function protectedResource(f: typeof fetch): Promise<ProtectedResource> {
 		`${API_BASE}/.well-known/oauth-protected-resource${path}`,
 		`${API_BASE}/.well-known/oauth-protected-resource`,
 	]) {
-		const res = await f(url);
-		if (res.ok) return (await res.json()) as ProtectedResource;
+		// `API_BASE` is compiled in, so this hop is trusted by construction — it is the ROOT of the chain,
+		// and the only link that does not have to be checked.
+		// oxlint-disable-next-line no-await-in-loop
+		const res = await trustedFetch(f, asTrustedUrl(url));
+		if (!res.ok) continue;
+		const doc = (await res.json()) as ProtectedResource;
+		// A document for some other resource is not ours to follow: it would name that resource's
+		// authorization server, and we would hand it credentials minted for `MCP_RESOURCE`.
+		if (doc.resource !== MCP_RESOURCE) {
+			throw new Error(
+				`discovery failed: metadata is for resource ${String(doc.resource)}, not ${MCP_RESOURCE}`,
+			);
+		}
+		return doc;
 	}
 	throw new Error("discovery failed: the server published no protected-resource metadata");
 }
@@ -83,20 +124,64 @@ async function protectedResource(f: typeof fetch): Promise<ProtectedResource> {
  */
 export async function discover(f: typeof fetch): Promise<Discovery> {
 	const { authorization_servers: servers } = await protectedResource(f);
-	const issuer = servers?.[0];
-	if (issuer === undefined) {
+	const named = servers?.[0];
+	if (named === undefined) {
 		throw new Error("discovery failed: the resource names no authorization server");
 	}
-	const res = await f(`${issuer.replace(/\/+$/, "")}/.well-known/oauth-authorization-server`);
+	// ⛔ Validated BEFORE the hop, never after. A check that runs on the response has already let the
+	// request reach a host of the document's choosing, and `requestUrl` is not subject to CORS.
+	const base = asTrustedUrl(named);
+	// `new URL(path, base)`, not concatenation: a path, query or fragment on the named server would
+	// otherwise be spliced into the well-known URL.
+	const metadataUrl = asTrustedUrl(
+		new URL("/.well-known/oauth-authorization-server", base).toString(),
+	);
+	const res = await trustedFetch(f, metadataUrl);
 	if (!res.ok) throw new Error(`discovery failed: ${res.status}`);
-	return (await res.json()) as Discovery;
+	return validateDiscovery((await res.json()) as Record<string, unknown>, base);
+}
+
+/**
+ * Turn an unvalidated metadata document into a `Discovery`, or refuse it.
+ *
+ * Two rules, and the second is what makes the rest safe by construction. Each URL must pass the
+ * trusted-URL policy; and, per RFC 8414 §3.3, the document's own `issuer` must be the origin it was
+ * served from, with every endpoint sharing that origin. Without the second rule a host that can serve
+ * one document could point a single endpoint — say the token endpoint — somewhere else, and only that
+ * one sink would leak.
+ */
+function validateDiscovery(doc: Record<string, unknown>, base: TrustedUrl): Discovery {
+	const issuer = asTrustedUrl(required(doc, "issuer"));
+	const origin = new URL(issuer).origin;
+	if (origin !== new URL(base).origin) {
+		throw new Error(
+			`discovery failed: issuer ${issuer} was served by ${new URL(base).origin}`, // RFC 8414 §3.3
+		);
+	}
+	const endpoint = (field: string): TrustedUrl => {
+		const url = asTrustedUrl(required(doc, field));
+		if (new URL(url).origin !== origin) {
+			throw new Error(`discovery failed: ${field} is on a different origin from the issuer`);
+		}
+		return url;
+	};
+	return {
+		issuer,
+		registration_endpoint: endpoint("registration_endpoint"),
+		authorization_endpoint: endpoint("authorization_endpoint"),
+		token_endpoint: endpoint("token_endpoint"),
+		// Optional by RFC 7009 — absent means sign-out degrades to local-only, present means checked.
+		...(doc.revocation_endpoint === undefined
+			? {}
+			: { revocation_endpoint: endpoint("revocation_endpoint") }),
+	};
 }
 
 export async function registerClient(
 	f: typeof fetch,
-	registrationEndpoint: string,
+	registrationEndpoint: TrustedUrl,
 ): Promise<ClientReg> {
-	const res = await f(registrationEndpoint, {
+	const res = await trustedFetch(f, registrationEndpoint, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
 		body: JSON.stringify({
@@ -119,11 +204,11 @@ export async function registerClient(
 }
 
 export function buildAuthorizeUrl(
-	endpoint: string,
+	endpoint: TrustedUrl,
 	clientId: string,
 	pkce: PkcePair,
 	state: string,
-): string {
+): TrustedUrl {
 	const u = new URL(endpoint);
 	u.searchParams.set("response_type", "code");
 	u.searchParams.set("client_id", clientId);
@@ -145,7 +230,10 @@ export function buildAuthorizeUrl(
 	 * unverifiable. MCP 2026-07-28 requires this parameter too, so it is not an optimisation.
 	 */
 	u.searchParams.set("resource", MCP_RESOURCE);
-	return u.toString();
+	// Re-checked rather than asserted. This is the one product of this module that is OPENED rather than
+	// fetched — `window.open` on desktop, a real `<a href>` on mobile — so it is the sink where a mistake
+	// executes code instead of leaking a token.
+	return asTrustedUrl(u.toString());
 }
 
 function toTokens(raw: {
@@ -165,12 +253,12 @@ function toTokens(raw: {
 
 export async function exchangeCode(
 	f: typeof fetch,
-	tokenEndpoint: string,
+	tokenEndpoint: TrustedUrl,
 	clientId: string,
 	code: string,
 	verifier: string,
 ): Promise<Tokens> {
-	const res = await f(tokenEndpoint, {
+	const res = await trustedFetch(f, tokenEndpoint, {
 		method: "POST",
 		headers: { "content-type": "application/x-www-form-urlencoded" },
 		body: new URLSearchParams({
@@ -236,11 +324,11 @@ export class TokenRefreshError extends Error {
 
 export async function refresh(
 	f: typeof fetch,
-	tokenEndpoint: string,
+	tokenEndpoint: TrustedUrl,
 	clientId: string,
 	refreshToken: string,
 ): Promise<Tokens> {
-	const res = await f(tokenEndpoint, {
+	const res = await trustedFetch(f, tokenEndpoint, {
 		method: "POST",
 		headers: { "content-type": "application/x-www-form-urlencoded" },
 		body: new URLSearchParams({
@@ -296,11 +384,11 @@ export async function refresh(
  */
 export async function revoke(
 	f: typeof fetch,
-	revocationEndpoint: string,
+	revocationEndpoint: TrustedUrl,
 	clientId: string,
 	refreshToken: string,
 ): Promise<void> {
-	const res = await f(revocationEndpoint, {
+	const res = await trustedFetch(f, revocationEndpoint, {
 		method: "POST",
 		headers: { "content-type": "application/x-www-form-urlencoded" },
 		body: new URLSearchParams({
@@ -334,10 +422,14 @@ export async function revoke(
  */
 export async function revokeGrant(
 	f: typeof fetch,
-	issuer: string,
+	issuer: TrustedUrl,
 	refreshToken: string,
 ): Promise<void> {
-	const res = await f(`${issuer.replace(/\/+$/, "")}/account/revoke-grant-by-token`, {
+	// The only consumer that appends its own path to a discovered value, so it is the one whose SHAPE
+	// differs — a bare origin rather than an endpoint. `new URL(path, issuer)` resolves against the
+	// origin and drops any path, query or fragment the issuer carried.
+	const url = asTrustedUrl(new URL("/account/revoke-grant-by-token", issuer).toString());
+	const res = await trustedFetch(f, url, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
 		body: JSON.stringify({ refresh_token: refreshToken }),

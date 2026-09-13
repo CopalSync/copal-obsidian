@@ -7,6 +7,7 @@ import type { VaultWriter } from "../sync/vault";
 import { CrdtNote, type YTransport } from "./crdt-note";
 import type { LocalNote } from "./local-note";
 import type { LocalNoteRegistry } from "./local-note-registry";
+import { PathQueue } from "./path-queue";
 import { WsTransport } from "./ws-transport";
 
 export interface CrdtSyncDeps {
@@ -49,7 +50,8 @@ const DEFAULT_SETTLE_MS = 1500;
  */
 export class CrdtSync {
 	private active: { path: string; peer: CrdtNote; transport: YTransport } | undefined;
-	private readonly inFlight = new Map<string, Promise<void>>();
+	/** Per-path serialisation. `coalesce` is the old in-flight guard; `run` is what a local edit needs. */
+	private readonly queue = new PathQueue();
 
 	constructor(private readonly deps: CrdtSyncDeps) {}
 
@@ -160,10 +162,35 @@ export class CrdtSync {
 		return this.syncOnce(change.path);
 	}
 
-	/** A local edit to a non-active note → apply it as an op on the persisted doc, then op-sync it up. */
-	async onLocalChange(path: string, text: string): Promise<void> {
+	/**
+	 * A local edit to a non-active note → apply it as an op on the persisted doc, then op-sync it up.
+	 *
+	 * The PATH is queued, never the text, and the file is read when the job's turn comes. That is what
+	 * makes a burst safe: Obsidian autosaves several times inside one sync's round trip, and the old code
+	 * handed each later caller the first call's promise and dropped its text on the floor. Queuing the path
+	 * collapses the burst into one sync of the FINAL state instead of a pipeline of stale snapshots.
+	 */
+	async onLocalChange(path: string): Promise<void> {
 		if (this.active?.path === path) return; // the editor binding owns the live note
-		return this.syncOnce(path, text);
+		if (safePath(path) === null) return; // unroutable name — its /ycrdt WS would 404-loop
+		return this.queue.run(path, async () => {
+			// Re-checked at dequeue, not just at call time: the note may have been opened while we waited.
+			if (this.active?.path === path) return;
+			const text = await this.readFileForSync(path);
+			if (text === null) return; // gone while queued → the file-level delete path owns it now
+			await this.doSync(path, text);
+		});
+	}
+
+	/** The file's current text at dequeue time, or `null` if it has gone — never `""` for a missing file,
+	 *  which would sync an empty note up and wipe it. */
+	private async readFileForSync(path: string): Promise<string | null> {
+		try {
+			if (!(await this.deps.vault.exists(path))) return null;
+			return await this.deps.vault.readCached(path);
+		} catch {
+			return null;
+		}
 	}
 
 	/**
@@ -242,6 +269,9 @@ export class CrdtSync {
 	async rename(oldPath: string, newPath: string): Promise<void> {
 		const wasActive = this.ownsPath(oldPath);
 		if (wasActive) await this.close(); // stop the OLD socket + editor binding (no auto-reconnect / re-push)
+		// A queued or in-flight local edit still refers to `oldPath`, and `registry.rename` below drops that
+		// path's cached LocalNote out from under it. Let it finish before the lineage moves.
+		await this.queue.drain(oldPath);
 		try {
 			await this.deps.api.moveNote(oldPath, newPath); // server: transfer history + R2, tombstone old
 			await this.deps.registry.rename(oldPath, newPath); // local: transfer the persisted doc lineage old→new
@@ -271,13 +301,10 @@ export class CrdtSync {
 		if (this.active?.path === path) return Promise.resolve();
 		// Never transient-sync an unroutable path (control chars in the name) — its /ycrdt WS would 404-loop.
 		if (safePath(path) === null) return Promise.resolve();
-		const existing = this.inFlight.get(path);
-		if (existing) return existing;
-		const p = this.doSync(path, applyFileText, settleMs, adopt).finally(() =>
-			this.inFlight.delete(path),
-		);
-		this.inFlight.set(path, p);
-		return p;
+		// Coalesce, not queue: every caller of this method means "make sure this path is synced", so riding
+		// a run that is already doing exactly that is correct. A LOCAL edit means something else and goes
+		// through `onLocalChange` instead — see `PathQueue`.
+		return this.queue.coalesce(path, () => this.doSync(path, applyFileText, settleMs, adopt));
 	}
 
 	private async doSync(
@@ -297,6 +324,7 @@ export class CrdtSync {
 			// would duplicate the text).
 			await Promise.race([peer.whenSynced(), new Promise((r) => setTimeout(r, SYNC_TIMEOUT_MS))]);
 			await this.reconcileFileAfterSync(note, path, wasEmpty, applyFileText, adopt);
+			await this.adoptUnseenFileEdits(note, path, wasEmpty, applyFileText);
 			await note.materialize(); // converged doc → its .md projection
 			await new Promise((r) => setTimeout(r, settleMs ?? this.deps.settleMs ?? DEFAULT_SETTLE_MS));
 		} finally {
@@ -340,6 +368,33 @@ export class CrdtSync {
 			await this.deps.vault.write(conflictName(path), fileText); // keep-both (first-import divergence)
 			this.deps.log?.(`first-import divergence, kept a conflict copy: ${path}`);
 		}
+	}
+
+	/**
+	 * Resolve "what is on disk?" before a materialize is allowed to answer it by assumption.
+	 *
+	 * `lastHash` is in-memory, so a `LocalNote` created this run knows nothing about its `.md` — and
+	 * `materialize()` used to read that silence as permission to overwrite. Anything that put a newer text
+	 * on disk without the doc hearing about it (an edit made while the plugin was not running, one dropped
+	 * by a crash mid-sync, one made while `syncActive` was false) was therefore reverted silently, with no
+	 * signal anywhere and no way back once the note was closed.
+	 *
+	 * Reading the file once and routing it through `applyFileEdit` merges the difference through the CRDT
+	 * instead of picking a winner, and no-ops when the two already agree — so the materialize that follows
+	 * can only ever write a converged text.
+	 */
+	private async adoptUnseenFileEdits(
+		note: LocalNote,
+		path: string,
+		wasEmpty: boolean,
+		applyFileText?: string,
+	): Promise<void> {
+		if (applyFileText !== undefined) return; // the caller read the file for us
+		if (wasEmpty) return; // the seed / first-import-divergence branches own this case
+		if (!note.fileStateUnknown()) return; // we wrote the file ourselves, so we know what it holds
+		const onDisk = await this.readFileSafe(path);
+		if (onDisk.length === 0) return; // missing or unreadable — never push an empty note up
+		await note.applyFileEdit(onDisk);
 	}
 
 	private async readFileSafe(path: string): Promise<string> {
@@ -403,8 +458,13 @@ export class CrdtSync {
 			...toPull.map((p) => () => this.syncOnce(p, undefined, 0, mode === "adopt")),
 			...toPush.map((p) => () => this.syncOnce(p, undefined)),
 		]);
-		await Promise.all(
-			toRemove.map(async (path) => {
+		// Bounded exactly like the syncs above. An adopt of a large vault puts every local-only note in
+		// `toRemove`, and an unbounded `Promise.all` would open that many trash operations and IndexedDB
+		// teardowns at once. Best-effort for the same reason the syncs are: a remove that fails leaves the
+		// file in place and the next reconcile retries it (the set is derived, not consumed).
+		await runBounded(
+			RECONCILE_CONCURRENCY,
+			toRemove.map((path) => async () => {
 				await this.deps.vault.remove(path); // → Obsidian trash (recoverable)
 				await this.deps.registry.destroy(path); // drop the persisted local doc so it can't re-push
 			}),

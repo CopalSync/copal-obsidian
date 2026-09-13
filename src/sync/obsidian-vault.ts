@@ -35,11 +35,21 @@ export class ObsidianVault implements VaultWriter {
 	}
 
 	read(path: string): Promise<string> {
+		return this.readWith(path, (file) => this.app.vault.read(file));
+	}
+
+	/** `cachedRead` is what Obsidian documents for reading content you are not about to modify in place;
+	 *  it serves the cache instead of hitting disk, which matters on the per-edit read-at-dequeue path. */
+	readCached(path: string): Promise<string> {
+		return this.readWith(path, (file) => this.app.vault.cachedRead(file));
+	}
+
+	private readWith(path: string, read: (file: TFile) => Promise<string>): Promise<string> {
 		const p = this.resolve(path);
 		if (p === null) throw new Error(`unsafe path: ${path}`);
 		const file = this.app.vault.getAbstractFileByPath(p);
 		if (!(file instanceof TFile)) throw new Error(`not a file: ${path}`);
-		return this.app.vault.read(file);
+		return read(file);
 	}
 
 	async write(path: string, content: string): Promise<void> {

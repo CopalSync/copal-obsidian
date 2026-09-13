@@ -1,3 +1,4 @@
+import type { TrustedUrl } from "../sync/safe-url";
 import type { Tokens } from "../types";
 import { buildAuthorizeUrl, discover, exchangeCode, registerClient, SCOPE } from "./oauth";
 import { createPkce } from "./pkce";
@@ -6,8 +7,9 @@ import type { TokenStore } from "./store";
 export interface ConnectDeps {
 	f: typeof fetch;
 	store: TokenStore;
-	/** Open the authorize URL in the system browser (Obsidian: `window.open`). */
-	openUrl: (url: string) => void;
+	/** Open the authorize URL in the system browser (Obsidian: `window.open`). Takes a `TrustedUrl`
+	 *  because this is the sink where a bad value EXECUTES rather than leaks — see `openExternal`. */
+	openUrl: (url: TrustedUrl) => void;
 	/** CSRF state generator (Obsidian: `crypto.randomUUID`). */
 	randomState: () => string;
 }
@@ -16,7 +18,8 @@ export interface ConnectDeps {
 interface Pending {
 	verifier: string;
 	state: string;
-	tokenEndpoint: string;
+	/** Captured at `start` and used a whole user round trip later, so it carries its check with it. */
+	tokenEndpoint: TrustedUrl;
 	clientId: string;
 }
 

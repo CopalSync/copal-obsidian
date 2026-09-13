@@ -22,6 +22,11 @@ export class InMemoryVault implements VaultWriter {
 		return Promise.resolve(content);
 	}
 
+	/** The fake has no cache layer; the distinction only exists in Obsidian. */
+	readCached(path: string): Promise<string> {
+		return this.read(path);
+	}
+
 	write(path: string, content: string): Promise<void> {
 		this.files.set(path, content);
 		return Promise.resolve();

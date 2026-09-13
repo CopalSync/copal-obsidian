@@ -1,4 +1,4 @@
-import { type App, normalizePath, TFile } from "obsidian";
+import { type App, normalizePath } from "obsidian";
 import { safePath } from "./safe-path";
 
 /**

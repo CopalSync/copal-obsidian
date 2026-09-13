@@ -1,5 +1,5 @@
 import type { Tokens } from "../types";
-import { discover, refresh, revoke, revokeGrant, TokenRefreshError } from "./oauth";
+import { type Discovery, discover, refresh, revoke, revokeGrant, TokenRefreshError } from "./oauth";
 import type { TokenStore } from "./store";
 
 /** Refresh this long before `expires_at`, so a call in flight does not race the expiry. */
@@ -52,12 +52,6 @@ export interface TokenManagerDeps {
 	 */
 	onReauthRequired: (reason: ReauthReason) => void;
 	now?: () => number;
-}
-
-interface Discovery {
-	token_endpoint: string;
-	revocation_endpoint?: string;
-	issuer?: string;
 }
 
 /**
@@ -287,7 +281,7 @@ export class TokenManager {
 			 * the account page keeps listing this plugin. Falls through to the token-scoped revoke when
 			 * the server does not serve the route, so the credential dies either way.
 			 */
-			if (scope === "grant" && disc.issuer !== undefined) {
+			if (scope === "grant") {
 				try {
 					await revokeGrant(this.deps.f, disc.issuer, token);
 					return "revoked";

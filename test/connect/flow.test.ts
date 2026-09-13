@@ -11,6 +11,8 @@ const PRM = {
 	authorization_servers: ["https://auth.copal.uk"],
 };
 const DISC = {
+	// RFC 8414 §3.3: the issuer is the origin that served this document, and every endpoint shares it.
+	issuer: "https://auth.copal.uk",
 	registration_endpoint: "https://auth.copal.uk/oauth2/register",
 	authorization_endpoint: "https://auth.copal.uk/oauth2/authorize",
 	token_endpoint: "https://auth.copal.uk/oauth2/token",

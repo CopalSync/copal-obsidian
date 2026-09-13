@@ -8,6 +8,11 @@ export interface VaultWriter {
 	list(): Promise<string[]>;
 	/** Read a note's current content (only called when it exists). */
 	read(path: string): Promise<string>;
+	/**
+	 * Read a note's content from Obsidian's own cache rather than forcing a disk read. This is the
+	 * read-at-dequeue path: it runs once per local edit after the queue gets to it, so it is the hot one.
+	 */
+	readCached(path: string): Promise<string>;
 	/** Create or overwrite a note, creating parent folders as needed. */
 	write(path: string, content: string): Promise<void>;
 	/** Delete a note (no-op if absent). */

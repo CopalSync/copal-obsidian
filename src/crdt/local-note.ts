@@ -58,6 +58,16 @@ export class LocalNote {
 		this.lastHash = h;
 	}
 
+	/**
+	 * Whether this note has never seen its `.md`. `lastHash` is in-memory and starts empty, so a note
+	 * created this run holds no record of what is on disk — that is "unknown", NOT "the file matches".
+	 * A caller about to {@link materialize} must resolve the unknown first or it can overwrite an edit
+	 * it never saw.
+	 */
+	fileStateUnknown(): boolean {
+		return this.lastHash === "";
+	}
+
 	/** Subscribe to doc changes; the callback gets each update's origin (`"file"`, `"editor"`, a peer, …). */
 	onChange(cb: (origin: unknown) => void): () => void {
 		const handler = (_u: Uint8Array, origin: unknown): void => cb(origin);
