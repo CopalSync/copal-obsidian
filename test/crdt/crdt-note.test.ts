@@ -224,3 +224,62 @@ describe("CrdtNote: a hostile or broken frame", () => {
 		expect(note.text(), "a rejected frame changed the note").toBe("mine");
 	});
 });
+
+/**
+ * N3. Awareness is relayed verbatim by the Durable Object and yCollab renders `user.color` /
+ * `colorLight` straight into inline `style` attributes on the caret widget and selection marks. A peer
+ * already authorized on the note — a second device, or an agent — could therefore put arbitrary text
+ * into a style attribute in someone else's editor. The colour is ours to choose, not theirs to send.
+ */
+describe("CrdtNote: a peer does not get to choose how it is drawn", () => {
+	async function settle() {
+		for (let i = 0; i < 20; i += 1) await Promise.resolve();
+		await new Promise((r) => setTimeout(r, 5));
+	}
+
+	function remoteStateOn(note: CrdtNote) {
+		const mine = note.awareness.clientID;
+		const entry = [...note.awareness.getStates().entries()].find(([id]) => id !== mine);
+		return entry?.[1] as { user?: Record<string, unknown> } | undefined;
+	}
+
+	it("replaces a peer's colour with one derived locally", async () => {
+		const { a, b } = pairedTransports();
+		const mine = new CrdtNote(a);
+		const peer = new CrdtNote(b);
+		peer.awareness.setLocalStateField("user", {
+			name: "Peer",
+			color: '#fff" onmouseover="alert(1)',
+			colorLight: "url(javascript:alert(1))",
+		});
+		await settle();
+
+		const seen = remoteStateOn(mine);
+		expect(seen?.user, "the peer's state never arrived").toBeDefined();
+		expect(seen?.user?.color).toMatch(/^#[0-9A-Fa-f]{6}$/);
+		expect(seen?.user?.colorLight).toMatch(/^#[0-9A-Fa-f]{6,8}$/);
+	});
+
+	it("caps a peer's display name", async () => {
+		const { a, b } = pairedTransports();
+		const mine = new CrdtNote(a);
+		const peer = new CrdtNote(b);
+		peer.awareness.setLocalStateField("user", { name: "x".repeat(5000), color: "#5B8DEF" });
+		await settle();
+
+		expect(String(remoteStateOn(mine)?.user?.name).length).toBeLessThanOrEqual(64);
+	});
+
+	it("leaves our own presence alone", async () => {
+		const { a, b } = pairedTransports();
+		const mine = new CrdtNote(a);
+		new CrdtNote(b);
+		mine.awareness.setLocalStateField("user", { name: "You", color: "#123456" });
+		await settle();
+
+		const own = mine.awareness.getStates().get(mine.awareness.clientID) as {
+			user?: Record<string, unknown>;
+		};
+		expect(own.user?.color, "our own chosen colour was overwritten").toBe("#123456");
+	});
+});

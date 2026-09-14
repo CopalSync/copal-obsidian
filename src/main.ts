@@ -12,30 +12,33 @@ import {
 } from "obsidian";
 import { decideConnect } from "./connect/decide";
 import { ConnectFlow } from "./connect/flow";
+import { colorFromId } from "./crdt/presence-color";
 import { CrdtSync } from "./crdt/crdt-sync";
 import { createLocalNoteRegistry } from "./crdt/create-registry";
 import { EditorBinding } from "./crdt/editor-binding";
 import { purgeLegacyCrdtDocs } from "./crdt/legacy-purge";
 import type { LocalNoteRegistry } from "./crdt/local-note-registry";
 import { tearDownCredential } from "./connect/sign-out";
-import { type PersistedData, TokenStore } from "./connect/store";
+import { TokenStore } from "./connect/store";
 import {
 	type ReauthReason,
 	type RevokeOutcome,
 	type RevokeScope,
 	TokenManager,
 } from "./connect/token-manager";
+import type { PluginDataStore } from "./data/plugin-data-store";
+import { wirePersistence } from "./data/wire-persistence";
 import { CopalSettingTab } from "./settings";
 import { ApiError, type SearchHit, type SearchMode, SyncApi, type Vault } from "./sync/api";
-import { type BinaryData, BinaryCursor } from "./sync/binary-cursor";
+import type { BinaryCursor } from "./sync/binary-cursor";
 import { BinarySync, isAttachmentPath } from "./sync/binary-sync";
 import { ObsidianBinaryVault } from "./sync/binary-vault";
 import { SyncClient } from "./sync/live";
-import { type MutationData, MutationQueue } from "./sync/mutation-queue";
+import type { MutationQueue } from "./sync/mutation-queue";
 import { ObsidianVault } from "./sync/obsidian-vault";
 import { requestUrlFetch } from "./sync/request-url-fetch";
 import { safePath } from "./sync/safe-path";
-import { type SyncData, SyncState } from "./sync/state";
+import type { SyncState } from "./sync/state";
 import { openExternal } from "./ui/external-link";
 import { COPAL_SEARCH_VIEW, CopalSearchView } from "./ui/search-view";
 import { STATUS_META, type SyncStatus } from "./ui/status";
@@ -67,17 +70,10 @@ function debugEnabled(): boolean {
 	}
 }
 
-/** Presence palette for human devices (the agent keeps its brand amber). A stable per-device colour so
- *  concurrent devices are distinguishable in the editor. Amber is deliberately excluded (agent-only). */
-const PRESENCE_COLORS = ["#5B8DEF", "#2FB67C", "#A66BEF", "#E85D9E", "#22A7C7", "#E0603A"];
-function colorFromId(id: string): string {
-	let h = 0;
-	for (let i = 0; i < id.length; i++) h = (Math.imul(h, 31) + id.charCodeAt(i)) >>> 0;
-	return PRESENCE_COLORS[h % PRESENCE_COLORS.length] as string;
-}
-
 export default class CopalPlugin extends Plugin {
 	store!: TokenStore;
+	/** The one writer for `data.json`. */
+	private data!: PluginDataStore;
 	flow!: ConnectFlow;
 	private tokens!: TokenManager;
 	/** Once per session: a burst of 401s must not become a burst of notices. */
@@ -103,10 +99,12 @@ export default class CopalPlugin extends Plugin {
 	private lastStatusLabel = "not connected";
 
 	override async onload(): Promise<void> {
-		this.store = new TokenStore(
-			() => this.loadData() as Promise<PersistedData | null>,
-			(data) => this.saveData(data),
-		);
+		const persistence = await wirePersistence({
+			load: () => this.loadData() as Promise<unknown>,
+			save: (data) => this.saveData(data),
+		});
+		this.data = persistence.data;
+		this.store = persistence.store;
 		this.flow = new ConnectFlow({
 			f: requestUrlFetch,
 			store: this.store,
@@ -116,8 +114,6 @@ export default class CopalPlugin extends Plugin {
 
 		this.tokens = this.newTokenManager();
 
-		// Sync stack. SyncState persists under the `sync` key of data.json, alongside the connect tokens;
-		// both read-modify-write the whole record, so they coexist.
 		const api = new SyncApi({
 			f: requestUrlFetch,
 			getToken: () => this.tokens.getValid(),
@@ -125,55 +121,25 @@ export default class CopalPlugin extends Plugin {
 			onUnauthorized: (used) => this.tokens.refreshAfterUnauthorized(used),
 		});
 		this.api = api;
-		const syncState = new SyncState(
-			async () =>
-				((await this.loadData()) as (PersistedData & { sync?: SyncData }) | null)?.sync ?? null,
-			async (sync) => {
-				const data = ((await this.loadData()) as PersistedData | null) ?? {};
-				await this.saveData({ ...data, sync });
-			},
-		);
-		await syncState.init();
+		const syncState = persistence.syncState;
 		this.syncState = syncState;
-		// Durable pending-mutation queue (offline/failed deletes), under the `pending` key of data.json.
-		const mutationQueue = new MutationQueue(
-			async () =>
-				((await this.loadData()) as (PersistedData & { pending?: MutationData }) | null)?.pending ??
-				null,
-			async (pending) => {
-				const data = ((await this.loadData()) as PersistedData | null) ?? {};
-				await this.saveData({ ...data, pending });
-			},
-		);
-		await mutationQueue.init();
+		const mutationQueue = persistence.mutationQueue;
 		this.mutationQueue = mutationQueue;
 		this.deviceId = await this.store.getDeviceId();
+		/*
+		 * The only teardown hook that can actually await anything. `onunload` is synchronous, so a
+		 * `void flush()` there would be theatre — the app does not wait for it. `Tasks.addPromise` does.
+		 * The promise is built inside the callback so it is the state at QUIT that gets flushed.
+		 * (G5 owns the wider teardown; this is only the `data.json` half.)
+		 */
+		this.registerEvent(
+			this.app.workspace.on("quit", (tasks) => tasks.addPromise(this.data.flush())),
+		);
 		const vault = new ObsidianVault(this.app);
 		this.vault = vault;
-		// Attachment (non-`.md`) sync: file-level last-writer-wins, keyed on the R2 etag. Its cursor persists
-		// under the `binary` key of data.json and its durable delete queue under `binaryPending` — both coexist
-		// with `sync`/`pending` via the same read-modify-write idiom.
-		const binaryCursor = new BinaryCursor(
-			async () =>
-				((await this.loadData()) as (PersistedData & { binary?: BinaryData }) | null)?.binary ??
-				null,
-			async (binary) => {
-				const data = ((await this.loadData()) as PersistedData | null) ?? {};
-				await this.saveData({ ...data, binary });
-			},
-		);
-		await binaryCursor.init();
+		const binaryCursor = persistence.binaryCursor;
 		this.binaryCursor = binaryCursor;
-		const binaryQueue = new MutationQueue(
-			async () =>
-				((await this.loadData()) as (PersistedData & { binaryPending?: MutationData }) | null)
-					?.binaryPending ?? null,
-			async (binaryPending) => {
-				const data = ((await this.loadData()) as PersistedData | null) ?? {};
-				await this.saveData({ ...data, binaryPending });
-			},
-		);
-		await binaryQueue.init();
+		const binaryQueue = persistence.binaryQueue;
 		this.binaryQueue = binaryQueue;
 		const binarySync = new BinarySync({
 			api,
@@ -190,7 +156,7 @@ export default class CopalPlugin extends Plugin {
 		 * One-shot, and BEFORE the registry exists: the databases being deleted are keyed under the old
 		 * constant tenant, so nothing that runs after this can see or touch them.
 		 */
-		if (!(await this.store.getLegacyCrdtPurged())) {
+		if (!this.store.getLegacyCrdtPurged()) {
 			const { names: purged, completed } = await purgeLegacyCrdtDocs();
 			// Only recorded when it actually finished: marking a timed-out run as done would skip it
 			// forever and leave the shared-tenant databases in place with nothing left to notice them.
@@ -290,12 +256,20 @@ export default class CopalPlugin extends Plugin {
 		});
 
 		this.addCommand({
-			id: "copal-sync-now",
-			name: "Copal: Sync now",
-			callback: () => {
-				void this.sync?.syncNow().catch((err: unknown) => {
+			// Obsidian namespaces the id by the plugin id and prefixes the name with the plugin name, so
+			// `copal-sync-now` / "Copal: Sync now" rendered as "copal:copal-sync-now" and "Copal: Copal:
+			// Sync now" in the palette.
+			id: "sync-now",
+			name: "Sync now",
+			// `checkCallback`, so the command is absent from the palette rather than present and inert
+			// when this folder is not linked to a vault — there is nothing for it to sync.
+			checkCallback: (checking: boolean) => {
+				if (this.sync === undefined) return false;
+				if (checking) return true;
+				void this.sync.syncNow().catch((err: unknown) => {
 					new Notice(`Copal sync failed: ${err instanceof Error ? err.message : String(err)}`);
 				});
+				return true;
 			},
 		});
 
@@ -306,14 +280,19 @@ export default class CopalPlugin extends Plugin {
 				new CopalSearchView(leaf, {
 					searchVault: (q, mode) => this.searchVault(q, mode),
 					isConnected: () => this.store.isConnected(),
-					hasVault: async () => (await this.store.getVaultId()) !== undefined,
+					hasVault: () => this.store.getVaultId() !== undefined,
 					openNote: (path) => void this.app.workspace.openLinkText(path, "", false),
 				}),
 		);
 		this.addCommand({
-			id: "copal-search",
-			name: "Copal: Search my vault by meaning",
-			callback: () => void this.activateSearchView(),
+			id: "search",
+			name: "Search my vault by meaning",
+			checkCallback: (checking: boolean) => {
+				if (this.sync === undefined) return false; // nothing indexed to search
+				if (checking) return true;
+				void this.activateSearchView();
+				return true;
+			},
 		});
 		// A ribbon icon so the pane is reachable on mobile too (where the status bar doesn't render).
 		this.addRibbonIcon("search", "Copal Search", () => void this.activateSearchView());
@@ -355,13 +334,13 @@ export default class CopalPlugin extends Plugin {
 				 * still works until it expires, so do NOT sign them out — interrupting sync that is
 				 * working right now would be gratuitous. Say it once and let Settings offer the button.
 				 */
-				if (await this.store.needsReauth()) {
+				if (this.store.needsReauth()) {
 					new Notice(
 						"Copal: this sign-in can't renew itself and will stop working soon. Open Settings → Copal and choose Sign in again.",
 						10000,
 					);
 				}
-				if (await this.store.isConnected()) await this.startSync();
+				if (this.store.isConnected()) await this.startSync();
 			})();
 		});
 	}
@@ -370,10 +349,24 @@ export default class CopalPlugin extends Plugin {
 		this.stopSync();
 	}
 
+	/**
+	 * `data.json` changed on disk outside Obsidian — a Sync service, or another copy of this vault.
+	 *
+	 * ⛔ Required by the cache, not a nicety. The old code spread a fresh read into every write, so a
+	 * key another copy owned survived ours by accident. With one in-memory record and no reload, the
+	 * next write would silently destroy it. `PluginDataStore.reloadExternal` states which keys it will
+	 * take and why; the short version is account-scoped facts yes, this device's sync progress no, and
+	 * a sign-out elsewhere is followed while a sign-in elsewhere is not.
+	 */
+	override async onExternalSettingsChange(): Promise<void> {
+		await this.data.reloadExternal();
+		await this.settingsTab?.refresh();
+	}
+
 	/** Search the connected vault against the server-side index (the search pane). Throws if no vault is
 	 *  linked, so the pane can show a connect prompt. `limit` 50 is generous for a sidebar result list. */
 	async searchVault(query: string, mode: SearchMode): Promise<SearchHit[]> {
-		if (!this.api || !(await this.store.isConnected())) {
+		if (!this.api || !this.store.isConnected()) {
 			throw new Error("Copal is not connected");
 		}
 		return this.api.search(query, { mode, limit: 50 });
@@ -604,11 +597,30 @@ export default class CopalPlugin extends Plugin {
 		 * leftovers the next link would push into a different vault.
 		 */
 		await this.registry?.destroyAll();
-		await this.store.unlinkVault();
-		await this.syncState?.reset();
-		await this.mutationQueue?.reset(); // drop queued deletes so they can't fire against the next vault
-		await this.binaryCursor?.reset(); // drop the attachment etag cursor so it can't bleed into the next vault
-		await this.binaryQueue?.reset(); // drop queued binary deletes
+		/*
+		 * Five sequentially-awaited writes became two concurrent ones. An awaited write cannot coalesce
+		 * with the next, so this used to rewrite the whole record five times over; issued together they
+		 * collapse. The four in-memory resets are applied first and separately — each persister owns its
+		 * own defaults, so `resetInMemory` does the wipe and deliberately does not write.
+		 *
+		 * ⛔ `unlinkVault()` stays a named call rather than being folded into the batch. The ordering it
+		 * sits in is a security property (the CRDT wipe must run while this folder still HAS a vault id)
+		 * and `main-signout.test.ts` asserts it by name. Folding it in would delete the observation point
+		 * while leaving the assertion passing.
+		 */
+		this.syncState?.resetInMemory(); // no stale knownServer tombstones bleeding into the next vault
+		this.mutationQueue?.resetInMemory(); // queued deletes can't fire against the next vault
+		this.binaryCursor?.resetInMemory(); // the attachment etag cursor can't bleed into the next vault
+		this.binaryQueue?.resetInMemory();
+		await Promise.all([
+			this.store.unlinkVault(),
+			this.data.update((d) => {
+				d.sync = { lastSeq: 0, knownServer: [] };
+				d.pending = { deletes: [] };
+				d.binary = { known: {} };
+				d.binaryPending = { deletes: [] };
+			}),
+		]);
 	}
 
 	/** Quick liveness probe (bounded) so `signOut` only sync-flushes when the server is actually reachable. */
@@ -675,7 +687,7 @@ export default class CopalPlugin extends Plugin {
 				return;
 			}
 			let vanished = false;
-			const vaultId = await this.store.getVaultId();
+			const vaultId = this.store.getVaultId();
 			if (vaultId) {
 				if (vaults.some((v) => v.vaultId === vaultId)) {
 					await this.startBound("merge"); // linked & present → resume, just as it was
@@ -870,7 +882,7 @@ class VaultChoiceModal extends Modal {
 
 	override onOpen(): void {
 		const { contentEl } = this;
-		contentEl.createEl("h3", { text: "Sync" });
+		this.setTitle("Sync");
 
 		/*
 		 * ⚠️ SAY WHY THEY ARE HERE. A folder whose vault was deleted elsewhere is unlinked silently

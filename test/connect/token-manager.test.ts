@@ -1,18 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import { TokenManager, type ReauthReason } from "../../src/connect/token-manager";
-import { TokenStore } from "../../src/connect/store";
+import type { TokenStore } from "../../src/connect/store";
 import type { PersistedData } from "../../src/connect/store";
 import type { Tokens } from "../../src/types";
+import { memStore as memData } from "../data/fake-plugin-data";
 
-function memStore(initial: PersistedData = {}): TokenStore {
-	let data: PersistedData = { ...initial };
-	return new TokenStore(
-		() => Promise.resolve(data),
-		(next) => {
-			data = next;
-			return Promise.resolve();
-		},
-	);
+async function memStore(initial: PersistedData = {}): Promise<TokenStore> {
+	return (await memData(initial)).store;
 }
 
 /**
@@ -29,22 +23,19 @@ const DISCOVERY = {
 	revocation_endpoint: "https://auth.copal.uk/oauth2/revoke",
 };
 
-/** `memStore`, but the raw record stays readable so a test can prove what was NOT written. */
-function peekableStore(initial: PersistedData = {}): {
+/**
+ * `memStore`, but the raw record stays readable so a test can prove what was NOT written.
+ *
+ * ⚠️ `peek` is the DISK, not the store's in-memory record. The assertions below are negative — "the
+ * rotated refresh token was never persisted" — and reading the in-memory record instead would leave
+ * them green against an implementation that mutates first and only guards the write.
+ */
+async function peekableStore(initial: PersistedData = {}): Promise<{
 	store: TokenStore;
 	peek: () => PersistedData;
-} {
-	let data: PersistedData = { ...initial };
-	return {
-		store: new TokenStore(
-			() => Promise.resolve(data),
-			(next) => {
-				data = next;
-				return Promise.resolve();
-			},
-		),
-		peek: () => data,
-	};
+}> {
+	const m = await memData(initial);
+	return { store: m.store, peek: m.peek };
 }
 
 function json(body: unknown, status = 200): Response {
@@ -152,7 +143,7 @@ describe("TokenManager single-flight", () => {
 			release = res;
 		});
 		const { f, tokenCalls } = fetchWith(() => gate);
-		const tm = make(memStore({ clientId: "cid", tokens: EXPIRED }), f);
+		const tm = make(await memStore({ clientId: "cid", tokens: EXPIRED }), f);
 
 		const all = Promise.all([tm.getValid(), tm.getValid(), tm.getValid(), tm.getValid()]);
 		await Promise.resolve();
@@ -168,7 +159,7 @@ describe("TokenManager single-flight", () => {
 			release = res;
 		});
 		const { f, tokenCalls } = fetchWith(() => gate);
-		const tm = make(memStore({ clientId: "cid", tokens: EXPIRED }), f);
+		const tm = make(await memStore({ clientId: "cid", tokens: EXPIRED }), f);
 
 		const all = Promise.all([
 			tm.refreshAfterUnauthorized("old-at"),
@@ -185,7 +176,7 @@ describe("TokenManager single-flight", () => {
 	/** The compare-and-swap: a caller holding a token someone already replaced does no work. */
 	it("makes ZERO network calls when the stored token already moved on", async () => {
 		const { f, tokenCalls } = fetchWith(() => Promise.resolve(json({})));
-		const store = memStore({
+		const store = await memStore({
 			clientId: "cid",
 			tokens: { access_token: "already-new", refresh_token: "rt", expires_at: 9e15 },
 		});
@@ -197,7 +188,7 @@ describe("TokenManager single-flight", () => {
 
 	it("does not refresh a token that is still comfortably valid", async () => {
 		const { f, tokenCalls } = fetchWith(() => Promise.resolve(json({})));
-		const store = memStore({
+		const store = await memStore({
 			clientId: "cid",
 			tokens: { access_token: "good", refresh_token: "rt", expires_at: 9e15 },
 		});
@@ -210,7 +201,7 @@ describe("TokenManager failure classification", () => {
 	it("treats invalid_grant as terminal: announces re-auth exactly once", async () => {
 		const seen: ReauthReason[] = [];
 		const { f } = fetchWith(() => Promise.resolve(json({ error: "invalid_grant" }, 400)));
-		const tm = make(memStore({ clientId: "cid", tokens: EXPIRED }), f, (r) => seen.push(r));
+		const tm = make(await memStore({ clientId: "cid", tokens: EXPIRED }), f, (r) => seen.push(r));
 
 		expect(await tm.refreshAfterUnauthorized("old-at")).toBeNull();
 		expect(await tm.refreshAfterUnauthorized("old-at")).toBeNull();
@@ -224,14 +215,12 @@ describe("TokenManager failure classification", () => {
 	it("treats a 500 as TRANSIENT: no re-auth, and the tokens survive", async () => {
 		const seen: ReauthReason[] = [];
 		const { f } = fetchWith(() => Promise.resolve(json({ error: "server_error" }, 500)));
-		const store = memStore({ clientId: "cid", tokens: EXPIRED });
+		const store = await memStore({ clientId: "cid", tokens: EXPIRED });
 		const tm = make(store, f, (r) => seen.push(r));
 
 		expect(await tm.refreshAfterUnauthorized("old-at")).toBeNull();
 		expect(seen, "a server hiccup signed the user out").toEqual([]);
-		expect((await store.getTokens())?.refresh_token, "tokens were discarded on a 5xx").toBe(
-			"old-rt",
-		);
+		expect(store.getTokens()?.refresh_token, "tokens were discarded on a 5xx").toBe("old-rt");
 	});
 
 	it("treats a transport failure as TRANSIENT and keeps the tokens", async () => {
@@ -246,18 +235,18 @@ describe("TokenManager failure classification", () => {
 			}
 			return json(DISCOVERY);
 		});
-		const store = memStore({ clientId: "cid", tokens: EXPIRED });
+		const store = await memStore({ clientId: "cid", tokens: EXPIRED });
 		const tm = make(store, f, (r) => seen.push(r));
 
 		expect(await tm.refreshAfterUnauthorized("old-at")).toBeNull();
 		expect(seen).toEqual([]);
-		expect((await store.getTokens())?.access_token).toBe("old-at");
+		expect(store.getTokens()?.access_token).toBe("old-at");
 	});
 
 	it("announces re-auth when there is no refresh token at all (the pre-fix install)", async () => {
 		const seen: ReauthReason[] = [];
 		const { f, tokenCalls } = fetchWith(() => Promise.resolve(json({})));
-		const store = memStore({
+		const store = await memStore({
 			clientId: "cid",
 			tokens: { access_token: "at", expires_at: 1_000 },
 		});
@@ -274,9 +263,9 @@ describe("TokenManager token merge", () => {
 		const { f } = fetchWith(() =>
 			Promise.resolve(json({ access_token: "new-at", expires_in: 3600 })),
 		);
-		const store = memStore({ clientId: "cid", tokens: EXPIRED });
+		const store = await memStore({ clientId: "cid", tokens: EXPIRED });
 		await make(store, f).getValid();
-		expect((await store.getTokens())?.refresh_token).toBe("old-rt");
+		expect(store.getTokens()?.refresh_token).toBe("old-rt");
 	});
 
 	/** Without carrying it forward, a response with no `expires_in` disables refresh forever. */
@@ -284,19 +273,19 @@ describe("TokenManager token merge", () => {
 		const { f } = fetchWith(() =>
 			Promise.resolve(json({ access_token: "new-at", refresh_token: "new-rt" })),
 		);
-		const store = memStore({ clientId: "cid", tokens: EXPIRED });
+		const store = await memStore({ clientId: "cid", tokens: EXPIRED });
 		await make(store, f).getValid();
-		expect((await store.getTokens())?.expires_at).toBe(1_000);
+		expect(store.getTokens()?.expires_at).toBe(1_000);
 	});
 
 	it("persists the new token before handing it out", async () => {
 		const { f } = fetchWith(() =>
 			Promise.resolve(json({ access_token: "new-at", refresh_token: "new-rt", expires_in: 3600 })),
 		);
-		const store = memStore({ clientId: "cid", tokens: EXPIRED });
+		const store = await memStore({ clientId: "cid", tokens: EXPIRED });
 		const handed = await make(store, f).getValid();
-		expect((await store.getTokens())?.access_token).toBe(handed);
-		expect((await store.getTokens())?.refresh_token).toBe("new-rt");
+		expect(store.getTokens()?.access_token).toBe(handed);
+		expect(store.getTokens()?.refresh_token).toBe("new-rt");
 	});
 });
 
@@ -314,7 +303,7 @@ describe("sign-out", () => {
 			release = res;
 		});
 		const { f, revokedTokens, tokenCalls } = fetchWith(() => gate);
-		const { store, peek } = peekableStore({ clientId: "cid", tokens: EXPIRED });
+		const { store, peek } = await peekableStore({ clientId: "cid", tokens: EXPIRED });
 		const tm = make(store, f);
 
 		// A refresh is in flight and suspended on the network.
@@ -333,6 +322,11 @@ describe("sign-out", () => {
 		// been written, a copy of this vault could renew from it for another 14 days.
 		expect(peek().tokens?.refresh_token).toBe("old-rt");
 		expect(peek().tokens?.access_token).toBe("old-at");
+		// ...and the IN-MEMORY record too. Since `data.json` became a cached canonical record, the
+		// mutation is what resurrects a credential and the write merely follows it, so a disk-only
+		// assertion would no longer see a store that was mutated and not yet flushed.
+		expect(store.getTokens()?.refresh_token).toBe("old-rt");
+		expect(store.getTokens()?.access_token).toBe("old-at");
 		// And the orphan is what got revoked: the stored token was already dead, killed by the very
 		// rotation this refresh completed, so revoking it would have reported success over a no-op.
 		expect(revokedTokens()).toEqual(["new-rt"]);
@@ -342,7 +336,7 @@ describe("sign-out", () => {
 		const { f, revokedTokens, tokenCalls } = fetchWith(() =>
 			Promise.reject(new Error("no refresh expected")),
 		);
-		const tm = make(memStore({ clientId: "cid", tokens: EXPIRED }), f);
+		const tm = make(await memStore({ clientId: "cid", tokens: EXPIRED }), f);
 		expect(await tm.revokeAndAbandon()).toBe("revoked");
 		expect(revokedTokens()).toEqual(["old-rt"]);
 		expect(tokenCalls()).toBe(0);
@@ -353,7 +347,7 @@ describe("sign-out", () => {
 			() => Promise.reject(new Error("no refresh expected")),
 			() => Promise.resolve(new Response(null, { status: 503 })),
 		);
-		const tm = make(memStore({ clientId: "cid", tokens: EXPIRED }), f);
+		const tm = make(await memStore({ clientId: "cid", tokens: EXPIRED }), f);
 		// Must RESOLVE. Sign-out deletes the local tokens straight after this and cannot be allowed to
 		// die on the way there.
 		expect(await tm.revokeAndAbandon()).toBe("failed");
@@ -364,13 +358,13 @@ describe("sign-out", () => {
 			() => Promise.reject(new Error("no refresh expected")),
 			() => Promise.reject(new TypeError("Failed to fetch")),
 		);
-		const tm = make(memStore({ clientId: "cid", tokens: EXPIRED }), f);
+		const tm = make(await memStore({ clientId: "cid", tokens: EXPIRED }), f);
 		expect(await tm.revokeAndAbandon()).toBe("failed");
 	});
 
 	it("has nothing to revoke on a pre-offline_access install, and calls nothing", async () => {
 		const { f } = fetchWith(() => Promise.reject(new Error("no refresh expected")));
-		const tm = make(memStore({ clientId: "cid", tokens: { access_token: "at" } }), f);
+		const tm = make(await memStore({ clientId: "cid", tokens: { access_token: "at" } }), f);
 		expect(await tm.revokeAndAbandon()).toBe("nothing-to-revoke");
 		expect(f).not.toHaveBeenCalled();
 	});
@@ -381,7 +375,7 @@ describe("sign-out", () => {
 			() => Promise.resolve(new Response(null, { status: 200 })),
 			{ ...DISCOVERY, revocation_endpoint: undefined },
 		);
-		const tm = make(memStore({ clientId: "cid", tokens: EXPIRED }), f);
+		const tm = make(await memStore({ clientId: "cid", tokens: EXPIRED }), f);
 		expect(await tm.revokeAndAbandon()).toBe("failed");
 	});
 
@@ -391,7 +385,7 @@ describe("sign-out", () => {
 			release = res;
 		});
 		const { f, revokedTokens, tokenCalls } = fetchWith(() => gate);
-		const { store, peek } = peekableStore({ clientId: "cid", tokens: EXPIRED });
+		const { store, peek } = await peekableStore({ clientId: "cid", tokens: EXPIRED });
 		const tm = make(store, f);
 
 		const inFlight = tm.getValid().catch(() => "threw");
@@ -415,7 +409,7 @@ describe("sign-out", () => {
 		const { f, grantRevokes, revokedTokens } = fetchWith(() =>
 			Promise.reject(new Error("no refresh expected")),
 		);
-		const tm = make(memStore({ clientId: "cid", tokens: EXPIRED }), f);
+		const tm = make(await memStore({ clientId: "cid", tokens: EXPIRED }), f);
 
 		expect(await tm.revokeAndAbandon("grant")).toBe("revoked");
 
@@ -434,7 +428,7 @@ describe("sign-out", () => {
 			DISCOVERY,
 			() => Promise.resolve(new Response(null, { status: 404 })),
 		);
-		const tm = make(memStore({ clientId: "cid", tokens: EXPIRED }), f);
+		const tm = make(await memStore({ clientId: "cid", tokens: EXPIRED }), f);
 
 		expect(await tm.revokeAndAbandon("grant")).toBe("revoked");
 

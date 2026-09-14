@@ -4,6 +4,7 @@ import { BinaryCursor } from "../../src/sync/binary-cursor";
 import { BinarySync, isAttachmentPath } from "../../src/sync/binary-sync";
 import { fnv1a } from "../../src/sync/fnv";
 import { MutationQueue } from "../../src/sync/mutation-queue";
+import { memSlice } from "../data/fake-plugin-data";
 import { InMemoryBinaryVault } from "./fake-binary-vault";
 
 describe("isAttachmentPath", () => {
@@ -51,28 +52,14 @@ function fakeApi() {
 }
 
 async function inMemoryQueue(): Promise<MutationQueue> {
-	let stored: { deletes: string[] } | null = null;
-	const q = new MutationQueue(
-		() => Promise.resolve(stored),
-		(d) => {
-			stored = d;
-			return Promise.resolve();
-		},
-	);
-	await q.init();
+	const q = new MutationQueue((await memSlice("binaryPending")).slice);
+	q.init();
 	return q;
 }
 
 async function inMemoryCursor(): Promise<BinaryCursor> {
-	let stored: { known: Record<string, { etag: string; hash: string }> } | null = null;
-	const c = new BinaryCursor(
-		() => Promise.resolve(stored),
-		(d) => {
-			stored = d;
-			return Promise.resolve();
-		},
-	);
-	await c.init();
+	const c = new BinaryCursor((await memSlice("binary")).slice);
+	c.init();
 	return c;
 }
 

@@ -112,7 +112,7 @@ export class TokenManager {
 
 	/** The access token to send, refreshed first if it is expired or about to be. */
 	async getValid(): Promise<string> {
-		const tokens = await this.deps.store.getTokens();
+		const tokens = this.deps.store.getTokens();
 		if (!tokens?.access_token) throw new Error("not connected");
 
 		const expiringSoon =
@@ -141,7 +141,7 @@ export class TokenManager {
 	 * `expires_in`.
 	 */
 	async refreshAfterUnauthorized(usedToken: string): Promise<string | null> {
-		const tokens = await this.deps.store.getTokens();
+		const tokens = this.deps.store.getTokens();
 		if (!tokens?.access_token) return null;
 		// Someone already refreshed while this request was in flight. No network call.
 		if (tokens.access_token !== usedToken) return tokens.access_token;
@@ -168,13 +168,13 @@ export class TokenManager {
 
 	private async doRefresh(usedToken: string): Promise<string> {
 		const { store } = this.deps;
-		const tokens = await store.getTokens();
+		const tokens = store.getTokens();
 		// Re-checked INSIDE the mutex: a caller that queued behind another refresh must not then
 		// replay the token that one just rotated.
 		if (!tokens?.refresh_token) throw new Error("not connected");
 		if (tokens.access_token !== usedToken) return tokens.access_token;
 
-		const clientId = await store.getClientId();
+		const clientId = store.getClientId();
 		if (!clientId) throw new Error("not connected");
 
 		let fresh: Tokens;
@@ -266,11 +266,11 @@ export class TokenManager {
 		this.abandoned = true;
 		await this.settleInFlight();
 		try {
-			const token = this.orphanedRefreshToken ?? (await store.getTokens())?.refresh_token;
+			const token = this.orphanedRefreshToken ?? store.getTokens()?.refresh_token;
 			// No refresh token at all: a pre-`offline_access` install. The access token expires within
 			// the hour and cannot be revoked anyway (it is a JWT), so the local delete is the whole job.
 			if (token === undefined) return "nothing-to-revoke";
-			const clientId = await store.getClientId();
+			const clientId = store.getClientId();
 			// The endpoint answers 200 and revokes NOTHING for a client id that does not own the token,
 			// so guessing one would report success over a no-op. Without the real id, say we failed.
 			if (clientId === undefined) return "failed";

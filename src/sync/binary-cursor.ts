@@ -1,3 +1,5 @@
+import type { DataSlice } from "../data/plugin-data-store";
+
 /** One tracked attachment: the server `etag` we last synced, plus a local content `hash` (FNV-1a) so a
  *  file the plugin just wrote from a pull isn't mistaken for a local edit (echo suppression). */
 export interface BinaryEntry {
@@ -20,13 +22,11 @@ export interface BinaryData {
 export class BinaryCursor {
 	private data: BinaryData = { known: {} };
 
-	constructor(
-		private readonly load: () => Promise<BinaryData | null>,
-		private readonly save: (data: BinaryData) => Promise<void>,
-	) {}
+	constructor(private readonly slice: DataSlice<BinaryData>) {}
 
-	async init(): Promise<void> {
-		const loaded = await this.load();
+	/** Synchronous, and the slice's copy is this cursor's own — see `SyncState.init`. */
+	init(): void {
+		const loaded = this.slice.get();
 		this.data = { known: loaded?.known ?? {} };
 	}
 
@@ -48,12 +48,17 @@ export class BinaryCursor {
 	}
 
 	async persist(): Promise<void> {
-		await this.save(this.data);
+		await this.slice.set(this.data);
 	}
 
 	/** Wipe the cursor (on disconnect) so stale etags can't bleed into the next linked vault's reconcile. */
 	async reset(): Promise<void> {
-		this.data = { known: {} };
+		this.resetInMemory();
 		await this.persist();
+	}
+
+	/** The same wipe without the write, for a caller batching every persister's reset into one. */
+	resetInMemory(): void {
+		this.data = { known: {} };
 	}
 }

@@ -1,4 +1,5 @@
 import { Awareness } from "y-protocols/awareness";
+import { colorFromId, colorLightFromId } from "./presence-color";
 import * as Y from "yjs";
 import {
 	applyAwareness,
@@ -32,6 +33,9 @@ const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const MIN_FRAME_BYTES = 1;
 /** WebSocket close code for "you sent something I cannot use". In the private-use 4000-4999 range. */
 const UNUSABLE_FRAME_CLOSE = 4002;
+
+/** Longest peer display name we will render. Long enough for a name, short enough not to be a banner. */
+const MAX_PEER_NAME = 64;
 
 /**
  * A per-note CRDT replica: a `Y.Doc` synced with the note's `YNoteDO` over an injected binary transport,
@@ -69,6 +73,14 @@ export class CrdtNote {
 		this.ownsDoc = doc === undefined;
 		this.awareness = new Awareness(this.doc);
 		this.ytext = this.doc.getText("content");
+		/*
+		 * ⛔ REGISTERED BEFORE THE RENDERER, AND THAT IS THE WHOLE TRICK.
+		 *
+		 * yCollab attaches its own awareness listener when the editor binds, which is after this
+		 * constructor has run — and y-protocols calls listeners in registration order. So this one
+		 * normalises the states map before anything draws from it, rather than a moment too late.
+		 */
+		this.awareness.on("change", () => this.normaliseRemotePresence());
 		// An unobserved rejection is not an error here: a transient peer may be disposed without anyone
 		// ever awaiting `whenSynced()`. Marking it handled keeps that from surfacing as a crash.
 		void this.syncedPromise.catch(() => undefined);
@@ -137,6 +149,31 @@ export class CrdtNote {
 	 *  server" (the seed logic uses this to avoid double-seeding). */
 	whenSynced(): Promise<void> {
 		return this.syncedPromise;
+	}
+
+	/**
+	 * Overwrite every REMOTE peer's presentation with values we derived ourselves.
+	 *
+	 * The Durable Object relays awareness frames verbatim and yCollab renders `user.color` and
+	 * `colorLight` straight into inline `style` attributes on the caret widget and selection marks — in
+	 * the *other* person's editor. A peer already authorized on the note (a second device, or an agent)
+	 * could therefore put arbitrary text into a style attribute someone else's browser parses.
+	 *
+	 * Normalising the value was the other option; deriving it is stronger, because there is then nothing
+	 * to get the sanitiser wrong about. The colour is ours to choose and a stable function of the client
+	 * id, so peers stay distinguishable without being able to say how. Our own state is left alone.
+	 */
+	private normaliseRemotePresence(): void {
+		const mine = this.awareness.clientID;
+		for (const [clientId, state] of this.awareness.getStates()) {
+			if (clientId === mine) continue;
+			const user = (state as { user?: Record<string, unknown> }).user;
+			if (user === undefined) continue;
+			user.color = colorFromId(clientId);
+			user.colorLight = colorLightFromId(clientId);
+			user.name =
+				typeof user.name === "string" ? user.name.slice(0, MAX_PEER_NAME) : "Someone else";
+		}
 	}
 
 	/** The current note text. */

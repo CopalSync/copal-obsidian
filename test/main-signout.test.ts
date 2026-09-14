@@ -1,9 +1,11 @@
 import { App } from "obsidian";
 import { describe, expect, it, vi } from "vitest";
 import CopalPlugin from "../src/main";
-import { TokenStore } from "../src/connect/store";
+import type { TokenStore } from "../src/connect/store";
 import type { PersistedData } from "../src/connect/store";
+import type { PluginDataStore } from "../src/data/plugin-data-store";
 import type { RevokeOutcome } from "../src/connect/token-manager";
+import { memStore } from "./data/fake-plugin-data";
 
 /**
  * ⛔ **THE FILE NOTHING COULD LOAD.**
@@ -19,28 +21,25 @@ import type { RevokeOutcome } from "../src/connect/token-manager";
  * (`serverReachable()` answers false with no api, so the flush is skipped; `stopSync()` and
  * `settingsTab?.refresh()` are optional-chained).
  */
-function makePlugin(initial: PersistedData, outcome: RevokeOutcome | Error = "revoked") {
+async function makePlugin(initial: PersistedData, outcome: RevokeOutcome | Error = "revoked") {
 	const calls: string[] = [];
-	let data: PersistedData = { ...initial };
-	const store = new TokenStore(
-		() => Promise.resolve(data),
-		(next) => {
-			data = next;
-			return Promise.resolve();
-		},
-	);
-	// Spied rather than faked, so these are the REAL store mutations in the real order.
-	const signOutSpy = vi.spyOn(store, "signOut");
-	signOutSpy.mockImplementation(async () => {
+	const mem = await memStore(initial);
+	const store = mem.store;
+	/*
+	 * Spied and CALLED THROUGH, so these really are the store's own mutations in the real order. They
+	 * used to be `mockImplementation`s that re-implemented the delete against a local variable, which
+	 * meant this file proved the ordering of two fakes — in a file whose entire reason for existing is
+	 * that fake-looking-correct is how F2 and C14 survived a green suite.
+	 */
+	const realSignOut = store.signOut.bind(store);
+	vi.spyOn(store, "signOut").mockImplementation(async () => {
 		calls.push("local-delete");
-		const { tokens: _dropped, ...rest } = data;
-		data = rest;
+		await realSignOut();
 	});
-	const unlinkSpy = vi.spyOn(store, "unlinkVault");
-	unlinkSpy.mockImplementation(async () => {
+	const realUnlink = store.unlinkVault.bind(store);
+	vi.spyOn(store, "unlinkVault").mockImplementation(async () => {
 		calls.push("unlink-vault");
-		const { vaultId: _v, vaultName: _n, ...rest } = data;
-		data = rest;
+		await realUnlink();
 	});
 
 	const scopes: string[] = [];
@@ -59,10 +58,12 @@ function makePlugin(initial: PersistedData, outcome: RevokeOutcome | Error = "re
 	const plugin = new CopalPlugin(new App() as never, {} as never);
 	const internals = plugin as unknown as {
 		store: TokenStore;
+		data: PluginDataStore;
 		tokens: typeof tokens;
 		registry: { destroyAll: () => Promise<void> };
 	};
 	internals.store = store;
+	internals.data = mem.data;
 	internals.tokens = tokens;
 	internals.registry = {
 		destroyAll: vi.fn(async () => {
@@ -70,7 +71,7 @@ function makePlugin(initial: PersistedData, outcome: RevokeOutcome | Error = "re
 		}),
 	};
 
-	return { plugin, internals, calls, tokens, scopes, peek: () => data };
+	return { plugin, internals, calls, tokens, scopes, peek: mem.peek };
 }
 
 const LINKED: PersistedData = {
@@ -82,7 +83,7 @@ const LINKED: PersistedData = {
 
 describe("CopalPlugin.signOut", () => {
 	it("revokes at the server BEFORE deleting the credential locally", async () => {
-		const { plugin, calls, tokens, peek } = makePlugin(LINKED);
+		const { plugin, calls, tokens, peek } = await makePlugin(LINKED);
 
 		expect(await plugin.signOut()).toBe("revoked");
 
@@ -98,20 +99,20 @@ describe("CopalPlugin.signOut", () => {
 	 * a consent screen in front of every single sign-in; the credential is dead either way.
 	 */
 	it("revokes the token only, leaving the consent so resuming needs no new consent screen", async () => {
-		const { plugin, scopes } = makePlugin(LINKED);
+		const { plugin, scopes } = await makePlugin(LINKED);
 		await plugin.signOut();
 		expect(scopes).toEqual(["token"]);
 	});
 
 	it("signs out locally and reports failure when revocation cannot be done", async () => {
-		const { plugin, calls, peek } = makePlugin(LINKED, "failed");
+		const { plugin, calls, peek } = await makePlugin(LINKED, "failed");
 		expect(await plugin.signOut()).toBe("failed");
 		expect(calls).toEqual(["revoke", "local-delete"]);
 		expect(peek().tokens).toBeUndefined(); // signed out HERE regardless — the point of the finally
 	});
 
 	it("signs out locally even when revocation throws, and does not rethrow at the button", async () => {
-		const { plugin, peek } = makePlugin(LINKED, new Error("network is gone"));
+		const { plugin, peek } = await makePlugin(LINKED, new Error("network is gone"));
 		// `clearCredential` logs and swallows: a rejected promise here would leave the settings pane
 		// wedged mid-sign-out with the tokens already gone.
 		expect(await plugin.signOut()).toBe("failed");
@@ -119,7 +120,7 @@ describe("CopalPlugin.signOut", () => {
 	});
 
 	it("replaces the TokenManager, so the next sign-in is not served by an abandoned one", async () => {
-		const { plugin, internals, tokens } = makePlugin(LINKED);
+		const { plugin, internals, tokens } = await makePlugin(LINKED);
 		await plugin.signOut();
 		// `abandoned` is one-way and `reauthAnnounced` is a latch; reusing the instance would silence
 		// the next expiry for the rest of the session.
@@ -135,7 +136,7 @@ describe("CopalPlugin.disconnect", () => {
 	 * into a different vault.
 	 */
 	it("wipes the local CRDT docs BEFORE unlinking the vault", async () => {
-		const { plugin, calls, peek } = makePlugin(LINKED);
+		const { plugin, calls, peek } = await makePlugin(LINKED);
 
 		expect(await plugin.disconnect()).toBe("revoked");
 
@@ -151,7 +152,7 @@ describe("CopalPlugin.disconnect", () => {
 	 * page still listing this plugin as a connected agent — `revoke.ts` calls that not a revoke.
 	 */
 	it("takes the whole grant, consent included, not just the token", async () => {
-		const { plugin, scopes } = makePlugin(LINKED);
+		const { plugin, scopes } = await makePlugin(LINKED);
 		await plugin.disconnect();
 		expect(scopes).toEqual(["grant"]);
 	});

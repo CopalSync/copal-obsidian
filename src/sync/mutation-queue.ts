@@ -1,3 +1,5 @@
+import type { DataSlice } from "../data/plugin-data-store";
+
 /** The durable pending-mutation queue, under the `pending` key of the plugin's `data.json`. */
 export interface MutationData {
 	/** Note paths whose remote delete has NOT yet landed (offline / failed) — retried on reconnect. */
@@ -15,13 +17,11 @@ export interface MutationData {
 export class MutationQueue {
 	private data: MutationData = { deletes: [] };
 
-	constructor(
-		private readonly load: () => Promise<MutationData | null>,
-		private readonly save: (data: MutationData) => Promise<void>,
-	) {}
+	constructor(private readonly slice: DataSlice<MutationData>) {}
 
-	async init(): Promise<void> {
-		const loaded = await this.load();
+	/** Synchronous, and the slice's copy is this queue's own — see `SyncState.init`. */
+	init(): void {
+		const loaded = this.slice.get();
 		this.data = { deletes: loaded?.deletes ?? [] };
 	}
 
@@ -41,12 +41,17 @@ export class MutationQueue {
 	}
 
 	async persist(): Promise<void> {
-		await this.save(this.data);
+		await this.slice.set(this.data);
 	}
 
 	/** Wipe the queue (on disconnect) so a stale delete can't fire against the next linked vault. */
 	async reset(): Promise<void> {
-		this.data = { deletes: [] };
+		this.resetInMemory();
 		await this.persist();
+	}
+
+	/** The same wipe without the write, for a caller batching every persister's reset into one. */
+	resetInMemory(): void {
+		this.data = { deletes: [] };
 	}
 }

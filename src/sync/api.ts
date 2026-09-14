@@ -126,7 +126,7 @@ export interface SyncApiDeps {
 	maxFileBytes?: number;
 	/** The Copal vault this Obsidian vault is linked to → sent as `X-Copal-Vault` so the tenant-scoped
 	 *  token resolves the right vault. Absent ⇒ the account's sole vault (error if it has several). */
-	getVaultId?: () => Promise<string | undefined>;
+	getVaultId?: () => string | undefined;
 	/**
 	 * A 401 came back. Refresh and return a token to retry with, or `null` to surface the 401.
 	 *
@@ -139,7 +139,7 @@ export class SyncApi {
 	constructor(private readonly deps: SyncApiDeps) {}
 
 	private async send(path: string, token: string, init?: RequestInit): Promise<Response> {
-		const vaultId = await (this.deps.getVaultId?.() ?? Promise.resolve(undefined));
+		const vaultId = this.deps.getVaultId?.();
 		return this.deps.f(`${API_BASE}${path}`, {
 			...init,
 			headers: {

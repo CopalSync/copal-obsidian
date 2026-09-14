@@ -182,8 +182,9 @@ export class BinarySync {
 				/* still offline / server error → keep it for the next drain */
 			}
 		}
-		await queue.persist();
-		await this.deps.cursor.persist();
+		// Concurrent, not sequential: two awaited writes cannot coalesce, and these two always land
+		// together. One write reaches disk instead of two.
+		await Promise.all([queue.persist(), this.deps.cursor.persist()]);
 	}
 
 	/** A local file that's also on the server: decide push / pull / conflict from the known cursor. */

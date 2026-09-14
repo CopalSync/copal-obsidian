@@ -8,7 +8,7 @@ const makeApi = (f: typeof fetch, vaultId: string | undefined = "vlt_x") =>
 	new SyncApi({
 		f,
 		getToken: () => Promise.resolve("tok"),
-		getVaultId: () => Promise.resolve(vaultId),
+		getVaultId: () => vaultId,
 	});
 
 describe("SyncApi", () => {
@@ -347,7 +347,7 @@ describe("SyncApi: responses are parsed, not assumed", () => {
 		const api = new SyncApi({
 			f,
 			getToken: () => Promise.resolve("tok"),
-			getVaultId: () => Promise.resolve("vlt_x"),
+			getVaultId: () => "vlt_x",
 			maxFileBytes: 32,
 		});
 		await expect(api.getFile("liar.bin")).rejects.toThrow(/too large/i);

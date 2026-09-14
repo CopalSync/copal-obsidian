@@ -120,19 +120,18 @@ export class ConnectFlow {
 		 *   would only take effect on the SECOND try, which is not a fix for someone who is stuck.
 		 * `false` — the last attempt completed. Keep it.
 		 */
-		const lastAttempt = await store.getConnectAttemptPending();
+		const lastAttempt = store.getConnectAttemptPending();
 		/*
 		 * Compared NORMALISED, so reordering `SCOPE` is not a change. A raw string compare would
 		 * re-register every install on the planet for a purely cosmetic edit, and the authorization
 		 * server accumulates a client row for each one.
 		 */
-		const scopeChanged = normaliseScope(await store.getClientScope()) !== normaliseScope(SCOPE);
-		if (lastAttempt !== false || scopeChanged) {
-			await store.clearClientRegistration();
-		}
-		await store.setConnectAttemptPending(true);
+		const scopeChanged = normaliseScope(store.getClientScope()) !== normaliseScope(SCOPE);
+		// One write, not two: discarding a registration we cannot trust and marking the attempt pending
+		// are the same decision, and two awaited writes here rewrote the record twice per connect.
+		await store.beginConnectAttempt(lastAttempt !== false || scopeChanged);
 
-		let clientId = await store.getClientId();
+		let clientId = store.getClientId();
 		if (!clientId) {
 			const reg = await registerClient(f, disc.registration_endpoint);
 			clientId = reg.client_id;
@@ -186,10 +185,9 @@ export class ConnectFlow {
 			params.code,
 			pending.verifier,
 		);
-		await this.deps.store.setTokens(tokens);
-		// The attempt came back. Clear the mark so the NEXT connect keeps this registration rather
-		// than treating it as the corpse of a failed one.
-		await this.deps.store.setConnectAttemptPending(false);
+		// One write. The attempt came back, so the mark is cleared in the same breath as the tokens land
+		// — the NEXT connect then keeps this registration rather than treating it as a failed one's corpse.
+		await this.deps.store.completeSignIn(tokens);
 		return tokens;
 	}
 }

@@ -42,13 +42,21 @@ describe("SyncClient", () => {
 			Promise.resolve({ ticket: "t", url: "wss://api.copal.uk/sync" }),
 	): SyncClient {
 		const api = { ticket } as unknown as SyncApi;
-		const state = new SyncState(
-			() => Promise.resolve({ lastSeq: 0, knownServer: [] }),
-			(d) => {
-				onSave?.(d);
+		/*
+		 * A hand-rolled slice rather than a real one, because these tests are about WHEN the cursor
+		 * reaches storage relative to the socket opening, and the spy is the observation point. It
+		 * copies on set exactly as the real slice does — recording the live object would let a later
+		 * mutation rewrite what an earlier save is remembered as having contained.
+		 */
+		let stored: SyncData | undefined = { lastSeq: 0, knownServer: [] };
+		const state = new SyncState({
+			get: () => stored,
+			set: (d: SyncData) => {
+				stored = JSON.parse(JSON.stringify(d)) as SyncData;
+				onSave?.(stored);
 				return Promise.resolve();
 			},
-		);
+		});
 		return new SyncClient(api, sink, state, () => undefined);
 	}
 
@@ -112,10 +120,10 @@ describe("SyncClient", () => {
 		const api = {
 			ticket: () => Promise.resolve({ ticket: "t", url: "ws://x/sync" }),
 		} as unknown as SyncApi;
-		const state = new SyncState(
-			() => Promise.resolve({ lastSeq: 0, knownServer: [] }),
-			() => Promise.resolve(),
-		);
+		const state = new SyncState({
+			get: () => ({ lastSeq: 0, knownServer: [] }),
+			set: () => Promise.resolve(),
+		});
 		const reconcile = vi
 			.fn<(k?: readonly string[]) => Promise<Cursor>>()
 			.mockResolvedValue({ knownServer: [], head: 0 });

@@ -27,7 +27,7 @@ export class CopalSettingTab extends PluginSettingTab {
 		// title, so an <h2> repeated it — and the review guidelines ask for `setHeading()` over a raw
 		// heading element, and for section headings only when there are several sections.
 
-		if (!(await this.plugin.store.isConnected())) {
+		if (!this.plugin.store.isConnected()) {
 			this.renderConnect(containerEl); // not signed in → Log in
 			return;
 		}
@@ -43,7 +43,7 @@ export class CopalSettingTab extends PluginSettingTab {
 		 *
 		 * Self-deleting: once re-authenticated, `needsReauth()` can never be true again.
 		 */
-		if (await this.plugin.store.needsReauth()) {
+		if (this.plugin.store.needsReauth()) {
 			new Setting(containerEl)
 				.setName("Sign in again")
 				.setDesc(
@@ -66,7 +66,7 @@ export class CopalSettingTab extends PluginSettingTab {
 				);
 		}
 
-		if (!(await this.plugin.store.getVaultId())) {
+		if (!this.plugin.store.getVaultId()) {
 			// Signed in, but this folder isn't linked to a vault (the adopt screen was closed). Nothing syncs.
 			new Setting(containerEl)
 				.setName("Not syncing")
@@ -99,7 +99,7 @@ export class CopalSettingTab extends PluginSettingTab {
 			return;
 		}
 
-		const vaultName = await this.plugin.store.getVaultName();
+		const vaultName = this.plugin.store.getVaultName();
 		new Setting(containerEl)
 			.setName("Connected")
 			.setDesc(

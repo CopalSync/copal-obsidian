@@ -36,7 +36,7 @@ export class ConfirmModal extends Modal {
 
 	override onOpen(): void {
 		const { contentEl } = this;
-		contentEl.createEl("h3", { text: this.opts.title });
+		this.setTitle(this.opts.title);
 		contentEl.createEl("p", { text: this.opts.body });
 		new Setting(contentEl)
 			.addButton((b) => b.setButtonText("Cancel").onClick(() => this.cancel()))

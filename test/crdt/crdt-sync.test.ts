@@ -7,22 +7,18 @@ import { asVaultId, LocalDocStore } from "../../src/crdt/local-doc-store";
 import { LocalNoteRegistry } from "../../src/crdt/local-note-registry";
 import type { SyncApi } from "../../src/sync/api";
 import { type MutationData, MutationQueue } from "../../src/sync/mutation-queue";
+import { memSlice } from "../data/fake-plugin-data";
 import { InMemoryVault } from "../sync/fake-vault";
 
 /** A fixed vault id, supplied the way the production factory supplies one. */
 const vaultIdOf = (id: string) => () => Promise.resolve(asVaultId(id));
 
 /** A MutationQueue backed by an in-memory `data.json` record (mirrors the real `pending`-key persistence). */
-function makeQueue(initial: MutationData | null = null) {
-	let data = initial;
-	const q = new MutationQueue(
-		() => Promise.resolve(data),
-		(d) => {
-			data = d;
-			return Promise.resolve();
-		},
-	);
-	return { q, peek: () => data };
+async function makeQueue(initial: MutationData | null = null) {
+	const m = await memSlice("pending", initial ?? undefined);
+	const q = new MutationQueue(m.slice);
+	q.init();
+	return { q, peek: (): MutationData | undefined => m.peek() };
 }
 
 /**
@@ -393,7 +389,7 @@ describe("CrdtSync (local-first op-sync)", () => {
 	});
 
 	it("a fully-offline rename durably queues the old-path delete and keeps the old doc (no resurrect)", async () => {
-		const { q } = makeQueue();
+		const { q } = await makeQueue();
 		await q.init();
 		const { crdt, registry, vault } = makeSync(
 			{ "old.md": "hello" },
@@ -680,7 +676,7 @@ describe("CrdtSync (local-first op-sync)", () => {
 
 describe("CrdtSync — durable delete queue (offline mutation durability)", () => {
 	it("deleteLocal enqueues + persists the delete when the server delete fails, and re-throws", async () => {
-		const { q, peek } = makeQueue();
+		const { q, peek } = await makeQueue();
 		await q.init();
 		const { crdt, registry } = makeSync(
 			{ "d.md": "x" },
@@ -701,7 +697,7 @@ describe("CrdtSync — durable delete queue (offline mutation durability)", () =
 	});
 
 	it("drainPending replays a queued delete: deletes server-side, drops the doc, dequeues", async () => {
-		const { q } = makeQueue({ deletes: ["gone.md"] });
+		const { q } = await makeQueue({ deletes: ["gone.md"] });
 		await q.init();
 		// Post-offline-delete state: the .md is gone but its persisted doc was KEPT + the delete queued.
 		const { crdt, registry, deleted } = makeSync({}, { queue: q });
@@ -718,7 +714,7 @@ describe("CrdtSync — durable delete queue (offline mutation durability)", () =
 	});
 
 	it("drainPending is idempotent — an empty queue is a no-op", async () => {
-		const { q } = makeQueue();
+		const { q } = await makeQueue();
 		await q.init();
 		const { crdt, deleted } = makeSync({}, { queue: q });
 		await crdt.drainPending();
@@ -727,7 +723,7 @@ describe("CrdtSync — durable delete queue (offline mutation durability)", () =
 	});
 
 	it("drainPending KEEPS a queued delete when the server delete still fails (still offline)", async () => {
-		const { q } = makeQueue({ deletes: ["gone.md"] });
+		const { q } = await makeQueue({ deletes: ["gone.md"] });
 		await q.init();
 		const { crdt, registry } = makeSync(
 			{},
@@ -747,7 +743,7 @@ describe("CrdtSync — durable delete queue (offline mutation durability)", () =
 	});
 
 	it("drainPending supersedes a queued delete whose .md was re-created locally (local wins)", async () => {
-		const { q } = makeQueue({ deletes: ["back.md"] });
+		const { q } = await makeQueue({ deletes: ["back.md"] });
 		await q.init();
 		// The user re-created the note: its .md is back on disk. The stale delete intent must be dropped, NOT
 		// sent (else the re-creation would be deleted). Doc-presence is not the signal — a queued delete keeps
@@ -761,7 +757,7 @@ describe("CrdtSync — durable delete queue (offline mutation durability)", () =
 	});
 
 	it("reconcile drains pending deletes before reconciling", async () => {
-		const { q } = makeQueue({ deletes: ["gone.md"] });
+		const { q } = await makeQueue({ deletes: ["gone.md"] });
 		await q.init();
 		const { crdt, registry, deleted } = makeSync({}, { queue: q }); // manifest empty (server has nothing)
 		const { note, whenLoaded } = registry.note("gone.md");

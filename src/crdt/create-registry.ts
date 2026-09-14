@@ -21,7 +21,7 @@ export function createLocalNoteRegistry(
 	vault: VaultWriter,
 ): LocalNoteRegistry {
 	return new LocalNoteRegistry(
-		new LocalDocStore(async () => asVaultId(await store.getVaultId())),
+		new LocalDocStore(() => Promise.resolve(asVaultId(store.getVaultId()))),
 		vault,
 	);
 }

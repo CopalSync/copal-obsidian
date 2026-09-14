@@ -9,9 +9,9 @@ export interface SearchHost {
 	searchVault(query: string, mode: SearchMode): Promise<SearchHit[]>;
 	/** Whether this folder is linked to a vault. Signed in with no vault cannot search either, and
 	 *  it is a DIFFERENT thing to fix, so the pane has to tell the two apart. */
-	hasVault(): Promise<boolean>;
+	hasVault(): boolean;
 	/** Whether the plugin holds tokens, i.e. somebody is SIGNED IN. Not the same as having a vault. */
-	isConnected(): Promise<boolean>;
+	isConnected(): boolean;
 	/** Open a note by its vault-relative path (click-through from a result). */
 	openNote(path: string): void;
 }
@@ -81,19 +81,32 @@ export class CopalSearchView extends ItemView {
 		this.resultsEl = root.createDiv({ cls: "copal-search-results" });
 		// On mobile, dismiss the on-screen keyboard when the user starts scrolling the results — it frees the
 		// space and is the expected gesture (tapping a result dismisses it too, see renderResults).
-		this.resultsEl.addEventListener("touchmove", () => this.inputEl.blur(), { passive: true });
+		this.registerDomEvent(this.resultsEl, "touchmove", () => this.inputEl.blur(), {
+			passive: true,
+		});
 
-		this.inputEl.addEventListener("input", () => {
+		this.registerDomEvent(this.inputEl, "input", () => {
 			this.query = this.inputEl.value;
 			this.scheduleSearch();
 		});
 		// Enter searches immediately (skip the debounce).
-		this.inputEl.addEventListener("keydown", (e) => {
+		this.registerDomEvent(this.inputEl, "keydown", (e) => {
 			if (e.key === "Enter") {
 				e.preventDefault();
 				this.query = this.inputEl.value;
 				void this.runSearch();
 			}
+		});
+
+		/*
+		 * Delegated once, rather than per result. `registerDomEvent` ties the listener to this view's
+		 * lifecycle so Obsidian removes it on close; a raw `addEventListener` per hit would both leak and
+		 * outlive the view.
+		 */
+		this.registerDomEvent(this.resultsEl, "click", (e) => this.openHitFrom(e.target));
+		this.registerDomEvent(this.resultsEl, "keydown", (e) => {
+			if (e.key !== "Enter" && e.key !== " ") return;
+			if (this.openHitFrom(e.target)) e.preventDefault();
 		});
 
 		void this.showIdleState();
@@ -108,7 +121,7 @@ export class CopalSearchView extends ItemView {
 	private addModeButton(parent: HTMLElement, mode: SearchMode, label: string): void {
 		const btn = parent.createEl("button", { cls: "copal-search-mode", text: label });
 		if (mode === this.mode) btn.addClass("is-active");
-		btn.addEventListener("click", () => {
+		this.registerDomEvent(btn, "click", () => {
 			if (this.mode === mode) return;
 			this.mode = mode;
 			for (const [m, el] of Object.entries(this.modeButtons))
@@ -144,9 +157,8 @@ export class CopalSearchView extends ItemView {
 	 * people to the wrong button.
 	 */
 	private async idleText(): Promise<string> {
-		if (!(await this.host.isConnected())) return "Not signed in. Open Settings, then Copal.";
-		if (!(await this.host.hasVault()))
-			return "No vault yet. Open Settings, then Copal, to sync one.";
+		if (!this.host.isConnected()) return "Not signed in. Open Settings, then Copal.";
+		if (!this.host.hasVault()) return "No vault yet. Open Settings, then Copal, to sync one.";
 		return "Search your vault by meaning.";
 	}
 
@@ -156,7 +168,7 @@ export class CopalSearchView extends ItemView {
 			await this.showIdleState();
 			return;
 		}
-		const ready = (await this.host.isConnected()) && (await this.host.hasVault());
+		const ready = this.host.isConnected() && this.host.hasVault();
 		if (!ready) {
 			this.renderPrompt(await this.idleText());
 			return;
@@ -201,18 +213,21 @@ export class CopalSearchView extends ItemView {
 			if (hit.snippet.length > 0) {
 				item.createDiv({ cls: "copal-search-hit-snippet", text: hit.snippet });
 			}
-			const open = (): void => {
-				this.inputEl.blur(); // dismiss the mobile keyboard before switching to the note
-				this.host.openNote(hit.path);
-			};
-			item.addEventListener("click", open);
-			item.addEventListener("keydown", (e) => {
-				if (e.key === "Enter" || e.key === " ") {
-					e.preventDefault();
-					open();
-				}
-			});
+			// The path travels on the element, not in a closure, because the listeners are DELEGATED —
+			// results re-render on every keystroke, and one listener per hit per render is a leak that
+			// grows with how much the user types.
+			item.dataset.copalPath = hit.path;
 		}
+	}
+
+	/** Open the result `target` sits inside, if any. Returns whether anything was opened. */
+	private openHitFrom(target: EventTarget | null): boolean {
+		const hit = target instanceof Element ? target.closest<HTMLElement>(".copal-search-hit") : null;
+		const path = hit?.dataset.copalPath;
+		if (path === undefined) return false;
+		this.inputEl.blur(); // dismiss the mobile keyboard before switching to the note
+		this.host.openNote(path);
+		return true;
 	}
 
 	private renderPrompt(text: string): void {

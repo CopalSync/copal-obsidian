@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { ConnectFlow } from "../../src/connect/flow";
 import { SCOPE } from "../../src/connect/oauth";
-import { type PersistedData, TokenStore } from "../../src/connect/store";
+import type { PersistedData, TokenStore } from "../../src/connect/store";
+import { memStore as memData } from "../data/fake-plugin-data";
 
 // Discovery is two hops: the gateway's protected-resource document names the authorization
 // server, and the authorization server's own metadata carries the endpoints. They are different
@@ -23,15 +24,8 @@ const json = (b: unknown, status = 200) => new Response(JSON.stringify(b), { sta
 const discovery = (f: ReturnType<typeof vi.fn<typeof fetch>>) =>
 	f.mockResolvedValueOnce(json(PRM)).mockResolvedValueOnce(json(DISC));
 
-function memStore(): TokenStore {
-	let data: PersistedData = {};
-	return new TokenStore(
-		() => Promise.resolve(data),
-		(d) => {
-			data = d;
-			return Promise.resolve();
-		},
-	);
+async function memStore(initial: PersistedData = {}): Promise<TokenStore> {
+	return (await memData(initial)).store;
 }
 
 describe("ConnectFlow", () => {
@@ -40,10 +34,10 @@ describe("ConnectFlow", () => {
 			json({ client_id: "cid" }, 201),
 		);
 		const openUrl = vi.fn<(u: string) => void>();
-		const store = memStore();
+		const store = await memStore();
 		const flow = new ConnectFlow({ f, store, openUrl, randomState: () => "st8" });
 		await flow.start();
-		expect(await store.getClientId()).toBe("cid");
+		expect(store.getClientId()).toBe("cid");
 		const url = new URL(openUrl.mock.calls[0]![0]);
 		expect(url.origin + url.pathname).toBe("https://auth.copal.uk/oauth2/authorize");
 		expect(url.searchParams.get("client_id")).toBe("cid");
@@ -55,7 +49,7 @@ describe("ConnectFlow", () => {
 		const f = discovery(vi.fn<typeof fetch>())
 			.mockResolvedValueOnce(json({ client_id: "cid" }, 201))
 			.mockResolvedValueOnce(json({ access_token: "at", scope: "vault.read vault.write" }));
-		const store = memStore();
+		const store = await memStore();
 		const flow = new ConnectFlow({
 			f,
 			store,
@@ -65,7 +59,7 @@ describe("ConnectFlow", () => {
 		await flow.start();
 		const tokens = await flow.handleCallback({ code: "code123", state: "st8" });
 		expect(tokens.access_token).toBe("at");
-		expect(await store.isConnected()).toBe(true);
+		expect(store.isConnected()).toBe(true);
 	});
 
 	it("rejects a state mismatch", async () => {
@@ -74,7 +68,7 @@ describe("ConnectFlow", () => {
 		);
 		const flow = new ConnectFlow({
 			f,
-			store: memStore(),
+			store: await memStore(),
 			openUrl: vi.fn<(u: string) => void>(),
 			randomState: () => "st8",
 		});
@@ -85,7 +79,7 @@ describe("ConnectFlow", () => {
 	it("rejects an error callback", async () => {
 		const flow = new ConnectFlow({
 			f: vi.fn<typeof fetch>(),
-			store: memStore(),
+			store: await memStore(),
 			openUrl: vi.fn<(u: string) => void>(),
 			randomState: () => "st8",
 		});
@@ -93,12 +87,14 @@ describe("ConnectFlow", () => {
 	});
 
 	it("reuses a previously-registered client id (no re-registration)", async () => {
-		const store = memStore();
 		// A COMPLETED attempt AND a matching scope are what make a stored registration trustworthy.
 		// An id alone now describes an install that predates one or both marks, which re-registers on
 		// purpose — see the migration cases below.
-		await store.setClientRegistration("existing", SCOPE);
-		await store.setConnectAttemptPending(false);
+		const store = await memStore({
+			clientId: "existing",
+			clientScope: SCOPE,
+			connectAttemptPending: false,
+		});
 		const f = discovery(vi.fn<typeof fetch>());
 		const openUrl = vi.fn<(u: string) => void>();
 		const flow = new ConnectFlow({ f, store, openUrl, randomState: () => "st8" });
@@ -124,9 +120,10 @@ describe("ConnectFlow", () => {
  */
 describe("ConnectFlow — recovering from a registration the server has forgotten", () => {
 	it("re-registers when the previous attempt never came back", async () => {
-		const store = memStore();
-		await store.setClientId("dead-client-from-before-the-reset");
-		await store.setConnectAttemptPending(true);
+		const store = await memStore({
+			clientId: "dead-client-from-before-the-reset",
+			connectAttemptPending: true,
+		});
 
 		const f = discovery(vi.fn<typeof fetch>()).mockResolvedValueOnce(
 			json({ client_id: "fresh" }, 201),
@@ -134,27 +131,29 @@ describe("ConnectFlow — recovering from a registration the server has forgotte
 		const openUrl = vi.fn<(u: string) => void>();
 		await new ConnectFlow({ f, store, openUrl, randomState: () => "st8" }).start();
 
-		expect(await store.getClientId()).toBe("fresh");
+		expect(store.getClientId()).toBe("fresh");
 		expect(new URL(openUrl.mock.calls[0]![0]).searchParams.get("client_id")).toBe("fresh");
 	});
 
 	it("⛔ KEEPS the registration when the last attempt completed", async () => {
 		// The falsifier for the test above. If `start()` simply discarded the client every time, that
 		// test would pass while the plugin registered a new client on every single connect.
-		const store = memStore();
-		await store.setClientRegistration("known-good", SCOPE);
-		await store.setConnectAttemptPending(false);
+		const store = await memStore({
+			clientId: "known-good",
+			clientScope: SCOPE,
+			connectAttemptPending: false,
+		});
 
 		const f = discovery(vi.fn<typeof fetch>());
 		const openUrl = vi.fn<(u: string) => void>();
 		await new ConnectFlow({ f, store, openUrl, randomState: () => "st8" }).start();
 
-		expect(await store.getClientId()).toBe("known-good");
+		expect(store.getClientId()).toBe("known-good");
 		expect(new URL(openUrl.mock.calls[0]![0]).searchParams.get("client_id")).toBe("known-good");
 	});
 
 	it("clears the mark once a callback lands, so the next connect keeps its client", async () => {
-		const store = memStore();
+		const store = await memStore();
 		const f = discovery(vi.fn<typeof fetch>())
 			.mockResolvedValueOnce(json({ client_id: "cid" }, 201))
 			.mockResolvedValueOnce(json({ access_token: "at", refresh_token: "rt", expires_in: 3600 }));
@@ -162,9 +161,9 @@ describe("ConnectFlow — recovering from a registration the server has forgotte
 		const flow = new ConnectFlow({ f, store, openUrl, randomState: () => "st8" });
 
 		await flow.start();
-		expect(await store.getConnectAttemptPending()).toBe(true);
+		expect(store.getConnectAttemptPending()).toBe(true);
 		await flow.handleCallback({ code: "c0de", state: "st8" });
-		expect(await store.getConnectAttemptPending()).toBe(false);
+		expect(store.getConnectAttemptPending()).toBe(false);
 	});
 });
 
@@ -174,9 +173,9 @@ describe("ConnectFlow — the migration for installs that predate the mark", () 
 		// build that fixes it. `undefined` is not `false` — treating it as "the last attempt was
 		// fine" would reuse the dead id and fail identically, and the fix would only bite on the
 		// second try, which is no use to somebody who is already stuck.
-		const store = memStore();
+		const store = await memStore();
 		await store.setClientId("dead-client-from-before-the-reset");
-		expect(await store.getConnectAttemptPending()).toBeUndefined();
+		expect(store.getConnectAttemptPending()).toBeUndefined();
 
 		const f = discovery(vi.fn<typeof fetch>()).mockResolvedValueOnce(
 			json({ client_id: "fresh" }, 201),
@@ -184,7 +183,7 @@ describe("ConnectFlow — the migration for installs that predate the mark", () 
 		const openUrl = vi.fn<(u: string) => void>();
 		await new ConnectFlow({ f, store, openUrl, randomState: () => "st8" }).start();
 
-		expect(await store.getClientId()).toBe("fresh");
+		expect(store.getClientId()).toBe("fresh");
 		expect(new URL(openUrl.mock.calls[0]![0]).searchParams.get("client_id")).toBe("fresh");
 	});
 });
@@ -200,9 +199,11 @@ describe("ConnectFlow — the migration for installs that predate the mark", () 
  */
 describe("ConnectFlow — a registration is only reusable at the scope it was made with", () => {
 	it("⛔ re-registers when the stored scope is narrower than SCOPE", async () => {
-		const store = memStore();
-		await store.setClientRegistration("narrow-client", "vault.read vault.write");
-		await store.setConnectAttemptPending(false);
+		const store = await memStore({
+			clientId: "narrow-client",
+			clientScope: "vault.read vault.write",
+			connectAttemptPending: false,
+		});
 
 		const f = discovery(vi.fn<typeof fetch>()).mockResolvedValueOnce(
 			json({ client_id: "wide" }, 201),
@@ -210,15 +211,13 @@ describe("ConnectFlow — a registration is only reusable at the scope it was ma
 		const openUrl = vi.fn<(u: string) => void>();
 		await new ConnectFlow({ f, store, openUrl, randomState: () => "st8" }).start();
 
-		expect(await store.getClientId()).toBe("wide");
+		expect(store.getClientId()).toBe("wide");
 		expect(new URL(openUrl.mock.calls[0]![0]).searchParams.get("scope")).toBe(SCOPE);
 	});
 
 	it("re-registers when the scope was never recorded (the migration)", async () => {
-		const store = memStore();
-		await store.setClientId("pre-scope-client");
-		await store.setConnectAttemptPending(false);
-		expect(await store.getClientScope()).toBeUndefined();
+		const store = await memStore({ clientId: "pre-scope-client", connectAttemptPending: false });
+		expect(store.getClientScope()).toBeUndefined();
 
 		const f = discovery(vi.fn<typeof fetch>()).mockResolvedValueOnce(
 			json({ client_id: "fresh" }, 201),
@@ -230,11 +229,11 @@ describe("ConnectFlow — a registration is only reusable at the scope it was ma
 			randomState: () => "st8",
 		}).start();
 
-		expect(await store.getClientId()).toBe("fresh");
+		expect(store.getClientId()).toBe("fresh");
 	});
 
 	it("persists the scope it registered with, so the NEXT connect reuses the client", async () => {
-		const store = memStore();
+		const store = await memStore();
 		const f = discovery(vi.fn<typeof fetch>()).mockResolvedValueOnce(
 			json({ client_id: "cid" }, 201),
 		);
@@ -246,7 +245,7 @@ describe("ConnectFlow — a registration is only reusable at the scope it was ma
 		});
 
 		await flow.start();
-		expect(await store.getClientScope()).toBe(SCOPE);
+		expect(store.getClientScope()).toBe(SCOPE);
 
 		await flow.handleCallback.call(flow, { code: "x", state: "st8" }).catch(() => undefined);
 	});
@@ -257,15 +256,17 @@ describe("ConnectFlow — a registration is only reusable at the scope it was ma
 	 */
 	it("⛔ does NOT re-register when the scope is merely REORDERED", async () => {
 		const reordered = SCOPE.split(" ").reverse().join(" ");
-		const store = memStore();
-		await store.setClientRegistration("known-good", reordered);
-		await store.setConnectAttemptPending(false);
+		const store = await memStore({
+			clientId: "known-good",
+			clientScope: reordered,
+			connectAttemptPending: false,
+		});
 
 		const f = discovery(vi.fn<typeof fetch>());
 		const openUrl = vi.fn<(u: string) => void>();
 		await new ConnectFlow({ f, store, openUrl, randomState: () => "st8" }).start();
 
-		expect(await store.getClientId()).toBe("known-good");
+		expect(store.getClientId()).toBe("known-good");
 	});
 });
 
@@ -275,11 +276,11 @@ describe("ConnectFlow — a registration is only reusable at the scope it was ma
  * the message a Notice renders.
  */
 describe("ConnectFlow: the pending attempt is short-lived and single-use", () => {
-	function make(clock: { now: number }, tokenResponse = json({ access_token: "at" })) {
+	async function make(clock: { now: number }, tokenResponse = json({ access_token: "at" })) {
 		const f = discovery(vi.fn<typeof fetch>())
 			.mockResolvedValueOnce(json({ client_id: "cid" }, 201))
 			.mockResolvedValue(tokenResponse);
-		const store = memStore();
+		const store = await memStore();
 		const flow = new ConnectFlow({
 			f,
 			store,
@@ -292,7 +293,7 @@ describe("ConnectFlow: the pending attempt is short-lived and single-use", () =>
 
 	it("refuses a callback that arrives after the attempt has expired", async () => {
 		const clock = { now: 1_000_000 };
-		const { flow } = make(clock);
+		const { flow } = await make(clock);
 		await flow.start();
 
 		clock.now += 11 * 60 * 1000; // the browser tab sat open over a coffee
@@ -302,7 +303,7 @@ describe("ConnectFlow: the pending attempt is short-lived and single-use", () =>
 
 	it("still accepts a callback inside the window", async () => {
 		const clock = { now: 1_000_000 };
-		const { flow } = make(clock);
+		const { flow } = await make(clock);
 		await flow.start();
 		clock.now += 9 * 60 * 1000;
 		await expect(flow.handleCallback({ code: "c", state: "st8" })).resolves.toBeDefined();
@@ -310,7 +311,7 @@ describe("ConnectFlow: the pending attempt is short-lived and single-use", () =>
 
 	it("consumes the attempt even when the exchange fails, so the code cannot be replayed", async () => {
 		const clock = { now: 1_000_000 };
-		const { flow } = make(clock, json({ error: "invalid_grant" }, 400));
+		const { flow } = await make(clock, json({ error: "invalid_grant" }, 400));
 		await flow.start();
 
 		await expect(flow.handleCallback({ code: "c", state: "st8" })).rejects.toThrow();
@@ -324,7 +325,7 @@ describe("ConnectFlow: the pending attempt is short-lived and single-use", () =>
 	 */
 	it("does NOT consume the attempt when the state does not match", async () => {
 		const clock = { now: 1_000_000 };
-		const { flow } = make(clock);
+		const { flow } = await make(clock);
 		await flow.start();
 
 		await expect(flow.handleCallback({ code: "c", state: "wrong" })).rejects.toThrow(/state/i);
@@ -333,7 +334,7 @@ describe("ConnectFlow: the pending attempt is short-lived and single-use", () =>
 
 	it("does not put the callback's error text into the message", async () => {
 		const clock = { now: 1_000_000 };
-		const { flow } = make(clock);
+		const { flow } = await make(clock);
 		await flow.start();
 
 		const attacker = "Your vault is locked. Call 0800-NOT-COPAL to restore it.";

@@ -34,7 +34,7 @@ class ExternalLinkModal extends Modal {
 
 	override onOpen(): void {
 		const { contentEl } = this;
-		contentEl.createEl("h3", { text: "Finish signing in" });
+		this.setTitle("Finish signing in");
 		contentEl.createEl("p", {
 			text: "Open the Copal sign-in page in your browser, then return to Obsidian. You will be connected automatically.",
 		});
@@ -46,6 +46,8 @@ class ExternalLinkModal extends Modal {
 		link.setAttribute("target", "_blank");
 		link.setAttribute("rel", "noopener");
 		// Let Obsidian's link handler open the URL (this tap is a real user gesture), then dismiss the prompt.
+		// `addEventListener`, not `registerDomEvent`: `Modal` is not a `Component` and has no such method.
+		// `onClose` empties `contentEl`, so the listener goes with the element it is on.
 		link.addEventListener("click", () => window.setTimeout(() => this.close(), 0));
 	}
 

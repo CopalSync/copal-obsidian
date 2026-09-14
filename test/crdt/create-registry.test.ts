@@ -5,7 +5,7 @@ import { InMemoryVault } from "../sync/fake-vault";
 
 /** Only the one method the factory reads, standing in for the real `TokenStore`. */
 const linkedTo = (vaultId: string | undefined) => ({
-	getVaultId: () => Promise.resolve(vaultId),
+	getVaultId: () => vaultId,
 });
 
 async function databaseNames(): Promise<string[]> {
