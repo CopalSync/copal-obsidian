@@ -46,7 +46,7 @@ describe("WsTransport", () => {
 
 	it("reconnects with a FRESH ticket + re-fires onOpen after an unintentional drop", async () => {
 		let ticket = 0;
-		const t = new WsTransport(() => Promise.resolve(`wss://x?t=${++ticket}`));
+		const t = new WsTransport(() => Promise.resolve(`wss://api.copal.uk/ycrdt?t=${++ticket}`));
 		let opens = 0;
 		t.onOpen(() => opens++);
 		t.connect();
@@ -72,8 +72,23 @@ describe("WsTransport", () => {
 		t.close(); // stop the backoff timer
 	});
 
+	/**
+	 * S7. The other half, and the one the scheme check missed entirely: a perfectly valid `wss://` that
+	 * points somewhere else. The ticket endpoint mints this URL, so a compromised or misconfigured one
+	 * could send the realtime channel — carrying note text — to a host of its choosing, encrypted and
+	 * unremarked. It has to fail closed exactly like the downgrade does.
+	 */
+	it("refuses a wss:// URL on another host — no socket is ever constructed", async () => {
+		const t = new WsTransport(() => Promise.resolve("wss://api.copal.uk.evil.com/ycrdt"));
+		t.connect();
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(created, "the socket opened to a host that is not Copal").toHaveLength(0);
+		t.close();
+	});
+
 	it("stops reconnecting after close()", async () => {
-		const t = new WsTransport(() => Promise.resolve("wss://x"));
+		const t = new WsTransport(() => Promise.resolve("wss://api.copal.uk/ycrdt"));
 		t.connect();
 		await vi.runAllTimersAsync();
 		created[0]!.open();
@@ -84,7 +99,7 @@ describe("WsTransport", () => {
 	});
 
 	it("does NOT close a still-CONNECTING socket directly (no console warning)", async () => {
-		const t = new WsTransport(() => Promise.resolve("wss://x"));
+		const t = new WsTransport(() => Promise.resolve("wss://api.copal.uk/ycrdt"));
 		t.connect();
 		await vi.runAllTimersAsync();
 		const ws = created[0]!;

@@ -283,3 +283,73 @@ describe("SyncApi.search", () => {
 		await expect(makeApi(f).search("q")).rejects.toThrow();
 	});
 });
+
+/**
+ * S9. These five responses were `as`-cast straight into use: a server (or anything that could answer
+ * as one) could return a vault with no id, a ticket that was not a string, or an attachment of any
+ * size at all, and the plugin would carry on with it.
+ */
+describe("SyncApi: responses are parsed, not assumed", () => {
+	it("drops a malformed vault rather than handing back a half one", async () => {
+		const f = vi.fn<typeof fetch>().mockResolvedValue(
+			json({
+				vaults: [
+					{ vaultId: "vlt_a", displayName: "Real", createdAt: 1 },
+					{ displayName: "no id" },
+					null,
+					{ vaultId: "vlt_b", displayName: "Also real", createdAt: 2 },
+				],
+			}),
+		);
+		const vaults = await makeApi(f).listVaults();
+		expect(vaults.map((v) => v.vaultId)).toEqual(["vlt_a", "vlt_b"]);
+	});
+
+	it("returns nothing when the vault list is not a list", async () => {
+		const f = vi.fn<typeof fetch>().mockResolvedValue(json({ vaults: "all of them" }));
+		await expect(makeApi(f).listVaults()).resolves.toEqual([]);
+	});
+
+	it("refuses a ticket that is not a usable pair", async () => {
+		const f = vi
+			.fn<typeof fetch>()
+			.mockResolvedValue(json({ ticket: 42, url: "wss://api.copal.uk/s" }));
+		await expect(makeApi(f).ticket()).rejects.toThrow(/ticket/i);
+	});
+
+	it("refuses a ticket whose socket URL is not Copal's", async () => {
+		const f = vi
+			.fn<typeof fetch>()
+			.mockResolvedValue(json({ ticket: "t", url: "wss://api.copal.uk.evil.com/s" }));
+		await expect(makeApi(f).ycrdtTicket()).rejects.toThrow(/untrusted url/i);
+	});
+
+	it("refuses an attachment larger than the cap, on the header, without reading it", async () => {
+		const body = vi.fn();
+		const res = new Response(new Uint8Array([1]), {
+			status: 200,
+			headers: { "content-length": String(101 * 1024 * 1024), etag: '"e"' },
+		});
+		Object.defineProperty(res, "arrayBuffer", { value: body });
+		const f = vi.fn<typeof fetch>().mockResolvedValue(res);
+		await expect(makeApi(f).getFile("big.bin")).rejects.toThrow(/too large/i);
+		expect(body, "the oversized body was read anyway").not.toHaveBeenCalled();
+	});
+
+	it("refuses an attachment that exceeds the cap despite its header", async () => {
+		const f = vi.fn<typeof fetch>().mockResolvedValue(
+			bin(
+				Array.from({ length: 64 }, () => 1),
+				200,
+				{ "content-length": "1" },
+			),
+		);
+		const api = new SyncApi({
+			f,
+			getToken: () => Promise.resolve("tok"),
+			getVaultId: () => Promise.resolve("vlt_x"),
+			maxFileBytes: 32,
+		});
+		await expect(api.getFile("liar.bin")).rejects.toThrow(/too large/i);
+	});
+});

@@ -39,7 +39,7 @@ describe("SyncClient", () => {
 		sink: RemoteSink,
 		onSave?: (d: SyncData) => void,
 		ticket: () => Promise<{ ticket: string; url: string }> = () =>
-			Promise.resolve({ ticket: "t", url: "wss://x/sync" }),
+			Promise.resolve({ ticket: "t", url: "wss://api.copal.uk/sync" }),
 	): SyncClient {
 		const api = { ticket } as unknown as SyncApi;
 		const state = new SyncState(
@@ -197,7 +197,7 @@ describe("SyncClient", () => {
 
 		await client.start();
 		client.stop();
-		release({ ticket: "t", url: "wss://x/sync" });
+		release({ ticket: "t", url: "wss://api.copal.uk/sync" });
 		await Promise.resolve();
 		await Promise.resolve();
 

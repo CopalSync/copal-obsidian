@@ -1,7 +1,7 @@
 import { PreconditionError, type SyncApi } from "./api";
 import type { BinaryCursor } from "./binary-cursor";
 import { type BinaryFiles, mimeForPath } from "./binary-vault";
-import { conflictName } from "./conflict-name";
+import { uniqueConflictName } from "./conflict-name";
 import { fnv1a } from "./fnv";
 import type { MutationQueue } from "./mutation-queue";
 import { safePath } from "./safe-path";
@@ -17,6 +17,9 @@ export interface BinarySyncDeps {
 	api: Pick<SyncApi, "getFile" | "putFile" | "deleteFile">;
 	files: BinaryFiles;
 	cursor: BinaryCursor;
+	/** This install's device id, stamped into conflict-copy names so two devices never collide. A
+	 *  getter because `main.ts` reads it from the store after this is constructed. */
+	deviceId?: () => string;
 	/** Durable pending-delete queue (a second `MutationQueue` instance under the `binaryPending` key). */
 	queue: MutationQueue;
 	log?: (msg: string) => void;
@@ -215,13 +218,24 @@ export class BinarySync {
 			this.deps.cursor.set(path, { etag: file.etag, hash: localHash }); // identical → just adopt the cursor
 			return;
 		}
-		await this.deps.files.writeBinary(conflictName(path), localBytes); // divergent → keep local as a copy
+		// divergent → keep local as a copy, under a name nothing else can already own
+		await this.deps.files.writeBinary(await this.conflictCopyName(path), localBytes);
 		await this.deps.files.writeBinary(path, file.bytes); // take server in place
 		this.deps.cursor.set(path, { etag: file.etag, hash: serverHash });
 	}
 
+	/** A conflict-copy name that is not already taken on disk — never a fixed one, which overwrote the
+	 *  previous copy the moment a note diverged twice. */
+	private conflictCopyName(path: string): Promise<string> {
+		return uniqueConflictName(
+			path,
+			{ at: new Date(), deviceId: this.deps.deviceId?.() ?? "" },
+			(p) => this.deps.files.exists(p),
+		);
+	}
+
 	private async resolveConflict(path: string, localBytes: ArrayBuffer): Promise<void> {
-		await this.deps.files.writeBinary(conflictName(path), localBytes);
+		await this.deps.files.writeBinary(await this.conflictCopyName(path), localBytes);
 		this.deps.log?.(`binary conflict, kept a conflict copy: ${path}`);
 		await this.pull(path); // server wins in place; the conflict copy propagates on its own next push
 	}

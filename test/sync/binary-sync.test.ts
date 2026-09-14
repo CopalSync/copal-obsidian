@@ -119,7 +119,12 @@ describe("BinarySync", () => {
 		cursor.set("a.png", { etag: "stale", hash: "00000000" }); // we think the server is at "stale"
 		api.server.set("a.png", { bytes: buf([7, 7]), etag: "srv-cur", contentType: "image/png" });
 		await sync.pushLocal("a.png");
-		expect(files.bytes("a (conflicted copy).png")).toEqual([9]); // local kept (name split at the extension)
+		// The copy carries a time + device stamp (S8), so it is found by shape rather than by a literal.
+		const copy = files
+			.paths()
+			.find((p) => p.startsWith("a (conflicted copy ") && p.endsWith(".png"));
+		expect(copy, "no stamped conflict copy was kept").toBeDefined();
+		expect(files.bytes(copy!)).toEqual([9]); // local kept (name split at the extension)
 		expect(files.bytes("a.png")).toEqual([7, 7]); // server won in place
 		expect(cursor.get("a.png")?.etag).toBe("srv-cur");
 	});

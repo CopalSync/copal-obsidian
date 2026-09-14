@@ -152,3 +152,75 @@ describe("CrdtNote", () => {
 		expect(origins).toEqual(["local"]); // no new entry after unsubscribe
 	});
 });
+
+/**
+ * S4. Inbound binary frames were neither size-capped nor guarded. `readMessage` runs `Y.applyUpdate`
+ * on whatever arrives, so a malformed frame threw inside the transport's listener — an unhandled
+ * exception, a doc left half-applied, and `whenSynced()` that never settled, which upstream shows up
+ * as an 8s stall per note rather than as an error.
+ */
+describe("CrdtNote: a hostile or broken frame", () => {
+	/** A transport whose inbound callback the test drives directly. */
+	function drivable() {
+		let deliver: ((d: Uint8Array) => void) | undefined;
+		const closes: (number | undefined)[] = [];
+		const transport: YTransport = {
+			send: () => undefined,
+			onMessage: (cb) => {
+				deliver = cb as (d: Uint8Array) => void;
+			},
+			onOpen: (cb) => cb(),
+			close: (code?: number) => closes.push(code),
+		};
+		return { transport, feed: (d: Uint8Array) => deliver?.(d), closes };
+	}
+
+	it("does not throw out of the transport listener", () => {
+		const { transport, feed } = drivable();
+		new CrdtNote(transport);
+		// A sync-type frame whose payload is not a valid Yjs update.
+		expect(() => feed(new Uint8Array([0, 200, 200, 200, 200]))).not.toThrow();
+	});
+
+	it("rejects whenSynced instead of stalling until the caller's timeout", async () => {
+		const { transport, feed } = drivable();
+		const note = new CrdtNote(transport);
+		feed(new Uint8Array([0, 200, 200, 200, 200]));
+		await expect(note.whenSynced()).rejects.toThrow(/unusable frame/i);
+	});
+
+	it("refuses an oversized frame without parsing it", async () => {
+		const { transport, feed, closes } = drivable();
+		const note = new CrdtNote(transport);
+		feed(new Uint8Array(9 * 1024 * 1024)); // over the 8 MiB cap
+		// ⚠️ Asserts the BOUNDS rejected it, not merely that it was rejected. The try/catch below would
+		// catch a 9 MiB parse failure too, which made an earlier version of this test pass with the size
+		// check deleted — a check that cannot fail its own test is not a check.
+		await expect(note.whenSynced()).rejects.toThrow(/out of bounds/i);
+		expect(closes, "the peer was not dropped").not.toHaveLength(0);
+	});
+
+	it("refuses an empty frame", async () => {
+		const { transport, feed } = drivable();
+		const note = new CrdtNote(transport);
+		feed(new Uint8Array(0));
+		await expect(note.whenSynced()).rejects.toThrow(/out of bounds/i);
+	});
+
+	it("ignores everything that arrives after it has given up on the peer", async () => {
+		const { transport, feed } = drivable();
+		const note = new CrdtNote(transport);
+		feed(new Uint8Array([0, 200, 200, 200, 200]));
+		await expect(note.whenSynced()).rejects.toThrow();
+		expect(() => feed(new Uint8Array([0, 200, 200, 200, 200]))).not.toThrow();
+	});
+
+	it("leaves the document untouched by the bad frame", async () => {
+		const { transport, feed } = drivable();
+		const note = new CrdtNote(transport);
+		note.edit((t) => t.insert(0, "mine"));
+		feed(new Uint8Array([0, 200, 200, 200, 200]));
+		await expect(note.whenSynced()).rejects.toThrow();
+		expect(note.text(), "a rejected frame changed the note").toBe("mine");
+	});
+});

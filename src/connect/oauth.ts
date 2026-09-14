@@ -198,8 +198,10 @@ export async function registerClient(
 		}),
 	});
 	if (!res.ok) throw new Error(`client registration failed: ${res.status}`);
-	const body = (await res.json()) as { client_id?: string };
-	if (!body.client_id) throw new Error("registration returned no client_id");
+	const body = (await res.json()) as { client_id?: unknown };
+	if (typeof body.client_id !== "string" || body.client_id === "") {
+		throw new Error("registration returned no usable client_id");
+	}
 	return { client_id: body.client_id };
 }
 
@@ -236,18 +238,30 @@ export function buildAuthorizeUrl(
 	return asTrustedUrl(u.toString());
 }
 
-function toTokens(raw: {
-	access_token?: string;
-	refresh_token?: string;
-	scope?: string;
-	expires_in?: number;
-}): Tokens {
-	if (!raw.access_token) throw new Error("token response missing access_token");
+/**
+ * Turn a token response into `Tokens`, checking TYPES and not merely presence.
+ *
+ * ⚠️ `expires_in` is the one that bites quietly. A non-numeric value made `Date.now() + x * 1000`
+ * evaluate to `NaN`, and every expiry comparison against `NaN` is false — so the token would never be
+ * refreshed and would simply start 401ing an hour later with nothing anywhere saying why. Dropping the
+ * field instead means the token is treated as having no known expiry, which the refresh path already
+ * handles.
+ */
+function toTokens(raw: unknown): Tokens {
+	const r = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
+	if (typeof r.access_token !== "string" || r.access_token === "") {
+		throw new Error("token response missing access_token");
+	}
+	if (r.refresh_token !== undefined && typeof r.refresh_token !== "string") {
+		throw new Error("token response has a non-string refresh_token");
+	}
+	const expiresIn =
+		typeof r.expires_in === "number" && Number.isFinite(r.expires_in) ? r.expires_in : undefined;
 	return {
-		access_token: raw.access_token,
-		...(raw.refresh_token === undefined ? {} : { refresh_token: raw.refresh_token }),
-		...(raw.scope === undefined ? {} : { scope: raw.scope }),
-		...(raw.expires_in === undefined ? {} : { expires_at: Date.now() + raw.expires_in * 1000 }),
+		access_token: r.access_token,
+		...(r.refresh_token === undefined ? {} : { refresh_token: r.refresh_token }),
+		...(typeof r.scope === "string" ? { scope: r.scope } : {}),
+		...(expiresIn === undefined ? {} : { expires_at: Date.now() + expiresIn * 1000 }),
 	};
 }
 

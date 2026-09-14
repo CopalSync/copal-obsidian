@@ -12,6 +12,8 @@ export interface ConnectDeps {
 	openUrl: (url: TrustedUrl) => void;
 	/** CSRF state generator (Obsidian: `crypto.randomUUID`). */
 	randomState: () => string;
+	/** Injected for tests; the pending attempt's expiry is measured against it. */
+	now?: () => number;
 }
 
 /** In-flight connect attempt: the PKCE verifier + CSRF state + the endpoints/client resolved at start. */
@@ -21,7 +23,31 @@ interface Pending {
 	/** Captured at `start` and used a whole user round trip later, so it carries its check with it. */
 	tokenEndpoint: TrustedUrl;
 	clientId: string;
+	/** When this attempt stops being usable. See {@link PENDING_TTL_MS}. */
+	expiresAt: number;
 }
+
+/**
+ * How long a started connect stays answerable.
+ *
+ * The attempt holds a live PKCE verifier, and it used to be held until the plugin was unloaded — so a
+ * connect abandoned in a browser tab in the morning was still redeemable that evening by anything that
+ * could reach the `obsidian://` deep link. Ten minutes is comfortably longer than a sign-in takes and
+ * shorter than a walk away from the machine; it is also the window authorization codes themselves are
+ * usually given.
+ */
+const PENDING_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * What the user is told when the callback carries an `error`.
+ *
+ * ⛔ **FIXED COPY, DELIBERATELY.** `params.error` arrives on `obsidian://copal-connect?error=…`, and
+ * any app or page on the device can invoke that URL. Interpolating it into the thrown message put a
+ * stranger's text into a Notice inside the user's vault, which is a phishing surface with the
+ * plugin's own credibility behind it ("Your vault is locked, call this number"). The raw value is
+ * logged for debugging and never rendered.
+ */
+const AUTHORIZATION_FAILED = "Sign-in did not complete. Please try connecting again.";
 
 /**
  * Scope strings compared as SETS, because that is what the server compares. `undefined` normalises
@@ -119,6 +145,7 @@ export class ConnectFlow {
 			state,
 			tokenEndpoint: disc.token_endpoint,
 			clientId,
+			expiresAt: (this.deps.now?.() ?? Date.now()) + PENDING_TTL_MS,
 		};
 		openUrl(buildAuthorizeUrl(disc.authorization_endpoint, clientId, pkce, state));
 	}
@@ -128,11 +155,30 @@ export class ConnectFlow {
 		state?: string | undefined;
 		error?: string | undefined;
 	}): Promise<Tokens> {
-		if (params.error) throw new Error(`authorization failed: ${params.error}`);
+		if (params.error !== undefined) {
+			console.warn(
+				`[copal] authorization callback reported an error: ${JSON.stringify(params.error).slice(0, 200)}`,
+			);
+			throw new Error(AUTHORIZATION_FAILED);
+		}
 		const pending = this.pending;
 		if (!pending) throw new Error("no pending connect attempt");
+		/*
+		 * State is checked BEFORE the attempt is consumed, and a mismatch deliberately leaves it
+		 * standing. Consuming on a bad state would let anything that can fire the deep link cancel a
+		 * sign-in that is legitimately in progress — trading a replay window for a denial of service.
+		 */
 		if (params.state !== pending.state) throw new Error("state mismatch, ignoring callback");
+		if ((this.deps.now?.() ?? Date.now()) > pending.expiresAt) {
+			this.pending = undefined;
+			throw new Error("this sign-in attempt has expired, please try connecting again");
+		}
 		if (!params.code) throw new Error("callback missing authorization code");
+		/*
+		 * SINGLE USE. Cleared before the exchange, not after: a failed exchange used to leave the
+		 * verifier in place, so the same code could be presented again and again.
+		 */
+		this.pending = undefined;
 		const tokens = await exchangeCode(
 			this.deps.f,
 			pending.tokenEndpoint,
@@ -144,7 +190,6 @@ export class ConnectFlow {
 		// The attempt came back. Clear the mark so the NEXT connect keeps this registration rather
 		// than treating it as the corpse of a failed one.
 		await this.deps.store.setConnectAttemptPending(false);
-		this.pending = undefined;
 		return tokens;
 	}
 }

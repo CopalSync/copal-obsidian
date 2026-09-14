@@ -15,7 +15,34 @@ describe("assertWssUrl", () => {
 		" wss://x",
 	]) {
 		it(`rejects ${JSON.stringify(bad)}`, () => {
-			expect(() => assertWssUrl(bad)).toThrow(/wss/);
+			expect(() => assertWssUrl(bad)).toThrow(/wss|untrusted/i);
+		});
+	}
+
+	/**
+	 * S7. The scheme check alone said nothing about WHERE the socket connects. The URL is server-supplied
+	 * — minted by the ticket endpoint — so a compromised or misconfigured server could hand back a
+	 * perfectly valid `wss://` pointing anywhere, and the realtime channel, which carries note text,
+	 * would open to it encrypted and unremarked. Same policy as `asTrustedUrl`, different scheme.
+	 */
+	for (const bad of [
+		"wss://evil.com",
+		"wss://api.copal.uk.evil.com",
+		"wss://xcopal.uk",
+		"wss://.copal.uk",
+		"wss://api.copal.uk./sync",
+		"wss://user:pass@api.copal.uk",
+		"wss://api.copal.uk@evil.com",
+		"wss://api.copal.uk:8443",
+	]) {
+		it(`rejects off-host ${JSON.stringify(bad)}`, () => {
+			expect(() => assertWssUrl(bad)).toThrow(/untrusted url/i);
+		});
+	}
+
+	for (const good of ["wss://api.copal.uk/ycrdt?ticket=x", "wss://copal.uk/sync"]) {
+		it(`accepts ${JSON.stringify(good)}`, () => {
+			expect(() => assertWssUrl(good)).not.toThrow();
 		});
 	}
 });

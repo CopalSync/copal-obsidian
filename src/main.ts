@@ -180,6 +180,7 @@ export default class CopalPlugin extends Plugin {
 			files: new ObsidianBinaryVault(this.app),
 			cursor: binaryCursor,
 			queue: binaryQueue,
+			deviceId: () => this.deviceId,
 			log: (m) => {
 				if (debugEnabled()) console.debug(`[copal binary] ${m}`);
 			},
@@ -214,6 +215,7 @@ export default class CopalPlugin extends Plugin {
 			registry,
 			vault,
 			queue: mutationQueue,
+			deviceId: () => this.deviceId,
 			binarySync,
 			bind: (peer) => {
 				// Give the human a presence identity so yCollab labels the local user and the agent's caret

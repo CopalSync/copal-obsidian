@@ -17,8 +17,21 @@ export interface YTransport {
 	onMessage(cb: (data: ArrayBuffer | Uint8Array) => void): void;
 	/** Fires on every (re)connect — the peer re-sends its syncStep1 so a reconnected socket re-syncs. */
 	onOpen(cb: () => void): void;
-	close(): void;
+	/** `code` is a WebSocket close code, so a deliberate drop can say why (4002 = unusable frame). */
+	close(code?: number): void;
 }
+
+/**
+ * Inbound frame bounds.
+ *
+ * A note's whole Yjs state crosses on the first sync, so the ceiling has to clear a large document while
+ * still refusing something that is only trying to make us allocate. A frame also has to carry at least a
+ * type byte for `messageType` to read.
+ */
+const MAX_FRAME_BYTES = 8 * 1024 * 1024;
+const MIN_FRAME_BYTES = 1;
+/** WebSocket close code for "you sent something I cannot use". In the private-use 4000-4999 range. */
+const UNUSABLE_FRAME_CLOSE = 4002;
 
 /**
  * A per-note CRDT replica: a `Y.Doc` synced with the note's `YNoteDO` over an injected binary transport,
@@ -34,9 +47,13 @@ export class CrdtNote {
 	/** Whether we created the doc (and must destroy it) — false when a persisted `LocalDocStore` doc is injected. */
 	private readonly ownsDoc: boolean;
 	private synced = false;
+	/** Set once a frame could not be used; every later frame from this peer is ignored. */
+	private poisoned = false;
 	private resolveSynced!: () => void;
-	private readonly syncedPromise = new Promise<void>((res) => {
+	private rejectSynced!: (err: Error) => void;
+	private readonly syncedPromise = new Promise<void>((res, rej) => {
 		this.resolveSynced = res;
+		this.rejectSynced = rej;
 	});
 
 	/**
@@ -52,18 +69,34 @@ export class CrdtNote {
 		this.ownsDoc = doc === undefined;
 		this.awareness = new Awareness(this.doc);
 		this.ytext = this.doc.getText("content");
+		// An unobserved rejection is not an error here: a transient peer may be disposed without anyone
+		// ever awaiting `whenSynced()`. Marking it handled keeps that from surfacing as a crash.
+		void this.syncedPromise.catch(() => undefined);
 		transport.onMessage((data) => {
+			if (this.poisoned) return; // already gave up on this peer
 			const bytes = toBytes(data);
-			if (messageType(bytes) === MSG_AWARENESS) {
-				applyAwareness(this.awareness, bytes, transport); // remote presence → local Awareness
+			// Bounds FIRST, so an absurd frame is refused before anything tries to parse it.
+			if (bytes.length < MIN_FRAME_BYTES || bytes.length > MAX_FRAME_BYTES) {
+				this.poison(`frame out of bounds (${bytes.length} bytes)`);
 				return;
 			}
-			const { reply, syncStep2 } = readMessage(this.doc, bytes, transport);
-			if (reply) transport.send(reply);
-			if (syncStep2 && !this.synced) {
-				// The server sent its full state — the initial sync is complete.
-				this.synced = true;
-				this.resolveSynced();
+			try {
+				if (messageType(bytes) === MSG_AWARENESS) {
+					applyAwareness(this.awareness, bytes, transport); // remote presence → local Awareness
+					return;
+				}
+				const { reply, syncStep2 } = readMessage(this.doc, bytes, transport);
+				if (reply) transport.send(reply);
+				if (syncStep2 && !this.synced) {
+					// The server sent its full state — the initial sync is complete.
+					this.synced = true;
+					this.resolveSynced();
+				}
+			} catch (err) {
+				// `readMessage` runs `Y.applyUpdate` on server-supplied bytes. Unguarded, a malformed
+				// frame threw INSIDE this listener: nothing caught it, the doc was left part-applied, and
+				// `whenSynced()` never settled — which upstream reads as an 8s stall, not as a failure.
+				this.poison(`unusable frame (${err instanceof Error ? err.message : String(err)})`);
 			}
 		});
 		this.doc.on("update", (update: Uint8Array, origin: unknown) => {
@@ -79,7 +112,25 @@ export class CrdtNote {
 			},
 		);
 		// (Re)handshake on every (re)connect — so after a reconnect the socket re-syncs (offline ops flush).
-		transport.onOpen(() => transport.send(encodeSyncStep1(this.doc)));
+		transport.onOpen(() => {
+			// A reconnect is a clean slate: the state vector below re-derives what this peer is missing,
+			// so a frame that poisoned the previous socket does not permanently mute the next one.
+			this.poisoned = false;
+			transport.send(encodeSyncStep1(this.doc));
+		});
+	}
+
+	/**
+	 * Give up on this peer: stop reading from it, tell anyone waiting on the initial sync, and drop the
+	 * socket with a code that says why.
+	 *
+	 * Failing loudly is the point. Carrying on after a frame we could not apply would leave a document
+	 * that is neither the server's nor ours, and materialize it over the user's `.md` without a word.
+	 */
+	private poison(reason: string): void {
+		this.poisoned = true;
+		this.rejectSynced(new Error(`sync aborted: ${reason}`));
+		this.transport.close(UNUSABLE_FRAME_CLOSE);
 	}
 
 	/** Resolves once the initial sync with the DO completes — so an empty doc reliably means "not on the

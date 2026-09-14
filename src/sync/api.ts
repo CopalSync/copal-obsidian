@@ -31,7 +31,14 @@ async function errorCode(res: Response): Promise<string | undefined> {
 }
 
 import { API_BASE } from "../connect/oauth";
-import { parseBatch, parseChangesResponse, parseManifest, parseSearch } from "./validate";
+import {
+	parseBatch,
+	parseChangesResponse,
+	parseManifest,
+	parseSearch,
+	parseTicket,
+	parseVaults,
+} from "./validate";
 
 /** Safety cap on manifest pages (1000 pages × ~1000 objects = ~1M files) so a misbehaving server can't
  *  spin the paging loop forever. Far above any real vault. */
@@ -105,9 +112,18 @@ const unquoteEtag = (value: string): string => value.replace(/^W\//, "").replace
  * Authenticated client for the Copal `/sync/*` surface. The `fetch` and a current-access-token getter
  * are injected so it's unit-testable (and so `main.ts` can supply the CORS-free `requestUrl` adapter).
  */
+/**
+ * Ceiling on a single attachment download. `arrayBuffer()` buffers the whole response in memory and on
+ * a phone that is the process, so an unbounded one is a crash the server can trigger. 100 MiB clears
+ * any attachment a vault plausibly holds while refusing something that is only trying to exhaust us.
+ */
+const MAX_FILE_BYTES = 100 * 1024 * 1024;
+
 export interface SyncApiDeps {
 	f: typeof fetch;
 	getToken: () => Promise<string>;
+	/** Override the download ceiling. Tests only — production wants {@link MAX_FILE_BYTES}. */
+	maxFileBytes?: number;
 	/** The Copal vault this Obsidian vault is linked to → sent as `X-Copal-Vault` so the tenant-scoped
 	 *  token resolves the right vault. Absent ⇒ the account's sole vault (error if it has several). */
 	getVaultId?: () => Promise<string | undefined>;
@@ -165,7 +181,7 @@ export class SyncApi {
 	async listVaults(): Promise<Vault[]> {
 		const res = await this.authed("/vaults");
 		if (!res.ok) throw new ApiError(res.status);
-		return ((await res.json()) as { vaults: Vault[] }).vaults;
+		return parseVaults(await res.json());
 	}
 
 	/** Create a Copal vault (Obsidian-first sync-up names it after the folder). Plan-capped → throws on 403. */
@@ -232,14 +248,14 @@ export class SyncApi {
 	async ticket(): Promise<{ ticket: string; url: string }> {
 		const res = await this.authed("/sync/ticket", { method: "POST" });
 		if (!res.ok) throw new ApiError(res.status, undefined, "ticket");
-		return (await res.json()) as { ticket: string; url: string };
+		return parseTicket(await res.json());
 	}
 
 	/** Mint a single-use ticket for a per-note CRDT WebSocket (`${url}/<path>?ticket=…`). */
 	async ycrdtTicket(): Promise<{ ticket: string; url: string }> {
 		const res = await this.authed("/ycrdt/ticket", { method: "POST" });
 		if (!res.ok) throw new ApiError(res.status, undefined, "ycrdt ticket");
-		return (await res.json()) as { ticket: string; url: string };
+		return parseTicket(await res.json());
 	}
 
 	/** Propagate a local delete: `DELETE /vault/:path` removes R2, tears down the note's DO, and journals it. */
@@ -271,8 +287,23 @@ export class SyncApi {
 		const res = await this.authed(`/file/${encodePath(path)}`);
 		if (res.status === 404) return null;
 		if (!res.ok) throw new ApiError(res.status, undefined, "get file");
+		/*
+		 * A download had no ceiling at all: `arrayBuffer()` buffers the WHOLE response in memory, and on
+		 * a phone that is the process. The header is checked first because refusing there is the only
+		 * check that costs nothing — by the time the body has been read the memory is already spent.
+		 * The second check is for a header that lied, which is cheap insurance rather than protection.
+		 */
+		const cap = this.deps.maxFileBytes ?? MAX_FILE_BYTES;
+		const declared = Number(res.headers.get("content-length") ?? "");
+		if (Number.isFinite(declared) && declared > cap) {
+			throw new ApiError(res.status, undefined, `file too large (${declared} bytes)`);
+		}
+		const bytes = await res.arrayBuffer();
+		if (bytes.byteLength > cap) {
+			throw new ApiError(res.status, undefined, `file too large (${bytes.byteLength} bytes)`);
+		}
 		return {
-			bytes: await res.arrayBuffer(),
+			bytes,
 			contentType: res.headers.get("content-type") ?? "application/octet-stream",
 			etag: unquoteEtag(res.headers.get("ETag") ?? ""),
 		};

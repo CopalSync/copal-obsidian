@@ -1,6 +1,6 @@
 import type { SyncApi } from "../sync/api";
 import { type BinarySync, isAttachmentPath } from "../sync/binary-sync";
-import { conflictName } from "../sync/conflict-name";
+import { uniqueConflictName } from "../sync/conflict-name";
 import type { MutationQueue } from "../sync/mutation-queue";
 import { safePath } from "../sync/safe-path";
 import type { VaultWriter } from "../sync/vault";
@@ -30,6 +30,9 @@ export interface CrdtSyncDeps {
 	 *  (else `null`). Captures a brand-new note's unsaved keystrokes — which aren't flushed to disk yet — so
 	 *  seeding an empty doc from the file (and materialize writing "" back) can't wipe them. */
 	readActiveText?: (path: string) => string | null;
+	/** This install's device id, stamped into conflict-copy names so two devices never collide. A
+	 *  getter because `main.ts` reads it from the store after this is constructed. */
+	deviceId?: () => string;
 	/** Settle window (ms) to let a transient sync flush + materialize before disconnecting. */
 	settleMs?: number;
 	log?: (msg: string) => void;
@@ -87,7 +90,11 @@ export class CrdtSync {
 		const transport = await this.transportFor(path);
 		const peer = new CrdtNote(transport, note.doc);
 		this.active = { path, peer, transport };
-		void this.seedAndBind(path, note, peer);
+		// Caught, because `whenSynced()` now REJECTS on a frame the peer could not use (S4) rather than
+		// stalling to the timeout. Unhandled, that would surface as a crash instead of a dead socket.
+		void this.seedAndBind(path, note, peer).catch((err: unknown) => {
+			this.deps.log?.(`open ${path} failed: ${err instanceof Error ? err.message : String(err)}`);
+		});
 	}
 
 	/**
@@ -365,7 +372,13 @@ export class CrdtSync {
 			// server content in place (its hash-guard stops that write echoing back up). MERGE never loses local
 			// data → keep it as a labelled conflict copy.
 			if (adopt) return;
-			await this.deps.vault.write(conflictName(path), fileText); // keep-both (first-import divergence)
+			// keep-both (first-import divergence), under a name that cannot overwrite an earlier copy
+			const name = await uniqueConflictName(
+				path,
+				{ at: new Date(), deviceId: this.deps.deviceId?.() ?? "" },
+				(p) => this.deps.vault.exists(p),
+			);
+			await this.deps.vault.write(name, fileText);
 			this.deps.log?.(`first-import divergence, kept a conflict copy: ${path}`);
 		}
 	}

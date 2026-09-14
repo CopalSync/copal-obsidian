@@ -352,3 +352,49 @@ describe("the resource indicator", () => {
 		expect(body.get("resource")).toBe("https://api.copal.uk/mcp");
 	});
 });
+
+/** S9. The token and registration bodies were shape-cast: only presence was checked, never type. */
+describe("token and registration responses are typed, not just present", () => {
+	const tokenFetch = (body: unknown) => vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(body));
+
+	it("refuses an access token that is not a string", async () => {
+		await expect(
+			refresh(
+				tokenFetch({ access_token: 12345 }),
+				asTrustedUrl("https://auth.copal.uk/t"),
+				"c",
+				"r",
+			),
+		).rejects.toThrow(/access_token/i);
+	});
+
+	it("ignores a non-numeric expires_in rather than computing NaN", async () => {
+		// `Date.now() + "soon" * 1000` is NaN, and every expiry comparison against NaN is false — so the
+		// token is never refreshed, and simply starts 401ing an hour later with nothing to show why.
+		const t = await refresh(
+			tokenFetch({ access_token: "at", expires_in: "soon" }),
+			asTrustedUrl("https://auth.copal.uk/t"),
+			"c",
+			"r",
+		);
+		expect(t.expires_at).toBeUndefined();
+	});
+
+	it("refuses a refresh token that is not a string", async () => {
+		await expect(
+			refresh(
+				tokenFetch({ access_token: "at", refresh_token: { nope: true } }),
+				asTrustedUrl("https://auth.copal.uk/t"),
+				"c",
+				"r",
+			),
+		).rejects.toThrow(/refresh_token/i);
+	});
+
+	it("refuses a client_id that is not a string", async () => {
+		const f = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({ client_id: 99 }, 201));
+		await expect(registerClient(f, asTrustedUrl("https://auth.copal.uk/r"))).rejects.toThrow(
+			/client_id/i,
+		);
+	});
+});

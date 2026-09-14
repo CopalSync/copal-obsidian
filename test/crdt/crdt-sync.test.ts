@@ -139,6 +139,14 @@ function makeSync(
 const serverText = (docs: Map<string, Y.Doc>, path: string) =>
 	docs.get(path)?.getText("content").toString() ?? "";
 
+/** Conflict copies carry a time + device stamp (S8), so they are found by shape, not by a literal. */
+function conflictCopies(snapshot: Record<string, string>, base: string): string[] {
+	const [stem, ext] = [base.replace(/\.md$/, ""), ".md"];
+	return Object.keys(snapshot).filter(
+		(k) => k.startsWith(`${stem} (conflicted copy `) && k.endsWith(ext),
+	);
+}
+
 describe("CrdtSync (local-first op-sync)", () => {
 	it("onLocalChange applies a file edit as an op and syncs it up to the server", async () => {
 		const { crdt, serverDocs } = makeSync({ "n.md": "hello world" });
@@ -301,7 +309,9 @@ describe("CrdtSync (local-first op-sync)", () => {
 		await crdt.onRemoteChange({ path: "n.md", op: "put" });
 		await waitFor(() => vault.snapshot()["n.md"] === "SERVER VERSION");
 		expect(vault.snapshot()["n.md"]).toBe("SERVER VERSION"); // adopts server
-		expect(vault.snapshot()["n (conflicted copy).md"]).toBe("LOCAL VERSION"); // local text preserved
+		const copies = conflictCopies(vault.snapshot(), "n.md");
+		expect(copies, "no stamped conflict copy was kept").toHaveLength(1);
+		expect(vault.snapshot()[copies[0]!]).toBe("LOCAL VERSION"); // local text preserved
 	});
 
 	it("deleteLocal propagates the delete remotely and drops the persisted doc", async () => {
@@ -621,7 +631,7 @@ describe("CrdtSync (local-first op-sync)", () => {
 
 		await waitFor(() => vault.snapshot()["Welcome.md"] === "welcome from the agent");
 		expect(vault.snapshot()["Welcome.md"]).toBe("welcome from the agent"); // remote-wins replace
-		expect(vault.snapshot()["Welcome (conflicted copy).md"]).toBeUndefined(); // NO keep-both
+		expect(conflictCopies(vault.snapshot(), "Welcome.md")).toHaveLength(0); // NO keep-both
 		await waitFor(() => vault.snapshot()["project.md"] === "the project");
 		expect(vault.snapshot()["project.md"]).toBe("the project"); // remote-only pulled
 		// nothing leaked up: the server Welcome keeps the agent text (not unioned with the local default), and
@@ -826,7 +836,7 @@ describe("a note this device was behind on, across an upgrade", () => {
 		const first = await behindByOneEdit();
 		await first.crdt.open("n.md");
 		await waitFor(() => first.vault.snapshot()["n.md"] === "NEW");
-		expect(first.vault.snapshot()["n (conflicted copy).md"]).toBeUndefined();
+		expect(conflictCopies(first.vault.snapshot(), "n.md")).toHaveLength(0);
 	});
 
 	it("leaves a conflict copy when the purge took the local history with it", async () => {
@@ -838,7 +848,9 @@ describe("a note this device was behind on, across an upgrade", () => {
 
 		// The note itself ends up correct; the stale local text is kept beside it rather than dropped.
 		expect(first.vault.snapshot()["n.md"]).toBe("NEW");
-		expect(first.vault.snapshot()["n (conflicted copy).md"]).toBe("OLD");
+		const kept = conflictCopies(first.vault.snapshot(), "n.md");
+		expect(kept, "the purge left no conflict copy").toHaveLength(1);
+		expect(first.vault.snapshot()[kept[0]!]).toBe("OLD");
 	});
 });
 

@@ -37,6 +37,11 @@ export class InMemoryBinaryVault implements BinaryFiles {
 	}
 
 	/** Test helper: the bytes at `path` as a number[] (or undefined if absent). */
+	/** Test helper: every path currently held, synchronously. */
+	paths(): string[] {
+		return [...this.files.keys()];
+	}
+
 	bytes(path: string): number[] | undefined {
 		const b = this.files.get(path);
 		return b === undefined ? undefined : [...new Uint8Array(b)];

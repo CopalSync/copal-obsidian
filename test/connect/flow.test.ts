@@ -268,3 +268,77 @@ describe("ConnectFlow — a registration is only reusable at the scope it was ma
 		expect(await store.getClientId()).toBe("known-good");
 	});
 });
+
+/**
+ * S6. The pending attempt held a live PKCE verifier with no expiry, survived a failed exchange, and
+ * put `params.error` — which arrives on a deep link anyone on the device can invoke — straight into
+ * the message a Notice renders.
+ */
+describe("ConnectFlow: the pending attempt is short-lived and single-use", () => {
+	function make(clock: { now: number }, tokenResponse = json({ access_token: "at" })) {
+		const f = discovery(vi.fn<typeof fetch>())
+			.mockResolvedValueOnce(json({ client_id: "cid" }, 201))
+			.mockResolvedValue(tokenResponse);
+		const store = memStore();
+		const flow = new ConnectFlow({
+			f,
+			store,
+			openUrl: vi.fn<(u: string) => void>(),
+			randomState: () => "st8",
+			now: () => clock.now,
+		});
+		return { f, store, flow };
+	}
+
+	it("refuses a callback that arrives after the attempt has expired", async () => {
+		const clock = { now: 1_000_000 };
+		const { flow } = make(clock);
+		await flow.start();
+
+		clock.now += 11 * 60 * 1000; // the browser tab sat open over a coffee
+
+		await expect(flow.handleCallback({ code: "c", state: "st8" })).rejects.toThrow(/expired/i);
+	});
+
+	it("still accepts a callback inside the window", async () => {
+		const clock = { now: 1_000_000 };
+		const { flow } = make(clock);
+		await flow.start();
+		clock.now += 9 * 60 * 1000;
+		await expect(flow.handleCallback({ code: "c", state: "st8" })).resolves.toBeDefined();
+	});
+
+	it("consumes the attempt even when the exchange fails, so the code cannot be replayed", async () => {
+		const clock = { now: 1_000_000 };
+		const { flow } = make(clock, json({ error: "invalid_grant" }, 400));
+		await flow.start();
+
+		await expect(flow.handleCallback({ code: "c", state: "st8" })).rejects.toThrow();
+		// The verifier is spent. A second callback must not get another go at the exchange.
+		await expect(flow.handleCallback({ code: "c", state: "st8" })).rejects.toThrow(/no pending/i);
+	});
+
+	/**
+	 * ⛔ The other direction, and it is a real tension: clearing on a WRONG state would let anyone who
+	 * can fire the deep link cancel a sign-in that is legitimately in progress.
+	 */
+	it("does NOT consume the attempt when the state does not match", async () => {
+		const clock = { now: 1_000_000 };
+		const { flow } = make(clock);
+		await flow.start();
+
+		await expect(flow.handleCallback({ code: "c", state: "wrong" })).rejects.toThrow(/state/i);
+		await expect(flow.handleCallback({ code: "c", state: "st8" })).resolves.toBeDefined();
+	});
+
+	it("does not put the callback's error text into the message", async () => {
+		const clock = { now: 1_000_000 };
+		const { flow } = make(clock);
+		await flow.start();
+
+		const attacker = "Your vault is locked. Call 0800-NOT-COPAL to restore it.";
+		await expect(flow.handleCallback({ error: attacker })).rejects.toThrow(
+			expect.objectContaining({ message: expect.not.stringContaining("0800") }) as Error,
+		);
+	});
+});

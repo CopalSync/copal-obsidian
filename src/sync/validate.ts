@@ -1,4 +1,5 @@
-import type { Change, ManifestEntry, NoteContent, SearchHit } from "./api";
+import type { Change, ManifestEntry, NoteContent, SearchHit, Vault } from "./api";
+import { assertWssUrl } from "./safe-url";
 import { safePath } from "./safe-path";
 
 /**
@@ -122,4 +123,42 @@ export function parseBatch(x: unknown): NoteContent[] {
 		}
 	}
 	return notes;
+}
+
+/**
+ * One vault from `GET /vaults`. An entry without a usable id is dropped rather than repaired: it would
+ * become the `vaultId` every local CRDT database is namespaced by, and a blank one silently commingles
+ * two accounts' notes — which is the bug N2/F3 already cost us once.
+ */
+export function parseVault(x: unknown): Vault | null {
+	if (!isRecord(x)) return null;
+	if (typeof x.vaultId !== "string" || x.vaultId === "") return null;
+	return {
+		vaultId: x.vaultId,
+		displayName: typeof x.displayName === "string" ? x.displayName : x.vaultId,
+		createdAt: num(x.createdAt),
+	};
+}
+
+/** The `vaults` array, malformed entries dropped. A non-array body yields none rather than throwing. */
+export function parseVaults(body: unknown): Vault[] {
+	if (!isRecord(body) || !Array.isArray(body.vaults)) return [];
+	return body.vaults.map(parseVault).filter((v): v is Vault => v !== null);
+}
+
+/**
+ * A WebSocket ticket pair.
+ *
+ * Throws rather than dropping, unlike the list parsers: there is no degraded mode here. A caller with
+ * no ticket cannot open a socket, so failing loudly beats handing back `undefined` and letting
+ * `new WebSocket(undefined)` be the error the user sees. The URL goes through the same host policy the
+ * socket layer applies, so a redirected socket is refused at the boundary as well as at the sink.
+ */
+export function parseTicket(x: unknown): { ticket: string; url: string } {
+	if (!isRecord(x) || typeof x.ticket !== "string" || x.ticket === "") {
+		throw new Error("malformed ticket response: no ticket");
+	}
+	if (typeof x.url !== "string") throw new Error("malformed ticket response: no url");
+	assertWssUrl(x.url);
+	return { ticket: x.ticket, url: x.url };
 }
