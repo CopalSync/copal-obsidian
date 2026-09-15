@@ -16,6 +16,16 @@ export class LocalNote {
 	readonly doc: Y.Doc;
 	private readonly ytext: Y.Text;
 	private lastHash = "";
+	/**
+	 * The server's Yjs state vector as of this note's last successful batch exchange, so the next push can
+	 * be a DIFF against it rather than the whole document.
+	 *
+	 * ⚠️ In-memory, so it is lost on restart and the next exchange sends full state instead. That is
+	 * correct (Yjs dedupes by client and clock, so a re-sent op is a no-op) and merely larger; persisting
+	 * it needs the single-database `docs` store from P2. Undefined means "unknown", which is deliberately
+	 * the same as "send everything" — never "send nothing".
+	 */
+	private serverState: Uint8Array | undefined;
 
 	constructor(
 		doc: Y.Doc,
@@ -66,6 +76,16 @@ export class LocalNote {
 	 */
 	fileStateUnknown(): boolean {
 		return this.lastHash === "";
+	}
+
+	/** The last state vector the server reported, or `undefined` if this note has not exchanged yet. */
+	serverSv(): Uint8Array | undefined {
+		return this.serverState;
+	}
+
+	/** Record the server's state vector after a successful exchange. */
+	setServerSv(sv: Uint8Array): void {
+		this.serverState = sv;
 	}
 
 	/** Subscribe to doc changes; the callback gets each update's origin (`"file"`, `"editor"`, a peer, …). */

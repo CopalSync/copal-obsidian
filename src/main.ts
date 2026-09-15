@@ -482,6 +482,7 @@ export default class CopalPlugin extends Plugin {
 	/** Stop pushing + pull-syncing + CRDT (disconnect / unload). Clears the watcher gate. */
 	stopSync(): void {
 		this.syncActive = false;
+		this.crdt?.stopPaging(); // refuse further pages; an in-flight one finishes on its own
 		void this.crdt?.close();
 		this.sync?.stop();
 	}
@@ -760,8 +761,14 @@ export default class CopalPlugin extends Plugin {
 		// mobile; without this the settings pane sits on the stale "No vault adopted" screen until sync finishes,
 		// reading as a failed adopt. The status indicator shows sync progress in the meantime.
 		await this.settingsTab?.refresh();
-		await this.sync?.start(mode);
+		// ⛔ BEFORE the reconcile, not after. `syncActive` gates the four vault watchers, and the initial
+		// reconcile of a large vault used to run with it false for its whole duration — ~53 minutes for
+		// 10k notes — during which every `create`/`modify`/`delete`/`rename` returned early with no
+		// deferral and no replay list. Edits made while a first import ran were simply lost. The watchers
+		// now hand their path to the pager, which queues it behind the import on the `live` lane instead
+		// of dropping it, so opening the gate first is safe as well as correct.
 		this.syncActive = true;
+		await this.sync?.start(mode);
 		await this.settingsTab?.refresh();
 		const active = this.app.workspace.getActiveFile();
 		if (active && active.extension === "md") this.openForSync(active.path);

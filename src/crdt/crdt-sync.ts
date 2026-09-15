@@ -1,13 +1,15 @@
-import type { SyncApi } from "../sync/api";
+import type { SyncApi, YSyncItem, YSyncResult } from "../sync/api";
 import { type BinarySync, isAttachmentPath } from "../sync/binary-sync";
 import { uniqueConflictName } from "../sync/conflict-name";
 import type { MutationQueue } from "../sync/mutation-queue";
 import { safePath } from "../sync/safe-path";
 import type { VaultWriter } from "../sync/vault";
+import * as Y from "yjs";
+import { base64ToBytes, bytesToBase64 } from "../sync/base64";
 import { CrdtNote, type YTransport } from "./crdt-note";
 import type { LocalNote } from "./local-note";
 import type { LocalNoteRegistry } from "./local-note-registry";
-import { PathQueue } from "./path-queue";
+import { type Lane, type PageEntry, SyncPager } from "./sync-pager";
 import { WsTransport } from "./ws-transport";
 
 export interface CrdtSyncDeps {
@@ -33,15 +35,24 @@ export interface CrdtSyncDeps {
 	/** This install's device id, stamped into conflict-copy names so two devices never collide. A
 	 *  getter because `main.ts` reads it from the store after this is constructed. */
 	deviceId?: () => string;
-	/** Settle window (ms) to let a transient sync flush + materialize before disconnecting. */
-	settleMs?: number;
+	/** Notes per batched request. The server refuses more than 100 and the client pages to match. */
+	pageSize?: number;
+	/** Trailing debounce before a page goes out. Tests pass 0. */
+	debounceMs?: number;
 	log?: (msg: string) => void;
 }
 
 /** Safety cap: proceed even if the initial sync never signals completion (e.g. a network failure). */
 const SYNC_TIMEOUT_MS = 8000;
-/** Default settle window before disconnecting a transient sync (lets the ops flush + materialize). */
-const DEFAULT_SETTLE_MS = 1500;
+/**
+ * Yjs encodes "no ops" as a 2-byte update, so anything at or below this carries nothing. Used both to
+ * decide there is nothing to push and to read the server's acknowledgement: if the diff against the state
+ * vector it just returned is empty, it has everything we had.
+ */
+const EMPTY_UPDATE_BYTES = 2;
+
+/** Transaction origin for ops that arrived FROM the server, so they are not counted as local work. */
+const SERVER_ORIGIN = "server";
 
 /**
  * Local-first note-text sync. Every note is a **persisted** local Y.Doc (LocalDocStore, via the registry);
@@ -53,10 +64,35 @@ const DEFAULT_SETTLE_MS = 1500;
  */
 export class CrdtSync {
 	private active: { path: string; peer: CrdtNote; transport: YTransport } | undefined;
-	/** Per-path serialisation. `coalesce` is the old in-flight guard; `run` is what a local edit needs. */
-	private readonly queue = new PathQueue();
+	/**
+	 * Batches closed-note syncs into pages. Replaces the old per-note transient socket: a page of up to 100
+	 * notes is ONE request and one metered call, against a ticket + WebSocket + 1.5s settle each before.
+	 */
+	private readonly pager: SyncPager;
 
-	constructor(private readonly deps: CrdtSyncDeps) {}
+	constructor(private readonly deps: CrdtSyncDeps) {
+		this.pager = new SyncPager({
+			drain: (entries) => this.syncPage(entries),
+			...(deps.pageSize === undefined ? {} : { pageSize: deps.pageSize }),
+			...(deps.debounceMs === undefined ? {} : { debounceMs: deps.debounceMs }),
+			...(deps.log === undefined ? {} : { log: deps.log }),
+		});
+	}
+
+	/** Queue a path for its next page. Fire-and-forget; `idle()` is how a caller waits for the work. */
+	notify(path: string, lane: Lane, readFile = false): void {
+		this.pager.notify(path, { lane, readFile });
+	}
+
+	/** Resolves once no page is queued or in flight. */
+	idle(): Promise<void> {
+		return this.pager.idle();
+	}
+
+	/** Refuse further paging (teardown). */
+	stopPaging(): void {
+		this.pager.stop();
+	}
 
 	/** True while the active note owns this path (so the vault watcher leaves the editor binding alone). */
 	ownsPath(path: string): boolean {
@@ -162,11 +198,17 @@ export class CrdtSync {
 			return;
 		}
 		if (change.op === "delete") {
+			// Cancel first. `registry.destroy` below drops the persisted doc, and a page still holding it
+			// would apply ops to a doc being torn down — `isCancelled` is what the page checks.
+			this.pager.drop(change.path);
 			await this.deps.vault.remove(change.path); // → Obsidian trash (recoverable), never a hard unlink
 			await this.deps.registry.destroy(change.path); // drop the persisted local doc
 			return;
 		}
-		return this.syncOnce(change.path);
+		// A remote change is not urgent in the way a local edit is, but it is a single note — `live` so it
+		// is not queued behind a first import that may still be draining.
+		this.pager.notify(change.path, { lane: "live" });
+		return this.pager.idle();
 	}
 
 	/**
@@ -180,13 +222,13 @@ export class CrdtSync {
 	async onLocalChange(path: string): Promise<void> {
 		if (this.active?.path === path) return; // the editor binding owns the live note
 		if (safePath(path) === null) return; // unroutable name — its /ycrdt WS would 404-loop
-		return this.queue.run(path, async () => {
-			// Re-checked at dequeue, not just at call time: the note may have been opened while we waited.
-			if (this.active?.path === path) return;
-			const text = await this.readFileForSync(path);
-			if (text === null) return; // gone while queued → the file-level delete path owns it now
-			await this.doSync(path, text);
-		});
+		// The PATH is queued and the file is read when the page reaches it — never the text. Obsidian
+		// autosaves several times inside one exchange, so queuing a snapshot would push stale bytes; the
+		// pager re-queues a path notified while its own page is in flight, so the newest state always wins.
+		this.pager.notify(path, { lane: "live", readFile: true });
+		// Awaited so callers (and tests) keep the old "resolves when this edit has synced" semantics.
+		// `main.ts` fires this and forgets it, so waiting on the whole queue costs nothing there.
+		return this.pager.idle();
 	}
 
 	/** The file's current text at dequeue time, or `null` if it has gone — never `""` for a missing file,
@@ -208,6 +250,7 @@ export class CrdtSync {
 	 * the throw (a Notice); the tombstone-aware `reconcile` retries the removal once the server delete lands.
 	 */
 	async deleteLocal(path: string): Promise<void> {
+		this.pager.drop(path); // stop any queued page for a path whose doc is about to be destroyed
 		try {
 			await this.deps.api.deleteNote(path);
 		} catch (err) {
@@ -278,7 +321,10 @@ export class CrdtSync {
 		if (wasActive) await this.close(); // stop the OLD socket + editor binding (no auto-reconnect / re-push)
 		// A queued or in-flight local edit still refers to `oldPath`, and `registry.rename` below drops that
 		// path's cached LocalNote out from under it. Let it finish before the lineage moves.
-		await this.queue.drain(oldPath);
+		// A queued or in-flight page still refers to `oldPath`, and `registry.rename` below drops that
+		// path's cached LocalNote out from under it. Cancel it, then let any page holding it finish.
+		this.pager.drop(oldPath);
+		await this.pager.idle();
 		try {
 			await this.deps.api.moveNote(oldPath, newPath); // server: transfer history + R2, tombstone old
 			await this.deps.registry.rename(oldPath, newPath); // local: transfer the persisted doc lineage old→new
@@ -295,49 +341,185 @@ export class CrdtSync {
 		}
 		if (wasActive)
 			await this.open(newPath); // rebind the editor to the (rekeyed) new doc → converges w/ server
-		else await this.syncOnce(newPath); // establish/converge the new-path local doc
-	}
-
-	/** Transiently connect a note's persisted doc, exchange ops, materialize, disconnect. Coalesced per path. */
-	private syncOnce(
-		path: string,
-		applyFileText?: string,
-		settleMs?: number,
-		adopt = false,
-	): Promise<void> {
-		if (this.active?.path === path) return Promise.resolve();
-		// Never transient-sync an unroutable path (control chars in the name) — its /ycrdt WS would 404-loop.
-		if (safePath(path) === null) return Promise.resolve();
-		// Coalesce, not queue: every caller of this method means "make sure this path is synced", so riding
-		// a run that is already doing exactly that is correct. A LOCAL edit means something else and goes
-		// through `onLocalChange` instead — see `PathQueue`.
-		return this.queue.coalesce(path, () => this.doSync(path, applyFileText, settleMs, adopt));
-	}
-
-	private async doSync(
-		path: string,
-		applyFileText?: string,
-		settleMs?: number,
-		adopt = false,
-	): Promise<void> {
-		const { note, whenLoaded } = this.deps.registry.note(path);
-		await whenLoaded;
-		const wasEmpty = note.text().length === 0;
-		const transport = await this.transportFor(path);
-		const peer = new CrdtNote(transport, note.doc);
-		try {
-			// SYNC FIRST — adopt the server's ops into the persisted doc (shared history) before reconciling the
-			// file, so we never seed the file into an empty doc that also has equivalent server content (which
-			// would duplicate the text).
-			await Promise.race([peer.whenSynced(), new Promise((r) => setTimeout(r, SYNC_TIMEOUT_MS))]);
-			await this.reconcileFileAfterSync(note, path, wasEmpty, applyFileText, adopt);
-			await this.adoptUnseenFileEdits(note, path, wasEmpty, applyFileText);
-			await note.materialize(); // converged doc → its .md projection
-			await new Promise((r) => setTimeout(r, settleMs ?? this.deps.settleMs ?? DEFAULT_SETTLE_MS));
-		} finally {
-			peer.disconnect();
-			transport.close();
+		else {
+			this.pager.notify(newPath, { lane: "live" }); // establish/converge the new-path local doc
+			await this.pager.idle();
 		}
+	}
+
+	/**
+	 * Exchange ONE page of closed notes with the server in a single request — the whole point of P1.
+	 *
+	 * Replaces `syncOnce`/`doSync`, which per closed note minted a single-use ticket, opened a WebSocket,
+	 * exchanged ops, materialized and then slept 1.5s. At six-wide that made a 10k-note first import take
+	 * ~53 minutes and cost ~10k metered calls — more than a solo plan's entire daily allowance, so it could
+	 * not finish at all. A page of 100 is one request and one metered call.
+	 *
+	 * Sockets remain for exactly two things: the note open in the editor, and the change bus.
+	 */
+	private async syncPage(entries: readonly PageEntry[]): Promise<void> {
+		const prepared: Array<{ path: string; note: LocalNote; wasEmpty: boolean; adopt: boolean }> =
+			[];
+		const items: YSyncItem[] = [];
+		for (const entry of entries) {
+			if (this.active?.path === entry.path) continue; // the editor binding owns the live note
+			if (safePath(entry.path) === null) continue; // unroutable name — never syncable
+			if (this.pager.isCancelled(entry.path)) continue; // deleted out from under this page
+			// oxlint-disable-next-line no-await-in-loop -- each note's persisted doc must load before we
+			// can read its state vector, and the page is bounded at 100.
+			const { note, whenLoaded } = this.deps.registry.note(entry.path);
+			// oxlint-disable-next-line no-await-in-loop
+			await whenLoaded;
+			const wasEmpty = note.text().length === 0;
+			// A file edit merges BEFORE the exchange when the doc already has history: it is a delta on
+			// shared history, so it can travel in the same round trip. An EMPTY doc must wait until after
+			// (the SYNC-FIRST rule) — seeding the file into a doc the server is about to fill duplicates
+			// the text, which is what `reconcileFileAfterSync` exists to arbitrate.
+			if (entry.readFile && !wasEmpty) {
+				// oxlint-disable-next-line no-await-in-loop
+				const text = await this.readFileForSync(entry.path);
+				// oxlint-disable-next-line no-await-in-loop
+				if (text !== null) await note.applyFileEdit(text);
+			}
+			const item: YSyncItem = {
+				path: entry.path,
+				sv: bytesToBase64(Y.encodeStateVector(note.doc)),
+			};
+			const push = this.pushableDiff(note);
+			if (push) item.update = bytesToBase64(push);
+			items.push(item);
+			prepared.push({ path: entry.path, note, wasEmpty, adopt: entry.adopt });
+		}
+		if (items.length === 0) return;
+
+		// A throw here (offline, 5xx) propagates to the pager, which re-queues the whole page and backs off.
+		const results = await this.deps.api.ycrdtSync({
+			device: this.deps.deviceId?.() ?? "",
+			items,
+		});
+		// ⚠️ Indexed BY PATH. The response is not promised to be in request order, and pairing by position
+		// would apply one note's ops to another note — silent cross-contamination that every "all paths
+		// present" assertion stays green for.
+		const byPath = new Map(results.map((r) => [r.path, r]));
+		for (const entry of prepared) {
+			// oxlint-disable-next-line no-await-in-loop -- materializing 100 files concurrently is worse
+			await this.applyResult(entry, byPath.get(entry.path));
+		}
+	}
+
+	/**
+	 * ⛔ **A page deliberately does NOT release the docs it synced, and that is not an oversight.**
+	 *
+	 * Releasing looked like free memory: `registry.close(path)` drops the doc and its IndexedDB provider
+	 * and keeps the stored data. But `LocalNote.lastHash` is in-memory, so a released-then-reopened note
+	 * reports `fileStateUnknown()` — and `adoptUnseenFileEdits` reads that as "the `.md` may hold an edit
+	 * the doc has not seen" and merges the file in. It cannot tell which side is newer, so on the very
+	 * next page it reverts freshly-pulled remote content, and deletes local ops that had not been
+	 * materialized yet. Measured: pulling a remote edit then re-syncing put the note back to its old text.
+	 *
+	 * It needs file state that survives a release, which is the persisted `docs` store in P2. Note also
+	 * that this is no regression: the old per-note path released nothing either, so a 10k-note import
+	 * left 10k docs resident — page size is not the peak, accumulation is, and P2 is what fixes that.
+	 */
+
+	/**
+	 * Whether the server's last-known state vector already covers every op this doc holds.
+	 *
+	 * ⛔ **Do NOT infer this from the byte length of `encodeStateAsUpdate(doc, serverSv)`.** That was the
+	 * obvious test — an empty Yjs update is 2 bytes — and it is wrong: an update ALWAYS carries the
+	 * document's full delete set, so any note that has ever had text deleted produces a non-empty diff
+	 * even when the server holds everything. `applyFileEdit` deletes on almost every real edit, so the
+	 * byte test would report "not acknowledged" forever and the pager would re-queue the note on every
+	 * page, in an endless loop against the server. Measured: a note stuck at a 10-byte "diff" across
+	 * unlimited pages while both sides already agreed.
+	 *
+	 * Comparing the vectors themselves is exact: the server has our work iff, for every client we know
+	 * of, its clock is at least ours.
+	 */
+	private serverCoversOurOps(note: LocalNote): boolean {
+		const serverSv = note.serverSv();
+		if (serverSv === undefined) return false; // never exchanged — assume it has nothing
+		let theirs: Map<number, number>;
+		try {
+			theirs = Y.decodeStateVector(serverSv);
+		} catch {
+			return false; // unreadable vector → push, which is the safe direction
+		}
+		const ours = Y.decodeStateVector(Y.encodeStateVector(note.doc));
+		for (const [client, clock] of ours) {
+			if ((theirs.get(client) ?? 0) < clock) return false;
+		}
+		return true;
+	}
+
+	/** The ops the server is missing, or `undefined` when it already has everything we hold. */
+	private pushableDiff(note: LocalNote): Uint8Array | undefined {
+		if (this.serverCoversOurOps(note)) return undefined;
+		const diff = Y.encodeStateAsUpdate(note.doc, note.serverSv());
+		// A doc with no content at all still encodes to a 2-byte update; there is nothing to send.
+		return diff.byteLength > EMPTY_UPDATE_BYTES ? diff : undefined;
+	}
+
+	/**
+	 * Fold one note's result back in: adopt the server's ops, record its state vector, then reconcile the
+	 * `.md`. Anything unfinished is re-queued rather than retried in place — the pager's next page IS the
+	 * retry, and it backs off when nothing is moving.
+	 */
+	private async applyResult(
+		entry: { path: string; note: LocalNote; wasEmpty: boolean; adopt: boolean },
+		result: YSyncResult | undefined,
+	): Promise<void> {
+		const { path, note, wasEmpty, adopt } = entry;
+		if (this.pager.isCancelled(path)) return; // deleted mid-page; its doc is being destroyed
+		if (!result) {
+			// The server said nothing about this path at all. Nothing was applied, so nothing diverged.
+			this.deps.log?.(`no sync result for ${path}; re-queued`);
+			this.pager.notify(path, { lane: "bulk" });
+			return;
+		}
+		if (!result.ok) {
+			if (result.code === "GONE") {
+				// Tombstoned server-side: the note was deleted on another device and we had not heard.
+				await this.deps.vault.remove(path); // → Obsidian trash, never a hard unlink
+				await this.deps.registry.destroy(path);
+				this.pager.drop(path);
+				return;
+			}
+			// DEFERRED (the page hit its byte budget), UNAVAILABLE, STORAGE_CAP, BAD_UPDATE — all retryable,
+			// and none of them a reason to lose the note.
+			this.deps.log?.(`sync deferred for ${path}: ${result.code ?? "unknown"}`);
+			this.pager.notify(path, { lane: "bulk" });
+			return;
+		}
+		if (result.update !== undefined) {
+			try {
+				Y.applyUpdate(note.doc, base64ToBytes(result.update), SERVER_ORIGIN);
+			} catch (err) {
+				// A payload we cannot apply must not be treated as applied.
+				this.deps.log?.(
+					`unusable update for ${path}: ${err instanceof Error ? err.message : String(err)}`,
+				);
+				this.pager.notify(path, { lane: "bulk" });
+				return;
+			}
+		}
+		if (result.sv !== undefined) {
+			try {
+				note.setServerSv(base64ToBytes(result.sv));
+			} catch {
+				/* leave it unknown — the next push sends full state, which is the safe direction */
+			}
+		}
+		await this.reconcileFileAfterSync(note, path, wasEmpty, undefined, adopt);
+		await this.adoptUnseenFileEdits(note, path, wasEmpty);
+		await note.materialize();
+
+		// The acknowledgement, and it must come LAST. With the server's new state vector in hand, does it
+		// cover everything we hold? ⚠️ Checked AFTER the file reconciliation, because that is what creates
+		// local ops: seeding a brand-new note from its `.md` happens above, and an ack taken before it
+		// would see an empty doc, conclude the server had everything, and never push the note at all. The
+		// whole bring-existing path depends on this ordering.
+		if (!this.serverCoversOurOps(note)) this.pager.notify(path, { lane: "bulk" });
 	}
 
 	/**
@@ -467,10 +649,12 @@ export class CrdtSync {
 		const toRemove = [...local].filter(
 			(p) => !serverPaths.has(p) && p !== active && (mode === "adopt" || knownSet.has(p)),
 		);
-		await runBounded(RECONCILE_CONCURRENCY, [
-			...toPull.map((p) => () => this.syncOnce(p, undefined, 0, mode === "adopt")),
-			...toPush.map((p) => () => this.syncOnce(p, undefined)),
-		]);
+		// One queue, drained in pages of 100. The old code opened a socket per note here, six at a time.
+		// `adopt` rides the entry because a live edit arriving DURING an adopt reconcile must not inherit
+		// remote-wins semantics — `syncActive` is now true before this runs, so that can happen.
+		for (const path of toPull) this.pager.notify(path, { lane: "bulk", adopt: mode === "adopt" });
+		for (const path of toPush) this.pager.notify(path, { lane: "bulk" });
+		await this.pager.idle();
 		// Bounded exactly like the syncs above. An adopt of a large vault puts every local-only note in
 		// `toRemove`, and an unbounded `Promise.all` would open that many trash operations and IndexedDB
 		// teardowns at once. Best-effort for the same reason the syncs are: a remove that fails leaves the
@@ -496,17 +680,15 @@ export class CrdtSync {
 
 	/**
 	 * Flush every persisted note UP to the server before teardown (the clean-disconnect sync-first step).
-	 * Closes the active note first so it's no longer skipped by `syncOnce`, then transient-syncs each
+	 * Closes the active note first so it's no longer skipped by the page, then syncs every
 	 * persisted path (op-exchange pushes local ops up + materializes). Best-effort: a note that can't reach
 	 * the server times out and moves on — the `.md` file is the safety net (reconnect brings-existing it up).
 	 */
 	async flushAll(): Promise<void> {
 		await this.close(); // drop the active note's live socket; its persisted doc keeps its latest edits
 		const paths = await this.deps.registry.listPersisted();
-		await runBounded(
-			RECONCILE_CONCURRENCY,
-			paths.map((p) => () => this.syncOnce(p)),
-		);
+		this.pager.enqueueAll(paths, "bulk");
+		await this.pager.idle();
 	}
 }
 

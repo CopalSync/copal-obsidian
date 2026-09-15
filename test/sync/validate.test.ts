@@ -1,10 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-	parseBatch,
-	parseChange,
-	parseChangesResponse,
-	parseManifest,
-} from "../../src/sync/validate";
+import { parseChange, parseManifest, parseYSync } from "../../src/sync/validate";
 
 describe("parseChange", () => {
 	it("accepts a well-formed put frame", () => {
@@ -44,35 +39,28 @@ describe("parseManifest", () => {
 	});
 });
 
-describe("parseChangesResponse", () => {
-	it("filters malformed frames but preserves the order of valid ones", () => {
-		const { head, changes } = parseChangesResponse({
-			head: 9,
-			changes: [
-				{ seq: 1, path: "a.md", op: "put", origin: "x", ts: 0 },
-				{ seq: 2, path: "../evil.md", op: "put", origin: "x", ts: 0 },
-				{ seq: 3, path: "c.md", op: "delete", origin: "x", ts: 0 },
+describe("parseYSync", () => {
+	it("keeps well-formed items and drops ones with an unsafe path", () => {
+		const items = parseYSync({
+			items: [
+				{ path: "ok.md", ok: true, update: "AAEC", sv: "AQ" },
+				{ path: "../escape.md", ok: true, update: "AAEC" },
+				{ path: "gone.md", ok: false, code: "GONE" },
 			],
 		});
-		expect(head).toBe(9);
-		expect(changes.map((c) => c.path)).toEqual(["a.md", "c.md"]);
+		expect(items.map((i: { path: string }) => i.path)).toEqual(["ok.md", "gone.md"]);
+		expect(items[0]?.sv).toBe("AQ");
+		expect(items[1]?.code).toBe("GONE");
 	});
-});
 
-describe("parseBatch", () => {
-	it("keeps ok notes with a safe path + string content, drops the rest", () => {
-		const notes = parseBatch({
-			get: [
-				{
-					path: "a.md",
-					ok: true,
-					note: { path: "a.md", content: "hi", version: "v1", mtime: 1, size: 2 },
-				},
-				{ path: "b.md", ok: false, code: "NOT_FOUND" },
-				{ path: "c.md", ok: true, note: { path: "../c.md", content: "x", mtime: 1, size: 1 } },
-			],
-		});
-		expect(notes.map((n) => n.path)).toEqual(["a.md"]);
-		expect(notes[0]?.content).toBe("hi");
+	it("drops a non-string binary field rather than passing it through to Y.applyUpdate", () => {
+		const items = parseYSync({ items: [{ path: "a.md", ok: true, update: 42, sv: {} }] });
+		expect(items[0]?.update).toBeUndefined();
+		expect(items[0]?.sv).toBeUndefined();
+	});
+
+	it("returns an empty page for a malformed body instead of throwing", () => {
+		expect(parseYSync(null)).toEqual([]);
+		expect(parseYSync({ items: "nope" })).toEqual([]);
 	});
 });

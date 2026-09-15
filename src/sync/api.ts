@@ -31,14 +31,7 @@ async function errorCode(res: Response): Promise<string | undefined> {
 }
 
 import { API_BASE } from "../connect/oauth";
-import {
-	parseBatch,
-	parseChangesResponse,
-	parseManifest,
-	parseSearch,
-	parseTicket,
-	parseVaults,
-} from "./validate";
+import { parseManifest, parseSearch, parseYSync, parseTicket, parseVaults } from "./validate";
 
 /** Safety cap on manifest pages (1000 pages × ~1000 objects = ~1M files) so a misbehaving server can't
  *  spin the paging loop forever. Far above any real vault. */
@@ -62,14 +55,6 @@ export interface Change {
 	mtime?: number;
 }
 
-export interface NoteContent {
-	path: string;
-	content: string;
-	version?: string;
-	mtime: number;
-	size: number;
-}
-
 export interface Vault {
 	vaultId: string;
 	displayName: string;
@@ -77,6 +62,27 @@ export interface Vault {
 }
 
 /** One search result from `GET /search` — no relevance score is exposed; order IS the ranking. */
+/** One note's half of the batched Yjs handshake — base64 `sv`, plus a base64 `update` when pushing. */
+export interface YSyncItem {
+	path: string;
+	sv: string;
+	update?: string;
+}
+
+export interface YSyncRequest {
+	device?: string;
+	items: YSyncItem[];
+}
+
+/** Per-item outcome. A failure is a `code` here, never a failed request — see the gateway's contract. */
+export interface YSyncResult {
+	path: string;
+	ok: boolean;
+	update?: string;
+	sv?: string;
+	code?: string;
+}
+
 export interface SearchHit {
 	path: string;
 	title: string;
@@ -237,18 +243,31 @@ export class SyncApi {
 		return parseSearch(await res.json());
 	}
 
-	/** The journal delta after `since`. */
-	async changesSince(since: number): Promise<{ head: number; changes: Change[] }> {
-		const res = await this.authed(`/sync/changes?since=${since}`);
-		if (!res.ok) throw new ApiError(res.status, undefined, "changes");
-		return parseChangesResponse(await res.json());
-	}
-
 	/** Mint a single-use WebSocket ticket. */
 	async ticket(): Promise<{ ticket: string; url: string }> {
 		const res = await this.authed("/sync/ticket", { method: "POST" });
 		if (!res.ok) throw new ApiError(res.status, undefined, "ticket");
 		return parseTicket(await res.json());
+	}
+
+	/**
+	 * Exchange a page of closed notes' CRDT state in ONE request (`POST /ycrdt/sync`).
+	 *
+	 * This is what replaces a ticket + WebSocket + 1.5s settle PER closed note: a 10k-note first import
+	 * cost ~10k metered calls, which a solo plan (2,000/day) cannot finish, and took ~53 minutes. The
+	 * server caps a page at 100 items and refuses a larger one with a 400, so the caller pages.
+	 *
+	 * ⚠️ The body is a plain string, deliberately: `authed` re-sends it after a 401 refresh, and a
+	 * stream would be consumed by the first attempt and send empty on the second.
+	 */
+	async ycrdtSync(body: YSyncRequest): Promise<YSyncResult[]> {
+		const res = await this.authed("/ycrdt/sync", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+		});
+		if (!res.ok) throw new ApiError(res.status, await errorCode(res), "ycrdt sync");
+		return parseYSync(await res.json());
 	}
 
 	/** Mint a single-use ticket for a per-note CRDT WebSocket (`${url}/<path>?ticket=…`). */
@@ -339,16 +358,5 @@ export class SyncApi {
 	async deleteFile(path: string): Promise<void> {
 		const res = await this.authed(`/file/${encodePath(path)}`, { method: "DELETE" });
 		if (!res.ok && res.status !== 404) throw new ApiError(res.status, undefined, "delete file");
-	}
-
-	/** Fetch the content of many notes in one round-trip; missing/errored paths are omitted. */
-	async batchGet(paths: string[]): Promise<NoteContent[]> {
-		const res = await this.authed("/sync/batch", {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ get: paths }),
-		});
-		if (!res.ok) throw new ApiError(res.status, undefined, "batch");
-		return parseBatch(await res.json()); // keep only found notes with a safe path + string content
 	}
 }

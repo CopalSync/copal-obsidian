@@ -1,4 +1,4 @@
-import type { Change, ManifestEntry, NoteContent, SearchHit, Vault } from "./api";
+import type { Change, ManifestEntry, SearchHit, Vault, YSyncResult } from "./api";
 import { assertWssUrl } from "./safe-url";
 import { safePath } from "./safe-path";
 
@@ -72,19 +72,6 @@ export function parseManifest(x: unknown): {
 	};
 }
 
-/** Validate a `{ head, changes[] }` delta; filters malformed frames, preserves order. */
-export function parseChangesResponse(x: unknown): { head: number; changes: Change[] } {
-	if (!isRecord(x)) return { head: 0, changes: [] };
-	const changes: Change[] = [];
-	if (Array.isArray(x.changes)) {
-		for (const c of x.changes) {
-			const parsed = parseChange(c);
-			if (parsed) changes.push(parsed);
-		}
-	}
-	return { head: num(x.head), changes };
-}
-
 /** Validate a `GET /search` response (`{ path, title, snippet }[]`); drops any hit whose path is unsafe. */
 export function parseSearch(x: unknown): SearchHit[] {
 	if (!Array.isArray(x)) return [];
@@ -102,27 +89,29 @@ export function parseSearch(x: unknown): SearchHit[] {
 	return hits;
 }
 
-/** Validate a `/sync/batch` GET response; keeps only found notes with a safe path + string content. */
-export function parseBatch(x: unknown): NoteContent[] {
-	if (!isRecord(x)) return [];
-	const notes: NoteContent[] = [];
-	if (Array.isArray(x.get)) {
-		for (const g of x.get) {
-			if (!isRecord(g) || g.ok !== true || !isRecord(g.note)) continue;
-			const note = g.note;
-			const path = safeStr(note.path);
-			if (path === null || typeof note.content !== "string") continue;
-			const nc: NoteContent = {
-				path,
-				content: note.content,
-				mtime: num(note.mtime),
-				size: num(note.size),
-			};
-			if (typeof note.version === "string") nc.version = note.version;
-			notes.push(nc);
-		}
+/**
+ * Validate a `POST /ycrdt/sync` response. Each item is kept only if its `path` is safe and its binary
+ * fields are strings; a malformed item is DROPPED rather than thrown, like every validator here, and the
+ * caller then simply re-enqueues that path (nothing was applied, so nothing diverged).
+ *
+ * ⚠️ `update`/`sv` are NOT decoded here. They are base64 that `Y.applyUpdate` must accept, and decoding
+ * in the validator would either throw — losing the whole page for one bad item — or need a second error
+ * channel. The caller decodes per item inside its own try.
+ */
+export function parseYSync(x: unknown): YSyncResult[] {
+	if (!isRecord(x) || !Array.isArray(x.items)) return [];
+	const items: YSyncResult[] = [];
+	for (const raw of x.items) {
+		if (!isRecord(raw)) continue;
+		const path = safePath(typeof raw.path === "string" ? raw.path : "");
+		if (path === null) continue;
+		const item: YSyncResult = { path, ok: raw.ok === true };
+		if (typeof raw.update === "string") item.update = raw.update;
+		if (typeof raw.sv === "string") item.sv = raw.sv;
+		if (typeof raw.code === "string") item.code = raw.code;
+		items.push(item);
 	}
-	return notes;
+	return items;
 }
 
 /**

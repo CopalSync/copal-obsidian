@@ -58,6 +58,8 @@ export function asVaultId(raw: string | undefined): VaultId {
  */
 export class LocalDocStore {
 	private readonly entries = new Map<string, Entry>();
+	/** In-flight teardowns, so `open` can wait one out instead of racing it. Keyed by path. */
+	private readonly closing = new Map<string, Promise<void>>();
 	private readonly index: PersistedIndex;
 	private vaultIdPromise: Promise<VaultId> | undefined;
 
@@ -84,9 +86,17 @@ export class LocalDocStore {
 		const existing = this.entries.get(path);
 		if (existing) return { doc: existing.doc, whenLoaded: existing.whenLoaded };
 		const doc = new Y.Doc();
+		// ⚠️ Wait out any teardown still running for this path. `close()` is fire-and-forget, so a re-open
+		// that ignored it would build a second `IndexeddbPersistence` on the same database name while the
+		// first was still calling `db.close()` — and the new provider's `whenSynced` can then never
+		// resolve, hanging every caller that awaits `whenLoaded`. Latent since `close()` existed; batched
+		// syncing exercises it constantly, because a finished page releases every note it synced.
+		const settled = this.closing.get(path) ?? Promise.resolve();
 		// Synchronous signature, async key: the caller gets its `Y.Doc` immediately (editors bind to it
 		// before anything is loaded) while the database name waits on the vault id.
-		const provider = this.key(path).then((name) => new IndexeddbPersistence(name, doc));
+		const provider = settled
+			.then(() => this.key(path))
+			.then((name) => new IndexeddbPersistence(name, doc));
 		void provider.catch(() => {}); // the real failure surfaces through `whenLoaded`, which callers await
 		const whenLoaded = provider.then((p) => p.whenSynced).then(() => undefined);
 		this.entries.set(path, { doc, provider, whenLoaded });
@@ -117,10 +127,17 @@ export class LocalDocStore {
 		this.entries.delete(path);
 		// Fire-and-forget as before, but the provider may not exist yet (its name needed the vault id).
 		// Close it FIRST where it does, so y-indexeddb never flushes into a destroyed doc.
-		void entry.provider.then(
-			(p) => p.destroy().then(() => entry.doc.destroy()),
-			() => entry.doc.destroy(), // never opened; nothing to close
-		);
+		// The promise is RECORDED so a re-open of this path can wait it out — see `open`.
+		const done = entry.provider
+			.then(
+				(p) => p.destroy().then(() => entry.doc.destroy()),
+				() => entry.doc.destroy(), // never opened; nothing to close
+			)
+			.catch(() => undefined);
+		this.closing.set(path, done);
+		void done.then(() => {
+			if (this.closing.get(path) === done) this.closing.delete(path);
+		});
 	}
 
 	/** Permanently delete a note's persisted local data (on a confirmed remote delete / bring-existing purge).

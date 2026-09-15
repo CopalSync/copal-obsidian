@@ -68,17 +68,6 @@ describe("SyncApi", () => {
 		expect(m.manifest.map((e) => e.path)).toEqual(["a.md"]);
 	});
 
-	it("changesSince() GETs the delta", async () => {
-		const f = vi
-			.fn<typeof fetch>()
-			.mockResolvedValue(
-				json({ head: 5, changes: [{ seq: 5, path: "b.md", op: "put", origin: "agent", ts: 1 }] }),
-			);
-		const p = await makeApi(f).changesSince(4);
-		expect(String(f.mock.calls[0]![0])).toContain("/sync/changes?since=4");
-		expect(p.changes[0]?.path).toBe("b.md");
-	});
-
 	it("ticket() POSTs /sync/ticket", async () => {
 		const f = vi
 			.fn<typeof fetch>()
@@ -98,23 +87,28 @@ describe("SyncApi", () => {
 		expect(f.mock.calls[0]![1]?.method).toBe("POST");
 	});
 
-	it("batchGet() posts the paths and returns only the notes that were found", async () => {
+	it("ycrdtSync() POSTs a page of base64 items and returns the per-item results", async () => {
 		const f = vi.fn<typeof fetch>().mockResolvedValue(
 			json({
-				get: [
-					{
-						path: "a.md",
-						ok: true,
-						note: { path: "a.md", content: "hi", version: "v1", mtime: 1, size: 2 },
-					},
-					{ path: "b.md", ok: false, code: "NOT_FOUND" },
+				items: [
+					{ path: "a.md", ok: true, update: "AAEC", sv: "AQ" },
+					{ path: "b.md", ok: false, code: "GONE" },
 				],
 			}),
 		);
-		const notes = await makeApi(f).batchGet(["a.md", "b.md"]);
-		expect(notes.map((n) => n.path)).toEqual(["a.md"]);
-		expect(notes[0]?.content).toBe("hi");
-		expect(JSON.parse(f.mock.calls[0]![1]!.body as string)).toEqual({ get: ["a.md", "b.md"] });
+		const items = await makeApi(f).ycrdtSync({
+			device: "d1",
+			items: [
+				{ path: "a.md", sv: "AQ" },
+				{ path: "b.md", sv: "AQ", update: "AAEC" },
+			],
+		});
+		expect(String(f.mock.calls[0]![0])).toContain("/ycrdt/sync");
+		expect(f.mock.calls[0]![1]?.method).toBe("POST");
+		expect(JSON.parse(f.mock.calls[0]![1]!.body as string).items).toHaveLength(2);
+		expect(items.map((i) => i.path)).toEqual(["a.md", "b.md"]);
+		expect(items[0]?.update).toBe("AAEC");
+		expect(items[1]?.code).toBe("GONE");
 	});
 
 	it("sends the X-Copal-Vault header when a vault is linked", async () => {

@@ -6,7 +6,8 @@ import { CrdtNote, type YTransport } from "../src/crdt/crdt-note";
 import { CrdtSync } from "../src/crdt/crdt-sync";
 import { asVaultId, LocalDocStore } from "../src/crdt/local-doc-store";
 import { LocalNoteRegistry } from "../src/crdt/local-note-registry";
-import type { SyncApi } from "../src/sync/api";
+import type { SyncApi, YSyncRequest, YSyncResult } from "../src/sync/api";
+import { base64ToBytes, bytesToBase64 } from "../src/sync/base64";
 import CopalPlugin from "../src/main";
 import { InMemoryVault } from "./sync/fake-vault";
 
@@ -70,18 +71,38 @@ function makePlugin(files: Record<string, string>, gate?: () => Promise<void>) {
 	);
 	const serverDocs = new Map<string, Y.Doc>();
 	let connects = 0;
+	let exchanges = 0;
 	const crdt = new CrdtSync({
 		api: {
 			manifest: () => Promise.resolve({ head: 0, manifest: [] }),
 			deleteNote: () => Promise.resolve(),
 			moveNote: () => Promise.resolve(),
+			// The batched handshake, mirroring `YNoteDO.sync`: apply the client's diff to the persistent
+			// server doc, answer with what that doc holds against the client's state vector.
+			ycrdtSync: async (body: YSyncRequest): Promise<YSyncResult[]> => {
+				exchanges += 1;
+				await gate?.();
+				return body.items.map((item) => {
+					let doc = serverDocs.get(item.path);
+					if (!doc) {
+						doc = new Y.Doc();
+						serverDocs.set(item.path, doc);
+					}
+					if (item.update !== undefined) Y.applyUpdate(doc, base64ToBytes(item.update), "batch");
+					return {
+						path: item.path,
+						ok: true,
+						update: bytesToBase64(Y.encodeStateAsUpdate(doc, base64ToBytes(item.sv))),
+						sv: bytesToBase64(Y.encodeStateVector(doc)),
+					};
+				});
+			},
 		} as unknown as SyncApi,
 		registry,
 		vault,
-		settleMs: 0,
+		debounceMs: 0,
 		transportFor: async (path: string) => {
 			connects += 1;
-			await gate?.();
 			const { a, b } = pairedTransports();
 			let doc = serverDocs.get(path);
 			if (!doc) {
@@ -103,7 +124,14 @@ function makePlugin(files: Record<string, string>, gate?: () => Promise<void>) {
 		(plugin as unknown as { onVaultChange: (f: { path: string }) => void }).onVaultChange({ path });
 
 	const serverText = (path: string) => serverDocs.get(path)?.getText("content").toString() ?? "";
-	return { plugin, vault, modify, serverText, connects: () => connects };
+	return {
+		plugin,
+		vault,
+		modify,
+		serverText,
+		connects: () => connects,
+		exchanges: () => exchanges,
+	};
 }
 
 describe("the plugin's own vault watcher", () => {
@@ -117,7 +145,7 @@ describe("the plugin's own vault watcher", () => {
 
 		gate = new Promise<void>((r) => (open = r));
 		h.modify("n.md"); // this one parks on the gate, mid-sync
-		await waitFor(() => h.connects() > 1);
+		await waitFor(() => h.exchanges() > 1);
 
 		// Obsidian autosaves twice more while that sync is still in flight.
 		await h.vault.write("n.md", "first, then more");

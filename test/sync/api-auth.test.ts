@@ -123,7 +123,7 @@ describe("every SyncApi method throws ApiError", () => {
 	const cases: [string, (a: SyncApi) => Promise<unknown>][] = [
 		["manifest", (a) => a.manifest()],
 		["search", (a) => a.search("q")],
-		["changesSince", (a) => a.changesSince(0)],
+		["ycrdtSync", (a) => a.ycrdtSync({ items: [{ path: "a.md", sv: "AQ" }] })],
 		["ticket", (a) => a.ticket()],
 		["ycrdtTicket", (a) => a.ycrdtTicket()],
 	];
