@@ -79,9 +79,20 @@ export function readMessage(
 	};
 }
 
-/** Coerce a WebSocket `message` payload (ArrayBuffer or view) to a Uint8Array. */
+/**
+ * Coerce a WebSocket `message` payload (ArrayBuffer or view) to a Uint8Array.
+ *
+ * ⚠️ Dispatches on `ArrayBuffer.isView`, NOT `instanceof ArrayBuffer`. `instanceof` compares
+ * constructors, so it is FALSE for a buffer made in another JavaScript realm — and Obsidian runs
+ * multiple windows, which is why Obsidian's own d.ts ships `Node.instanceOf()`. Measured under a second
+ * realm: `new TextEncoder().encode("ab").buffer instanceof ArrayBuffer` is `false`, so the old form fell
+ * through to the view branch, read `undefined` for `.buffer`/`.byteOffset`/`.byteLength`, and
+ * `new Uint8Array(undefined, undefined, undefined)` returned **length 0** — a silently empty frame
+ * rather than a throw. `isView` asks what the value IS rather than where it came from. ROADMAP G13.
+ */
 export function toBytes(data: ArrayBuffer | ArrayBufferView | string): Uint8Array {
 	if (typeof data === "string") return new Uint8Array(0);
-	if (data instanceof ArrayBuffer) return new Uint8Array(data);
-	return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+	if (ArrayBuffer.isView(data))
+		return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+	return new Uint8Array(data);
 }

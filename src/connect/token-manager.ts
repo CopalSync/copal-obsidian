@@ -1,6 +1,8 @@
+import { log } from "../log";
 import type { Tokens } from "../types";
 import { type Discovery, discover, refresh, revoke, revokeGrant, TokenRefreshError } from "./oauth";
 import type { TokenStore } from "./store";
+import { withBudget } from "../sync/with-timeout";
 
 /** Refresh this long before `expires_at`, so a call in flight does not race the expiry. */
 const REFRESH_SKEW_MS = 60_000;
@@ -24,22 +26,6 @@ export type RevokeOutcome = "revoked" | "nothing-to-revoke" | "failed";
  * ordinary pause-and-resume; `grant` takes the consent too, which is what disconnecting a folder means.
  */
 export type RevokeScope = "token" | "grant";
-
-/** Resolve to `onTimeout` rather than hanging past `ms`. Clears the timer, so a caller inside a test
- *  runner does not keep the event loop alive for the full budget after it resolves. */
-async function withBudget<T>(work: Promise<T>, ms: number, onTimeout: T): Promise<T> {
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	try {
-		return await Promise.race([
-			work,
-			new Promise<T>((resolve) => {
-				timer = setTimeout(() => resolve(onTimeout), ms);
-			}),
-		]);
-	} finally {
-		if (timer !== undefined) clearTimeout(timer);
-	}
-}
 
 export type ReauthReason = "expired" | "revoked" | "no-refresh-token";
 
@@ -286,7 +272,7 @@ export class TokenManager {
 					await revokeGrant(this.deps.f, disc.issuer, token);
 					return "revoked";
 				} catch (err) {
-					console.warn(
+					log.warn(
 						`[copal] grant revoke failed, falling back to token revoke: ${err instanceof Error ? err.message : String(err)}`,
 					);
 				}
@@ -296,7 +282,7 @@ export class TokenManager {
 			await revoke(this.deps.f, endpoint, clientId, token);
 			return "revoked";
 		} catch (err) {
-			console.warn(`[copal] revoke failed: ${err instanceof Error ? err.message : String(err)}`);
+			log.warn("revoke failed:", err);
 			return "failed";
 		}
 	}

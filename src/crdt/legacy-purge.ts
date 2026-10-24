@@ -1,3 +1,5 @@
+import { withBudget } from "../sync/with-timeout";
+
 /**
  * The tenant every install before this change used: a hard-coded literal, never a vault id.
  * @see VaultId in `local-doc-store.ts` for what that cost.
@@ -42,15 +44,7 @@ const INDEX_STORE = "paths";
 export async function purgeLegacyCrdtDocs(
 	budgetMs = 10_000,
 ): Promise<{ names: string[]; completed: boolean }> {
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	const budget = new Promise<{ names: string[]; completed: boolean }>((resolve) => {
-		timer = setTimeout(() => resolve({ names: [], completed: false }), budgetMs);
-	});
-	try {
-		return await Promise.race([purge(), budget]);
-	} finally {
-		if (timer !== undefined) clearTimeout(timer);
-	}
+	return withBudget(purge(), budgetMs, { names: [], completed: false });
 }
 
 async function purge(): Promise<{ names: string[]; completed: boolean }> {

@@ -16,6 +16,14 @@ describe("isAttachmentPath", () => {
 		expect(isAttachmentPath(".obsidian/app.json")).toBe(false);
 		expect(isAttachmentPath(".trash/old.png")).toBe(false);
 	});
+	it("rejects the config folder in any case, and by its 8.3 short name (S1)", () => {
+		// The exact-case `.obsidian/` prefix this replaced let `.Obsidian/plugins/copal/main.js` through,
+		// and on a case-insensitive filesystem that path IS this plugin's own code.
+		expect(isAttachmentPath(".Obsidian/plugins/copal/main.js")).toBe(false);
+		expect(isAttachmentPath(".OBSIDIAN/plugins/copal/main.js")).toBe(false);
+		expect(isAttachmentPath("OBSIDI~1/plugins/copal/main.js")).toBe(false);
+		expect(isAttachmentPath(".Trash/old.png")).toBe(false);
+	});
 	it("rejects a name with control characters (unroutable over HTTP → would 404-loop)", () => {
 		expect(isAttachmentPath("photo (@x)\n18 likes.png")).toBe(false);
 	});
@@ -184,5 +192,128 @@ describe("BinarySync", () => {
 			expect(files.trashed).toContain("cruft.png");
 			expect(api.putFile).not.toHaveBeenCalled();
 		});
+	});
+});
+
+describe("P4 — the stat gate", () => {
+	it("skips the read and hash entirely when neither side has moved", async () => {
+		// ⛔ The whole point of P4. This used to read and FNV-hash EVERY attachment on EVERY reconcile, on
+		// the main thread. In the steady state — which is most reconciles — nothing has changed on either
+		// side, and `TFile.stat` says so for free.
+		const { sync, api, files, cursor } = await build({ local: { "a.png": [1, 2, 3] } });
+		api.server.set("a.png", { bytes: buf([1, 2, 3]), etag: "e1", contentType: "image/png" });
+		await sync.pushLocal("a.png"); // establishes the cursor, including size + mtime
+		const serverEtag = cursor.get("a.png")?.etag;
+		expect(serverEtag).toBeDefined();
+
+		const readsBefore = files.reads;
+		await sync.reconcile([{ path: "a.png", version: serverEtag as string }], "merge");
+		expect(files.reads - readsBefore, "an unchanged attachment must not be read").toBe(0);
+	});
+
+	it("reads when the local file has changed", async () => {
+		const { sync, api, files, cursor } = await build({ local: { "a.png": [1, 2, 3] } });
+		api.server.set("a.png", { bytes: buf([1, 2, 3]), etag: "e1", contentType: "image/png" });
+		await sync.pushLocal("a.png");
+		const serverEtag = cursor.get("a.png")?.etag as string;
+
+		await files.writeBinary("a.png", buf([9, 9, 9, 9])); // a genuine local edit
+		const readsBefore = files.reads;
+		await sync.reconcile([{ path: "a.png", version: serverEtag }], "merge");
+		expect(files.reads - readsBefore, "a changed attachment must be read").toBeGreaterThan(0);
+	});
+
+	it("reads when only the mtime moved, even at the same size", async () => {
+		// Same length, different content is the case a size-only gate would miss.
+		const { sync, api, files, cursor } = await build({ local: { "a.png": [1, 2, 3] } });
+		api.server.set("a.png", { bytes: buf([1, 2, 3]), etag: "e1", contentType: "image/png" });
+		await sync.pushLocal("a.png");
+		const serverEtag = cursor.get("a.png")?.etag as string;
+
+		files.__touch("a.png");
+		const readsBefore = files.reads;
+		await sync.reconcile([{ path: "a.png", version: serverEtag }], "merge");
+		expect(files.reads - readsBefore).toBeGreaterThan(0);
+	});
+
+	it("reads when the SERVER etag moved, even if the local stat is unchanged", async () => {
+		const { sync, api, files, cursor } = await build({ local: { "a.png": [1, 2, 3] } });
+		api.server.set("a.png", { bytes: buf([1, 2, 3]), etag: "e1", contentType: "image/png" });
+		await sync.pushLocal("a.png");
+		void cursor;
+		const readsBefore = files.reads;
+		await sync.reconcile([{ path: "a.png", version: "a-different-etag" }], "merge");
+		expect(files.reads - readsBefore, "the server changing is a reason to look").toBeGreaterThan(0);
+	});
+
+	it("reads when the cursor predates P4 and has no recorded size", async () => {
+		// ⚠️ Conservative on purpose: a missing size means UNKNOWN, never "unchanged". A cursor written by
+		// an older build must not be read as proof that nothing happened.
+		const { sync, api, files, cursor } = await build({ local: { "a.png": [1, 2, 3] } });
+		api.server.set("a.png", { bytes: buf([1, 2, 3]), etag: "e1", contentType: "image/png" });
+		cursor.set("a.png", { etag: "e1", hash: fnv1a(new Uint8Array([1, 2, 3])) }); // no size/mtime
+		const readsBefore = files.reads;
+		await sync.reconcile([{ path: "a.png", version: "e1" }], "merge");
+		expect(files.reads - readsBefore).toBeGreaterThan(0);
+	});
+
+	it("records the stat AFTER writing, so the next gate compares the right mtime", async () => {
+		// Taking the stat before the write would record the pre-write mtime, and the very next reconcile
+		// would then think the file had changed — the gate would never fire.
+		const { sync, api, files, cursor } = await build();
+		api.server.set("a.png", { bytes: buf([7, 7]), etag: "e9", contentType: "image/png" });
+		await sync.pull("a.png");
+		const recorded = cursor.get("a.png");
+		const actual = await files.stat("a.png");
+		expect(recorded?.size).toBe(actual?.size);
+		expect(recorded?.mtime).toBe(actual?.mtime);
+	});
+});
+
+describe("P4 — the size ceiling", () => {
+	const HUGE = 100 * 1024 * 1024;
+
+	it("refuses to push an attachment at or over 100 MB, without reading it", async () => {
+		// ⚠️ The ceiling is about MEMORY: putFile buffers the whole body, and on a phone that allocation
+		// is the process. So the size is checked BEFORE the read, not after.
+		const { sync, api, files } = await build();
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		vi.spyOn(files, "stat").mockResolvedValue({ size: HUGE, mtime: 1 });
+		const readsBefore = files.reads;
+
+		await sync.pushLocal("huge.mp4");
+		expect(files.reads - readsBefore, "it must not allocate the buffer").toBe(0);
+		expect(api.putFile).not.toHaveBeenCalled();
+		expect(warn.mock.calls.flat().join(" "), "a silent skip looks like data loss").toMatch(
+			/skipping attachment over the 100 MB limit/,
+		);
+		warn.mockRestore();
+	});
+
+	it("says the file stays in the vault, so the warning is not alarming", async () => {
+		const { sync, files } = await build();
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		vi.spyOn(files, "stat").mockResolvedValue({ size: HUGE, mtime: 1 });
+		await sync.pushLocal("huge.mp4");
+		expect(warn.mock.calls.flat().join(" ")).toMatch(/stays in your vault but will not sync/);
+		warn.mockRestore();
+	});
+
+	it("warns once per path, not once per reconcile", async () => {
+		const { sync, files } = await build();
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		vi.spyOn(files, "stat").mockResolvedValue({ size: HUGE, mtime: 1 });
+		await sync.pushLocal("huge.mp4");
+		await sync.pushLocal("huge.mp4");
+		await sync.pushLocal("huge.mp4");
+		expect(warn).toHaveBeenCalledTimes(1);
+		warn.mockRestore();
+	});
+
+	it("still syncs a file just under the ceiling", async () => {
+		const { sync, api, files } = await build({ local: { "ok.png": [1, 2] } });
+		vi.spyOn(files, "stat").mockResolvedValue({ size: HUGE - 1, mtime: 1 });
+		await sync.pushLocal("ok.png");
+		expect(api.putFile).toHaveBeenCalledOnce();
 	});
 });

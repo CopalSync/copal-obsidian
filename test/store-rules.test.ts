@@ -12,6 +12,8 @@ import { describe, expect, it } from "vitest";
  * (This file replaces a `smoke.test.ts` that asserted `1 + 1 === 2`.)
  */
 const SRC = join(import.meta.dirname, "..", "src");
+/** The package root, for the manifest/package/versions files the submission is judged on. */
+const ROOT = join(import.meta.dirname, "..");
 
 function sourceFiles(dir: string): string[] {
 	return readdirSync(dir).flatMap((entry) => {
@@ -107,5 +109,104 @@ describe("Obsidian store rules", () => {
 			.filter((f) => /(?:text|name|title|cta|placeholder):\s*"[^"]*—/.test(f.text))
 			.map((f) => f.path);
 		expect(offenders).toEqual([]);
+	});
+
+	it("manifest, package.json and versions.json agree on the version (G9)", () => {
+		// ⛔ They had drifted: manifest said 0.1.36 and package.json said 0.1.0. Nothing noticed, because
+		// nothing compared them — and the release script's byte-compare between the beta and 1.0.0 trees
+		// is only meaningful if the version a build CLAIMS is the version it was cut from.
+		const manifest = JSON.parse(readFileSync(join(ROOT, "manifest.json"), "utf8")) as {
+			version: string;
+			minAppVersion: string;
+		};
+		const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")) as { version: string };
+		expect(pkg.version, "package.json must match manifest.json").toBe(manifest.version);
+
+		const versions = JSON.parse(readFileSync(join(ROOT, "versions.json"), "utf8")) as Record<
+			string,
+			string
+		>;
+		expect(
+			Object.keys(versions),
+			"versions.json must have an entry for the version being shipped",
+		).toContain(manifest.version);
+		expect(
+			versions[manifest.version],
+			"and that entry must claim the same minAppVersion as the manifest",
+		).toBe(manifest.minAppVersion);
+	});
+
+	it("the store description says what it does without naming the host app (G9)", () => {
+		// The directory already tells the reader which app this is for, and the review guidelines ask
+		// plugins not to repeat it. The em dash is the house rule.
+		const manifest = JSON.parse(readFileSync(join(ROOT, "manifest.json"), "utf8")) as {
+			description: string;
+		};
+		expect(manifest.description).not.toMatch(/obsidian/i);
+		expect(manifest.description, "no em dash in anything a reader sees").not.toContain("—");
+		expect(manifest.description.length, "the directory truncates a long one").toBeLessThanOrEqual(
+			250,
+		);
+		expect(manifest.description, "a description is a sentence").toMatch(/\.$/);
+	});
+
+	/**
+	 * ⛔ G1. The register calls the README the likeliest single cause of store rejection, and it is the
+	 * one artefact nothing else checks: it is prose, it is published to the public repo by the release
+	 * script, and a reviewer reads it before anything else.
+	 *
+	 * These assert the DISCLOSURES the developer policies require, not the wording around them.
+	 */
+	describe("the published README (G1)", () => {
+		const readme = readFileSync(join(ROOT, "README.md"), "utf8");
+
+		it("discloses the account, the subscription and the network use", () => {
+			expect(readme, "an account requirement must be stated").toMatch(/account is required/i);
+			expect(readme, "a paid subscription must be stated").toMatch(/subscription is required/i);
+			expect(readme, "where note content goes must be named").toMatch(/api\.copal\.uk/);
+			expect(readme, "and that it is sent at all").toMatch(
+				/sends your note content over the network/i,
+			);
+		});
+
+		it("states that nothing is downloaded or executed, and that there is no telemetry", () => {
+			expect(readme).toMatch(/fetches no code at runtime|nothing is downloaded or executed/i);
+			expect(readme).toMatch(/no analytics or telemetry/i);
+		});
+
+		it("links the privacy policy and the terms", () => {
+			expect(readme).toMatch(/copal\.uk\/privacy/);
+			expect(readme).toMatch(/copal\.uk\/terms/);
+		});
+
+		it("⛔ carries the credential-storage disclosure", () => {
+			// The security scan's C2/C9 row recorded this as already being in the README when it was only
+			// in the settings pane. The consequence — a synced vault carries the sign-in with it — is the
+			// part a reader needs, so assert that and not just the file path.
+			expect(readme).toMatch(/data\.json/);
+			expect(readme, "the consequence, not just the location").toMatch(
+				/sign-in travels with it|travels with any copy/i,
+			);
+			expect(readme, "and that signing out revokes it").toMatch(/revoke/i);
+		});
+
+		it("tells a reader how to install it", () => {
+			expect(readme).toMatch(/community plugins/i);
+			expect(readme, "BRAT is the route until the directory listing exists").toMatch(/BRAT/);
+			expect(readme).toMatch(/manifest\.json/);
+		});
+
+		it("states the Obsidian version it needs, matching the manifest", () => {
+			const manifest = JSON.parse(readFileSync(join(ROOT, "manifest.json"), "utf8")) as {
+				minAppVersion: string;
+			};
+			expect(readme, "a README claiming a different floor than the manifest misleads").toContain(
+				manifest.minAppVersion,
+			);
+		});
+
+		it("has no em dash, like every other thing a reader sees", () => {
+			expect(readme).not.toContain("—");
+		});
 	});
 });

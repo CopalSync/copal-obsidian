@@ -21,61 +21,15 @@ export class TokenStore {
 		return this.data.read().clientId;
 	}
 
-	/** `undefined` discards it, which is how a registration the server has forgotten gets replaced. */
-	async setClientId(id: string | undefined): Promise<void> {
-		await this.data.update((d) => {
-			// `exactOptionalPropertyTypes` is on, so discarding means REMOVING the key rather than setting
-			// it to undefined — the two are different types here and only one of them round-trips as JSON.
-			if (id === undefined) delete d.clientId;
-			else d.clientId = id;
-		});
-	}
-
-	getClientScope(): string | undefined {
-		return this.data.read().clientScope;
-	}
-
-	/**
-	 * Record a fresh registration: the id and the scope it was made with, in ONE write.
-	 *
-	 * One write rather than two because a crash between two sequential mutators would leave an id with
-	 * no scope, which reads as "stale" and re-registers on every connect thereafter. (It used to also
-	 * be a defence against the four other persisters spreading a stale read over it; that hazard is
-	 * gone — there is one record and one writer now — but the crash argument stands.)
-	 */
-	async setClientRegistration(id: string, scope: string): Promise<void> {
-		await this.data.update((d) => {
-			d.clientId = id;
-			d.clientScope = scope;
-		});
-	}
-
-	/**
-	 * Start a connect attempt: mark it pending and, if the stored registration can no longer be
-	 * trusted, discard it — in ONE write rather than two adjacent awaited ones.
-	 *
-	 * The two used to be sequential, and an awaited write cannot coalesce with the next, so every
-	 * connect rewrote the whole record twice before it had even opened the browser.
-	 */
-	async beginConnectAttempt(discardRegistration: boolean): Promise<void> {
-		await this.data.update((d) => {
-			if (discardRegistration) {
-				delete d.clientId;
-				delete d.clientScope;
-			}
-			d.connectAttemptPending = true;
-		});
-	}
-
 	getTokens(): Tokens | undefined {
 		return this.data.read().tokens;
 	}
 
-	/** Sign-in landed: record the credential and clear the attempt mark together, in ONE write. */
-	async completeSignIn(tokens: Tokens): Promise<void> {
+	/** Sign-in landed: record the credential and the client it was issued to, in ONE write. */
+	async completeSignIn(tokens: Tokens, clientId: string): Promise<void> {
 		await this.data.update((d) => {
 			d.tokens = tokens;
-			d.connectAttemptPending = false;
+			d.clientId = clientId;
 		});
 	}
 
@@ -156,33 +110,5 @@ export class TokenStore {
 
 	isConnected(): boolean {
 		return Boolean(this.data.read().tokens?.access_token);
-	}
-
-	/**
-	 * `undefined` means this install has never recorded one — it was written by a build that predates
-	 * the mark — which is NOT the same as `false` and the difference decides whether a stored
-	 * registration can be trusted. See `ConnectFlow.start`.
-	 */
-	getConnectAttemptPending(): boolean | undefined {
-		return this.data.read().connectAttemptPending;
-	}
-
-	/**
-	 * The stable device id, generated + persisted on first use (kept across disconnects).
-	 *
-	 * Async because it may write. The generate-if-absent is now a single synchronous mutation, so two
-	 * concurrent callers can no longer both mint one and disagree about which was stored — the old
-	 * shape suspended on a read between the check and the write.
-	 */
-	async getDeviceId(): Promise<string> {
-		let id = this.data.read().deviceId;
-		if (id === undefined) {
-			const fresh = crypto.randomUUID();
-			await this.data.update((d) => {
-				d.deviceId ??= fresh;
-			});
-			id = this.data.read().deviceId;
-		}
-		return id ?? crypto.randomUUID();
 	}
 }

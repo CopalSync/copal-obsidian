@@ -1,5 +1,5 @@
 import { asTrustedUrl, type TrustedUrl } from "../sync/safe-url";
-import type { ClientReg, PkcePair, Tokens } from "../types";
+import type { PkcePair, Tokens } from "../types";
 
 export const API_BASE = "https://api.copal.uk";
 /**
@@ -18,6 +18,24 @@ export const API_BASE = "https://api.copal.uk";
  */
 export const REDIRECT_URI = "https://copal.uk/plugin/connect";
 /**
+ * This plugin's OAuth client id: the URL of its Client ID Metadata Document, which copal.uk serves.
+ *
+ * ⛔ **It is a URL on purpose, and that is the whole of the consent screen's "Verified by Copal".**
+ * The plugin used to register itself through open dynamic registration, which lets ANY caller choose
+ * any `client_name`, so a stranger could register as "Copal for Obsidian" and get a consent screen
+ * identical to this plugin's. Under CIMD the authorization server fetches this document and the id IS
+ * its address, so a client whose id is on copal.uk can only be one copal.uk published. The console
+ * badges exactly that.
+ *
+ * Nothing is registered, so nothing can go stale: the old recovery for a registration the server had
+ * forgotten, and for one made at a narrower scope, went with it.
+ *
+ * ⚠️ The document is `apps/marketing/public/clients/obsidian.json`, and it must be LIVE before a build
+ * carrying this id ships: an id the server cannot fetch is `invalid_client` at every connect.
+ * `apps/marketing/test/plugin-client.test.ts` holds the document to this file's constants.
+ */
+export const CLIENT_ID = "https://copal.uk/clients/obsidian.json";
+/**
  * ⛔ **`offline_access` IS WHAT BUYS A REFRESH TOKEN. REMOVING IT BREAKS EVERY INSTALL IN AN HOUR.**
  *
  * This read `"vault.read vault.write"` until 2026-09-12, and the consequence was total: Better
@@ -28,10 +46,10 @@ export const REDIRECT_URI = "https://copal.uk/plugin/connect";
  * a silent forever-reconnect that reads as "offline" and is indistinguishable from a dead network.
  * 6550 such 401s in one week, and the only cure a user could find was signing out and back in.
  *
- * ⚠️ Changing this string invalidates a stored client registration. `/oauth2/authorize` validates
- * the requested scope against `client.scopes` as captured at registration, so a client registered
- * with one scope can never be authorized with another — which is why `ConnectFlow.start` discards
- * the registration when this value changes. Do not change it without reading that comment.
+ * ⚠️ What a client may be GRANTED is not decided here, nor by the `scope` in the plugin's client
+ * document (which repeats this string, held there by `apps/marketing/test/plugin-client.test.ts`).
+ * `@better-auth/oauth-provider` 1.7 replaces a CIMD client's scopes with copal-auth's
+ * `OAUTH_REGISTRATION_SCOPES`, so that list must keep `offline_access` for this one to be honoured.
  *
  * Gated by `copal-auth/test/integration/plugin-grant.test.ts`, which drives this exact constant.
  */
@@ -48,7 +66,6 @@ export const SCOPE = "vault.read vault.write offline_access";
 export interface Discovery {
 	/** RFC 8414 identifier of the authorization server, and the origin Copal's own routes live on. */
 	issuer: TrustedUrl;
-	registration_endpoint: TrustedUrl;
 	authorization_endpoint: TrustedUrl;
 	token_endpoint: TrustedUrl;
 	/** RFC 7009. Optional: a server that publishes none must degrade to a local-only sign-out. */
@@ -167,7 +184,6 @@ function validateDiscovery(doc: Record<string, unknown>, base: TrustedUrl): Disc
 	};
 	return {
 		issuer,
-		registration_endpoint: endpoint("registration_endpoint"),
 		authorization_endpoint: endpoint("authorization_endpoint"),
 		token_endpoint: endpoint("token_endpoint"),
 		// Optional by RFC 7009 — absent means sign-out degrades to local-only, present means checked.
@@ -175,34 +191,6 @@ function validateDiscovery(doc: Record<string, unknown>, base: TrustedUrl): Disc
 			? {}
 			: { revocation_endpoint: endpoint("revocation_endpoint") }),
 	};
-}
-
-export async function registerClient(
-	f: typeof fetch,
-	registrationEndpoint: TrustedUrl,
-): Promise<ClientReg> {
-	const res = await trustedFetch(f, registrationEndpoint, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify({
-			client_name: "Copal for Obsidian",
-			redirect_uris: [REDIRECT_URI],
-			// Truthful, and MCP 2026-07-28 requires clients to declare it. `web` would also be accepted
-			// now that REDIRECT_URI is https, but this is a native app and the distinction is what the
-			// server uses to decide which redirect shapes are legal for it.
-			application_type: "native",
-			token_endpoint_auth_method: "none",
-			grant_types: ["authorization_code", "refresh_token"],
-			response_types: ["code"],
-			scope: SCOPE,
-		}),
-	});
-	if (!res.ok) throw new Error(`client registration failed: ${res.status}`);
-	const body = (await res.json()) as { client_id?: unknown };
-	if (typeof body.client_id !== "string" || body.client_id === "") {
-		throw new Error("registration returned no usable client_id");
-	}
-	return { client_id: body.client_id };
 }
 
 export function buildAuthorizeUrl(

@@ -1,5 +1,7 @@
 import "fake-indexeddb/auto";
 import { describe, expect, it } from "vitest";
+import { IndexeddbPersistence } from "y-indexeddb";
+import * as Y from "yjs";
 import { purgeLegacyCrdtDocs } from "../../src/crdt/legacy-purge";
 import { asVaultId, LocalDocStore } from "../../src/crdt/local-doc-store";
 
@@ -17,37 +19,75 @@ async function withoutDatabasesApi(fn: () => Promise<void>): Promise<void> {
 	}
 }
 
+const LEGACY_INDEX_DB = "copal-index";
+const LEGACY_INDEX_STORE = "paths";
+
 /**
- * A pre-upgrade install, built with the very class that built the real ones: the store keyed by the
- * old constant tenant. That produces both halves of the legacy state — the per-note database AND the
- * `copal-index` record under the literal `"vault"` — which a hand-rolled fixture would get subtly
- * wrong.
+ * A pre-upgrade install, built with the LEGACY writers: one y-indexeddb database per note plus the
+ * `copal-index` record, which is exactly what the old store produced.
+ *
+ * ⚠️ This helper used to build the fixture through `LocalDocStore` itself, on the reasoning that it was
+ * "the very class that built the real ones". That was true until P2 rewrote the store to one database
+ * per vault — after which the helper produced the NEW shape, and four tests here went on asserting a
+ * purge of legacy data that no longer existed. A fixture built through the code under change stops
+ * standing for the thing it names, and says nothing when it does.
  */
-function legacyStore(): LocalDocStore {
-	return new LocalDocStore(() => Promise.resolve(asVaultId("vault")));
+async function seedLegacyNote(path: string, text: string): Promise<void> {
+	const doc = new Y.Doc();
+	const provider = new IndexeddbPersistence(`copal:vault:${path}`, doc);
+	await provider.whenSynced;
+	doc.getText("content").insert(0, text);
+	await new Promise((r) => setTimeout(r, 50)); // y-indexeddb writes on its own schedule
+	await provider.destroy();
+	await addLegacyIndexRecord(path);
 }
 
-async function seedLegacyNote(path: string, text: string): Promise<void> {
-	const store = legacyStore();
-	const { doc, whenLoaded } = store.open(path);
-	await whenLoaded;
-	doc.getText("content").insert(0, text);
-	await new Promise((r) => setTimeout(r, 60)); // let y-indexeddb flush
-	store.close(path);
-	await new Promise((r) => setTimeout(r, 30)); // and let the connection close
+/** The `copal-index` record the old store maintained, keyed by the constant tenant. */
+async function addLegacyIndexRecord(path: string): Promise<void> {
+	const db = await new Promise<IDBDatabase>((resolve, reject) => {
+		const req = globalThis.indexedDB.open(LEGACY_INDEX_DB, 1);
+		req.onupgradeneeded = () => req.result.createObjectStore(LEGACY_INDEX_STORE);
+		req.onsuccess = () => resolve(req.result);
+		req.onerror = () => reject(req.error);
+	});
+	await new Promise<void>((resolve, reject) => {
+		const tx = db.transaction(LEGACY_INDEX_STORE, "readwrite");
+		const store = tx.objectStore(LEGACY_INDEX_STORE);
+		const read = store.get("vault");
+		read.onsuccess = () => {
+			const current = (read.result as string[] | undefined) ?? [];
+			store.put([...new Set([...current, path])], "vault");
+		};
+		tx.oncomplete = () => resolve();
+		tx.onerror = () => reject(tx.error);
+	});
+	db.close();
 }
 
 async function names(): Promise<string[]> {
 	return ((await globalThis.indexedDB.databases()) ?? []).map((d) => d.name ?? "");
 }
 
-/** What the legacy `copal-index` record still lists, read the way iOS reads it. */
+/** What the legacy `copal-index` record still lists, read directly rather than through the store. */
 async function legacyIndexRecord(): Promise<string[]> {
-	let listed: string[] = [];
-	await withoutDatabasesApi(async () => {
-		listed = await legacyStore().listPersisted();
-	});
-	return listed;
+	try {
+		const db = await new Promise<IDBDatabase>((resolve, reject) => {
+			const req = globalThis.indexedDB.open(LEGACY_INDEX_DB, 1);
+			req.onupgradeneeded = () => req.result.createObjectStore(LEGACY_INDEX_STORE);
+			req.onsuccess = () => resolve(req.result);
+			req.onerror = () => reject(req.error);
+		});
+		const listed = await new Promise<string[]>((resolve) => {
+			const store = db.transaction(LEGACY_INDEX_STORE, "readonly").objectStore(LEGACY_INDEX_STORE);
+			const read = store.get("vault");
+			read.onsuccess = () => resolve((read.result as string[] | undefined) ?? []);
+			read.onerror = () => resolve([]);
+		});
+		db.close();
+		return listed;
+	} catch {
+		return [];
+	}
 }
 
 describe("purgeLegacyCrdtDocs", () => {
@@ -71,14 +111,19 @@ describe("purgeLegacyCrdtDocs", () => {
 
 	it("leaves a properly keyed vault's documents alone", async () => {
 		const keep = new LocalDocStore(() => Promise.resolve(asVaultId("vlt-keep")));
-		await keep.open("mine.md").whenLoaded;
+		const mine = keep.open("mine.md");
+		await mine.whenLoaded;
+		mine.doc.getText("content").insert(0, "keep me");
+		await keep.flush("mine.md");
 		await seedLegacyNote("theirs.md", "x");
 
 		await purgeLegacyCrdtDocs();
 
-		expect(await names()).toContain("copal:vlt-keep:mine.md");
+		// The properly keyed vault now lives in ONE database named for it; the purge must not touch it.
+		expect(await names()).toContain("copal:vlt-keep");
+		expect(await keep.listPersisted()).toContain("mine.md");
 		expect(await names()).not.toContain("copal:vault:theirs.md");
-		await keep.destroy("mine.md");
+		await keep.destroyAll();
 	});
 
 	it("is idempotent, so a second load is a no-op rather than a second wipe", async () => {

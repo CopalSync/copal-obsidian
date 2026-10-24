@@ -1,3 +1,18 @@
+/*
+ * Copal's two state colours, as tokens. ROADMAP G10.
+ *
+ * They were hard-coded at four call sites, so the status bar and the ribbon could drift apart — and
+ * did not say which amber they meant. `--copal-amber` is the brand amber the shard logo uses;
+ * `--copal-green` is the synced state. Both fall back to Obsidian's own variables where it has an
+ * equivalent, so a theme that restyles those restyles these too.
+ */
+.theme-light,
+.theme-dark,
+:root {
+	--copal-amber: #ef9f2c;
+	--copal-green: var(--color-green, #3fb950);
+}
+
 /* Copal status-bar indicator: the amber shard logo + a standard sync icon that colours by state. */
 .copal-status {
 	display: inline-flex;
@@ -29,13 +44,13 @@
 
 /* Syncing — amber, spinning. */
 .copal-sync.is-sync {
-	color: #ef9f2c;
+	color: var(--copal-amber);
 	animation: copal-spin 0.9s linear infinite;
 }
 
 /* Synced & live — green. */
 .copal-sync.is-live {
-	color: #3fb950;
+	color: var(--copal-green);
 }
 
 /* Ribbon icon — the mobile-visible sync-state surface (mobile has no status bar). Same state colours. */
@@ -43,11 +58,11 @@
 	color: var(--text-muted);
 }
 .copal-ribbon.is-sync {
-	color: #ef9f2c;
+	color: var(--copal-amber);
 	animation: copal-spin 0.9s linear infinite;
 }
 .copal-ribbon.is-live {
-	color: #3fb950;
+	color: var(--copal-green);
 }
 
 @keyframes copal-spin {
@@ -173,7 +188,7 @@
 	cursor: pointer;
 }
 .copal-search-mode.is-active {
-	border-color: #ef9f2c;
+	border-color: var(--copal-amber);
 	color: var(--text-normal);
 	background: var(--background-primary);
 }

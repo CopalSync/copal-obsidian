@@ -13,8 +13,11 @@ export interface ConfirmOptions {
  * A cross-platform confirmation dialog. Replaces `window.confirm`, which is unreliable or blocked on
  * Obsidian **mobile** (and doesn't render inside an already-open Modal). Resolves `true` if the user
  * confirms, `false` on Cancel / Esc / closing the modal. The resolve is idempotent — closing twice can't
- * double-resolve. The button actions (`confirm`/`cancel`) are public so they can be driven directly in
- * unit tests without simulating DOM clicks.
+ * double-resolve.
+ *
+ * `confirm`/`cancel` are the buttons' own handlers. They used to be public so tests could drive them
+ * without a DOM; the tests now click the real buttons, which is what proves the wiring between a button
+ * and its action rather than assuming it.
  */
 export class ConfirmModal extends Modal {
 	private result = false;

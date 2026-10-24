@@ -1,8 +1,10 @@
+import { runBounded } from "../sync/run-bounded";
 import type { SyncApi, YSyncItem, YSyncResult } from "../sync/api";
 import { type BinarySync, isAttachmentPath } from "../sync/binary-sync";
 import { uniqueConflictName } from "../sync/conflict-name";
 import type { MutationQueue } from "../sync/mutation-queue";
 import { safePath } from "../sync/safe-path";
+import { withTimeout } from "../sync/with-timeout";
 import type { VaultWriter } from "../sync/vault";
 import * as Y from "yjs";
 import { base64ToBytes, bytesToBase64 } from "../sync/base64";
@@ -63,7 +65,9 @@ const SERVER_ORIGIN = "server";
  * persists shared history, an offline/closed edit is just an op that merges on connect — no divergence.
  */
 export class CrdtSync {
-	private active: { path: string; peer: CrdtNote; transport: YTransport } | undefined;
+	private active:
+		| { path: string; peer: CrdtNote; transport: YTransport; unpin: () => void }
+		| undefined;
 	/**
 	 * Batches closed-note syncs into pages. Replaces the old per-note transient socket: a page of up to 100
 	 * notes is ONE request and one metered call, against a ticket + WebSocket + 1.5s settle each before.
@@ -94,6 +98,11 @@ export class CrdtSync {
 		this.pager.stop();
 	}
 
+	/** Page again after `stopPaging`, when sync restarts in the same session (see `SyncPager.start`). */
+	startPaging(): void {
+		this.pager.start();
+	}
+
 	/** True while the active note owns this path (so the vault watcher leaves the editor binding alone). */
 	ownsPath(path: string): boolean {
 		return this.active?.path === path;
@@ -121,11 +130,12 @@ export class CrdtSync {
 			this.deps.log?.(`skipping unsyncable path (invalid characters in name): ${path}`);
 			return;
 		}
+		const unpin = this.deps.registry.acquire(path); // the editor's doc must never be evicted
 		const { note, whenLoaded } = this.deps.registry.note(path);
 		await whenLoaded; // the persisted history must be loaded before we send our state vector
 		const transport = await this.transportFor(path);
 		const peer = new CrdtNote(transport, note.doc);
-		this.active = { path, peer, transport };
+		this.active = { path, peer, transport, unpin };
 		// Caught, because `whenSynced()` now REJECTS on a frame the peer could not use (S4) rather than
 		// stalling to the timeout. Unhandled, that would surface as a crash instead of a dead socket.
 		void this.seedAndBind(path, note, peer).catch((err: unknown) => {
@@ -154,9 +164,15 @@ export class CrdtSync {
 		// SYNC FIRST (adopt the server's ops), THEN reconcile the local file — so an existing note isn't
 		// duplicated by seeding the file into an empty doc before its server content has arrived.
 		const wasEmpty = note.text().length === 0;
-		await Promise.race([peer.whenSynced(), new Promise((r) => setTimeout(r, SYNC_TIMEOUT_MS))]);
+		await withTimeout(peer.whenSynced(), SYNC_TIMEOUT_MS);
 		if (this.active?.path !== path) return;
 		await this.reconcileFileAfterSync(note, path, wasEmpty);
+		// ⚠️ Re-checked, because `reconcileFileAfterSync` awaits: the note can be closed, or another
+		// opened, while it runs. `close()` has to be authoritative — a seed that has already been
+		// abandoned must not go on to write the `.md` or bind an editor that has moved on. Without this
+		// second check a straggling seed could land its materialize on top of work done after it was
+		// closed, which is exactly what made the upgrade/conflict-copy test flaky rather than wrong.
+		if (this.active?.path !== path) return;
 		// Only write the .md when the live editor is OUT OF SYNC with the doc (i.e. there's remote content to
 		// project down). When we just seeded the doc FROM the editor (a new note), the editor already matches —
 		// writing the file would reload + race the open editor and could clobber the user's keystrokes. The
@@ -164,6 +180,7 @@ export class CrdtSync {
 		if (this.deps.readActiveText?.(path) !== note.text()) {
 			await note.materialize(); // project the converged doc into the .md
 		}
+		if (this.active?.path !== path) return;
 		this.deps.bind?.(peer);
 	}
 
@@ -175,6 +192,7 @@ export class CrdtSync {
 		if (!this.active) return Promise.resolve();
 		const active = this.active;
 		this.active = undefined;
+		active.unpin();
 		this.deps.unbind?.();
 		active.peer.disconnect(); // closes the socket; does NOT destroy the injected persisted doc
 		return Promise.resolve();
@@ -254,9 +272,7 @@ export class CrdtSync {
 		try {
 			await this.deps.api.deleteNote(path);
 		} catch (err) {
-			this.deps.log?.(
-				`delete propagate failed for ${path}: ${err instanceof Error ? err.message : err}`,
-			);
+			this.deps.log?.(`delete propagate failed for ${path}: ${String(err)}`);
 			// Durably queue the intent so it's replayed on reconnect — a fully-offline delete must not be lost.
 			if (this.deps.queue) {
 				this.deps.queue.enqueueDelete(path);
@@ -330,7 +346,7 @@ export class CrdtSync {
 			await this.deps.registry.rename(oldPath, newPath); // local: transfer the persisted doc lineage old→new
 		} catch (err) {
 			this.deps.log?.(
-				`server move ${oldPath}→${newPath} failed (${err instanceof Error ? err.message : err}); ` +
+				`server move ${oldPath}→${newPath} failed (${String(err)}); ` +
 					`falling back to delete-old + upload-new`,
 			);
 			try {
@@ -361,49 +377,59 @@ export class CrdtSync {
 		const prepared: Array<{ path: string; note: LocalNote; wasEmpty: boolean; adopt: boolean }> =
 			[];
 		const items: YSyncItem[] = [];
-		for (const entry of entries) {
-			if (this.active?.path === entry.path) continue; // the editor binding owns the live note
-			if (safePath(entry.path) === null) continue; // unroutable name — never syncable
-			if (this.pager.isCancelled(entry.path)) continue; // deleted out from under this page
-			// oxlint-disable-next-line no-await-in-loop -- each note's persisted doc must load before we
-			// can read its state vector, and the page is bounded at 100.
-			const { note, whenLoaded } = this.deps.registry.note(entry.path);
-			// oxlint-disable-next-line no-await-in-loop
-			await whenLoaded;
-			const wasEmpty = note.text().length === 0;
-			// A file edit merges BEFORE the exchange when the doc already has history: it is a delta on
-			// shared history, so it can travel in the same round trip. An EMPTY doc must wait until after
-			// (the SYNC-FIRST rule) — seeding the file into a doc the server is about to fill duplicates
-			// the text, which is what `reconcileFileAfterSync` exists to arbitrate.
-			if (entry.readFile && !wasEmpty) {
+		// Pin every path this page touches. The registry's LRU evicts least-recently-used docs to stay
+		// inside its bound, and without a pin it could close a doc this page is mid-exchange on.
+		const release: Array<() => void> = [];
+		try {
+			for (const entry of entries) {
+				if (this.active?.path === entry.path) continue; // the editor binding owns the live note
+				if (safePath(entry.path) === null) continue; // unroutable name — never syncable
+				if (this.pager.isCancelled(entry.path)) continue; // deleted out from under this page
+				// oxlint-disable-next-line no-await-in-loop -- each note's persisted doc must load before we
+				// can read its state vector, and the page is bounded at 100.
+				release.push(this.deps.registry.acquire(entry.path));
+				const { note, whenLoaded } = this.deps.registry.note(entry.path);
 				// oxlint-disable-next-line no-await-in-loop
-				const text = await this.readFileForSync(entry.path);
-				// oxlint-disable-next-line no-await-in-loop
-				if (text !== null) await note.applyFileEdit(text);
+				await whenLoaded;
+				const wasEmpty = note.text().length === 0;
+				// A file edit merges BEFORE the exchange when the doc already has history: it is a delta on
+				// shared history, so it can travel in the same round trip. An EMPTY doc must wait until after
+				// (the SYNC-FIRST rule) — seeding the file into a doc the server is about to fill duplicates
+				// the text, which is what `reconcileFileAfterSync` exists to arbitrate.
+				//
+				// Done for EVERY non-empty note, not only when the caller flagged `readFile`: now that the
+				// file hash is durable, `applyFileEdit` no-ops when the file still matches what we last
+				// wrote, so the read is the check. See `adoptUnseenFileEdits`.
+				if (!wasEmpty) {
+					// oxlint-disable-next-line no-await-in-loop
+					await this.adoptUnseenFileEdits(note, entry.path);
+				}
+				const item: YSyncItem = {
+					path: entry.path,
+					sv: bytesToBase64(Y.encodeStateVector(note.doc)),
+				};
+				const push = this.pushableDiff(note);
+				if (push) item.update = bytesToBase64(push);
+				items.push(item);
+				prepared.push({ path: entry.path, note, wasEmpty, adopt: entry.adopt });
 			}
-			const item: YSyncItem = {
-				path: entry.path,
-				sv: bytesToBase64(Y.encodeStateVector(note.doc)),
-			};
-			const push = this.pushableDiff(note);
-			if (push) item.update = bytesToBase64(push);
-			items.push(item);
-			prepared.push({ path: entry.path, note, wasEmpty, adopt: entry.adopt });
-		}
-		if (items.length === 0) return;
+			if (items.length === 0) return;
 
-		// A throw here (offline, 5xx) propagates to the pager, which re-queues the whole page and backs off.
-		const results = await this.deps.api.ycrdtSync({
-			device: this.deps.deviceId?.() ?? "",
-			items,
-		});
-		// ⚠️ Indexed BY PATH. The response is not promised to be in request order, and pairing by position
-		// would apply one note's ops to another note — silent cross-contamination that every "all paths
-		// present" assertion stays green for.
-		const byPath = new Map(results.map((r) => [r.path, r]));
-		for (const entry of prepared) {
-			// oxlint-disable-next-line no-await-in-loop -- materializing 100 files concurrently is worse
-			await this.applyResult(entry, byPath.get(entry.path));
+			// A throw here (offline, 5xx) propagates to the pager, which re-queues the whole page and backs off.
+			const results = await this.deps.api.ycrdtSync({
+				device: this.deps.deviceId?.() ?? "",
+				items,
+			});
+			// ⚠️ Indexed BY PATH. The response is not promised to be in request order, and pairing by position
+			// would apply one note's ops to another note — silent cross-contamination that every "all paths
+			// present" assertion stays green for.
+			const byPath = new Map(results.map((r) => [r.path, r]));
+			for (const entry of prepared) {
+				// oxlint-disable-next-line no-await-in-loop -- materializing 100 files concurrently is worse
+				await this.applyResult(entry, byPath.get(entry.path));
+			}
+		} finally {
+			for (const unpin of release) unpin();
 		}
 	}
 
@@ -511,7 +537,6 @@ export class CrdtSync {
 			}
 		}
 		await this.reconcileFileAfterSync(note, path, wasEmpty, undefined, adopt);
-		await this.adoptUnseenFileEdits(note, path, wasEmpty);
 		await note.materialize();
 
 		// The acknowledgement, and it must come LAST. With the server's new state vector in hand, does it
@@ -519,7 +544,11 @@ export class CrdtSync {
 		// local ops: seeding a brand-new note from its `.md` happens above, and an ack taken before it
 		// would see an empty doc, conclude the server had everything, and never push the note at all. The
 		// whole bring-existing path depends on this ordering.
-		if (!this.serverCoversOurOps(note)) this.pager.notify(path, { lane: "bulk" });
+		const behind = !this.serverCoversOurOps(note);
+		// Recorded durably, so reconcile can find an unpushed note without loading every document —
+		// and so an edit whose page never ran (offline, then a restart) is still known to be unpushed.
+		note.setDirty(behind);
+		if (behind) this.pager.notify(path, { lane: "bulk" });
 	}
 
 	/**
@@ -566,27 +595,25 @@ export class CrdtSync {
 	}
 
 	/**
-	 * Resolve "what is on disk?" before a materialize is allowed to answer it by assumption.
+	 * Merge whatever is on disk into the doc before the exchange, so a materialize can never answer
+	 * "what is on disk?" by assumption.
 	 *
-	 * `lastHash` is in-memory, so a `LocalNote` created this run knows nothing about its `.md` — and
-	 * `materialize()` used to read that silence as permission to overwrite. Anything that put a newer text
-	 * on disk without the doc hearing about it (an edit made while the plugin was not running, one dropped
-	 * by a crash mid-sync, one made while `syncActive` was false) was therefore reverted silently, with no
-	 * signal anywhere and no way back once the note was closed.
+	 * Anything that put a newer text on the `.md` without the doc hearing about it — an edit made while
+	 * the plugin was not running, one dropped by a crash mid-sync, one made while sync was off — used to
+	 * be reverted silently, with no signal anywhere and no way back once the note was closed.
 	 *
-	 * Reading the file once and routing it through `applyFileEdit` merges the difference through the CRDT
-	 * instead of picking a winner, and no-ops when the two already agree — so the materialize that follows
-	 * can only ever write a converged text.
+	 * ⚠️ **The discriminator is the file HASH, not whether this `LocalNote` is new.** It used to skip
+	 * unless `fileStateUnknown()` — in-memory, so true only for a note first touched this run — and in
+	 * that state it could not tell a newer file from a newer doc, so it merged the file either way and
+	 * could revert freshly-pulled content. With the hash persisted (P2's `docs` record) "the file differs
+	 * from what we last wrote" is a reliable statement that the FILE changed underneath us, and
+	 * `applyFileEdit`'s own guard makes the matching case a no-op. That is what lets docs be evicted at
+	 * all: a reopened note knows what it last wrote, so eviction stops being a data-loss event.
+	 *
+	 * Routing the difference through `applyFileEdit` merges it through the CRDT rather than picking a
+	 * winner, so the materialize that follows can only ever write a converged text.
 	 */
-	private async adoptUnseenFileEdits(
-		note: LocalNote,
-		path: string,
-		wasEmpty: boolean,
-		applyFileText?: string,
-	): Promise<void> {
-		if (applyFileText !== undefined) return; // the caller read the file for us
-		if (wasEmpty) return; // the seed / first-import-divergence branches own this case
-		if (!note.fileStateUnknown()) return; // we wrote the file ourselves, so we know what it holds
+	private async adoptUnseenFileEdits(note: LocalNote, path: string): Promise<void> {
 		const onDisk = await this.readFileSafe(path);
 		if (onDisk.length === 0) return; // missing or unreadable — never push an empty note up
 		await note.applyFileEdit(onDisk);
@@ -654,6 +681,14 @@ export class CrdtSync {
 		// remote-wins semantics — `syncActive` is now true before this runs, so that can happen.
 		for (const path of toPull) this.pager.notify(path, { lane: "bulk", adopt: mode === "adopt" });
 		for (const path of toPush) this.pager.notify(path, { lane: "bulk" });
+		// Notes recorded as holding unpushed ops. Without this, a closed-note edit made offline whose
+		// page never ran — the app quit, say — was never pushed again: it is on the server's side of
+		// neither set above, because the server already knows the path exists.
+		if (mode === "merge") {
+			for (const path of await this.deps.registry.listDirty()) {
+				if (path !== active) this.pager.notify(path, { lane: "bulk" });
+			}
+		}
 		await this.pager.idle();
 		// Bounded exactly like the syncs above. An adopt of a large vault puts every local-only note in
 		// `toRemove`, and an unbounded `Promise.all` would open that many trash operations and IndexedDB
@@ -700,15 +735,3 @@ function isMarkdownPath(path: string): boolean {
 
 /** Max concurrent first-import syncs during reconcile (bounded so a big vault doesn't open N sockets). */
 const RECONCILE_CONCURRENCY = 6;
-
-/** Run `thunks` with at most `limit` in flight; a thrown thunk is swallowed (best-effort populate). */
-async function runBounded(limit: number, thunks: Array<() => Promise<void>>): Promise<void> {
-	let next = 0;
-	const worker = async (): Promise<void> => {
-		while (next < thunks.length) {
-			const idx = next++;
-			await thunks[idx]?.().catch(() => undefined);
-		}
-	};
-	await Promise.all(Array.from({ length: Math.min(limit, thunks.length) }, worker));
-}

@@ -20,8 +20,11 @@ import { InMemoryVault } from "./sync/fake-vault";
  * no longer reading the file itself — lives in `main.ts`, which for a long time nothing could even load.
  * F2 and C14 both survived a green suite for exactly that reason.
  *
- * It does NOT emulate Obsidian: the stub's `App` has no event emitter, so this calls the handler
- * Obsidian's `vault.on("modify", …)` registration calls, with the same argument shape.
+ * ⚠️ It tests the HANDLER, not the registration. This file never runs `onload()` — it injects `crdt`
+ * and `syncActive` directly — so there is no `vault.on("modify", …)` subscription to fire; it calls
+ * `onVaultChange` with the argument shape Obsidian passes. That the registration exists at all, and is
+ * released on unload, is proved in `test/main-layout-ready.test.ts` against the double's real `Events`.
+ * (The double DOES have an event emitter now; it did not when this comment was first written.)
  */
 function pairedTransports(): { a: YTransport; b: YTransport } {
 	const s: {
@@ -65,10 +68,8 @@ let tenant = 0;
 
 function makePlugin(files: Record<string, string>, gate?: () => Promise<void>) {
 	const vault = new InMemoryVault(files);
-	const registry = new LocalNoteRegistry(
-		new LocalDocStore(() => Promise.resolve(asVaultId(`main-t${++tenant}`))),
-		vault,
-	);
+	const vaultId = asVaultId(`main-t${++tenant}`); // stable per plugin, as a linked vault is
+	const registry = new LocalNoteRegistry(new LocalDocStore(() => Promise.resolve(vaultId)), vault);
 	const serverDocs = new Map<string, Y.Doc>();
 	let connects = 0;
 	let exchanges = 0;

@@ -1,3 +1,4 @@
+import { log } from "../log";
 import { ItemView, type WorkspaceLeaf, setIcon } from "obsidian";
 import { ApiError, type SearchHit, type SearchMode } from "../sync/api";
 
@@ -29,6 +30,8 @@ export class CopalSearchView extends ItemView {
 	private mode: SearchMode = "semantic";
 	private query = "";
 	private debounce: ReturnType<typeof setTimeout> | undefined;
+	/** Owned so `onClose` can clear it — an unowned focus timer fires into a detached view (G5). */
+	private focusTimer: ReturnType<typeof setTimeout> | undefined;
 	private seq = 0; // guards against a slow earlier search overwriting a newer one
 	private inputEl!: HTMLInputElement;
 	private resultsEl!: HTMLElement;
@@ -111,11 +114,12 @@ export class CopalSearchView extends ItemView {
 
 		void this.showIdleState();
 		// Defer focus so Obsidian has attached the leaf.
-		window.setTimeout(() => this.inputEl.focus(), 0);
+		this.focusTimer = setTimeout(() => this.inputEl.focus(), 0);
 	}
 
 	override async onClose(): Promise<void> {
 		if (this.debounce !== undefined) clearTimeout(this.debounce);
+		if (this.focusTimer !== undefined) clearTimeout(this.focusTimer);
 	}
 
 	private addModeButton(parent: HTMLElement, mode: SearchMode, label: string): void {
@@ -186,7 +190,7 @@ export class CopalSearchView extends ItemView {
 			 * and searching, which is a thing a person can fix; anything else is ours and a raw
 			 * message helps nobody, so it stays generic and the detail goes to the console.
 			 */
-			console.error("Copal: search failed", err);
+			log.error("search failed", err);
 			const status = err instanceof ApiError ? err.status : undefined;
 			this.renderPrompt(
 				status === 401 || status === 403

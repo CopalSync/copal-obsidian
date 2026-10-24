@@ -1,5 +1,6 @@
+import { log } from "../log";
 import { type App, normalizePath, TFile } from "obsidian";
-import { safePath } from "./safe-path";
+import { isConfigDirPath, safePath } from "./safe-path";
 import type { VaultWriter } from "./vault";
 
 /** Real `VaultWriter` over Obsidian's `app.vault`. Creates parent folders as needed on write. */
@@ -10,13 +11,15 @@ export class ObsidianVault implements VaultWriter {
 	 * Defense-in-depth: every path that reaches a filesystem sink here originates from the server, so
 	 * validate (`safePath`) then canonicalize (`normalizePath`) before touching `app.vault`. `safePath`
 	 * fails closed on traversal/absolute paths (`normalizePath` alone does NOT strip `..`); a rejected path
-	 * returns `null` and the caller no-ops rather than writing outside the vault. The boundary validators
-	 * (`api.ts`/`live.ts`) already vet server paths — this is the last line of defense.
+	 * returns `null` and the caller no-ops rather than writing outside the vault. It also refuses the
+	 * vault's config folder by what `configDir` says it is called now (S1), which `safePath` cannot know.
+	 * The boundary validators (`api.ts`/`live.ts`) already vet server paths — this is the last line of
+	 * defense.
 	 */
 	private resolve(path: string): string | null {
 		const safe = safePath(path);
-		if (safe === null) {
-			console.warn(`[copal] refusing unsafe vault path: ${JSON.stringify(path)}`);
+		if (safe === null || isConfigDirPath(safe, this.app.vault.configDir)) {
+			log.warnOnce(`vault:${path}`, `refusing unsafe vault path: ${JSON.stringify(path)}`);
 			return null;
 		}
 		return normalizePath(safe);

@@ -1,4 +1,6 @@
+import { deviceId } from "./connect/device-id";
 import type { EditorView } from "@codemirror/view";
+import { withBudget, withTimeout } from "./sync/with-timeout";
 import {
 	type App,
 	MarkdownView,
@@ -29,7 +31,9 @@ import {
 import type { PluginDataStore } from "./data/plugin-data-store";
 import { wirePersistence } from "./data/wire-persistence";
 import { CopalSettingTab } from "./settings";
+import { log } from "./log";
 import { ApiError, type SearchHit, type SearchMode, SyncApi, type Vault } from "./sync/api";
+import { userMessage } from "./ui/user-error";
 import type { BinaryCursor } from "./sync/binary-cursor";
 import { BinarySync, isAttachmentPath } from "./sync/binary-sync";
 import { ObsidianBinaryVault } from "./sync/binary-vault";
@@ -61,14 +65,8 @@ function renderGem(parent: HTMLElement): void {
 	for (const { points, fill } of GEM_POLYGONS) g.createSvg("polygon", { attr: { points, fill } });
 }
 
-/** Verbose CRDT logging is opt-in via `localStorage['copal-debug'] = '1'` — off by default (no console spam). */
-function debugEnabled(): boolean {
-	try {
-		return globalThis.localStorage?.getItem("copal-debug") === "1";
-	} catch {
-		return false;
-	}
-}
+/** How long `shutdown()` waits for in-flight sync work before closing the documents underneath it. */
+const SHUTDOWN_DRAIN_MS = 3000;
 
 export default class CopalPlugin extends Plugin {
 	store!: TokenStore;
@@ -82,7 +80,6 @@ export default class CopalPlugin extends Plugin {
 	crdt: CrdtSync | undefined;
 	private vault: ObsidianVault | undefined;
 	private readonly editorBinding = new EditorBinding();
-	private deviceId = "";
 	private syncActive = false;
 	private settingsTab: CopalSettingTab | undefined;
 	private api: SyncApi | undefined;
@@ -125,7 +122,6 @@ export default class CopalPlugin extends Plugin {
 		this.syncState = syncState;
 		const mutationQueue = persistence.mutationQueue;
 		this.mutationQueue = mutationQueue;
-		this.deviceId = await this.store.getDeviceId();
 		/*
 		 * The only teardown hook that can actually await anything. `onunload` is synchronous, so a
 		 * `void flush()` there would be theatre — the app does not wait for it. `Tasks.addPromise` does.
@@ -146,9 +142,9 @@ export default class CopalPlugin extends Plugin {
 			files: new ObsidianBinaryVault(this.app),
 			cursor: binaryCursor,
 			queue: binaryQueue,
-			deviceId: () => this.deviceId,
+			deviceId: () => deviceId(),
 			log: (m) => {
-				if (debugEnabled()) console.debug(`[copal binary] ${m}`);
+				log.debug(`[binary] ${m}`);
 			},
 		});
 		this.binarySync = binarySync;
@@ -161,9 +157,9 @@ export default class CopalPlugin extends Plugin {
 			// Only recorded when it actually finished: marking a timed-out run as done would skip it
 			// forever and leave the shared-tenant databases in place with nothing left to notice them.
 			if (completed) await this.store.markLegacyCrdtPurged();
-			else console.warn("[copal] legacy CRDT purge timed out; will retry on next load");
+			else log.warn("legacy CRDT purge timed out; will retry on next load");
 			if (purged.length > 0) {
-				console.info(
+				log.info(
 					`[copal] discarded ${purged.length} local CRDT document(s) keyed under the old shared ` +
 						`tenant; note files are untouched and sync will rebuild from the server`,
 				);
@@ -181,13 +177,13 @@ export default class CopalPlugin extends Plugin {
 			registry,
 			vault,
 			queue: mutationQueue,
-			deviceId: () => this.deviceId,
+			deviceId: () => deviceId(),
 			binarySync,
 			bind: (peer) => {
 				// Give the human a presence identity so yCollab labels the local user and the agent's caret
 				// reads as distinct. A stable per-device colour distinguishes concurrent devices; the agent
 				// keeps amber. Set before attaching; the Awareness heartbeat keeps it fresh for peers.
-				const color = colorFromId(this.deviceId);
+				const color = colorFromId(deviceId());
 				peer.awareness.setLocalStateField("user", { name: "You", color, colorLight: `${color}33` });
 				const view = this.activeEditorView();
 				if (view) this.editorBinding.attach(view, peer.doc.getText("content"), peer.awareness);
@@ -204,7 +200,7 @@ export default class CopalPlugin extends Plugin {
 				return this.activeEditorView()?.state.doc.toString() ?? null;
 			},
 			log: (m) => {
-				if (debugEnabled()) console.debug(`[copal crdt] ${m}`);
+				log.debug(`[crdt] ${m}`);
 			},
 		});
 		// Desktop status bar: the amber shard + a lucide sync-state icon. Obsidian mobile does NOT render the
@@ -219,7 +215,13 @@ export default class CopalPlugin extends Plugin {
 		this.ribbonIconEl = this.addRibbonIcon("cloud-off", "Copal", (evt) => this.showStatusMenu(evt));
 		this.ribbonIconEl.addClass("copal-ribbon");
 		this.setStatus("idle");
-		this.sync = new SyncClient(api, this.crdt, syncState, (s) => this.setStatus(s));
+		this.sync = new SyncClient(
+			api,
+			this.crdt,
+			syncState,
+			(s) => this.setStatus(s),
+			() => deviceId(),
+		);
 
 		// The magic-link sign-in redirects to obsidian://copal-connect?code=…&state=… — caught here.
 		this.registerObsidianProtocolHandler("copal-connect", async (params) => {
@@ -239,7 +241,7 @@ export default class CopalPlugin extends Plugin {
 				 * outage. Store the token and shout.
 				 */
 				if (!tokens.refresh_token) {
-					console.error(
+					log.error(
 						"[copal] sign-in returned no refresh_token. This session expires in about an hour and cannot renew. Check that SCOPE requests offline_access and that the authorization server still grants it.",
 					);
 					new Notice(
@@ -251,7 +253,8 @@ export default class CopalPlugin extends Plugin {
 				await this.settingsTab?.refresh();
 				void this.startSync(); // fresh bind → the connect flow selects the vault (create vs pull)
 			} catch (err) {
-				new Notice(`Copal connect failed: ${err instanceof Error ? err.message : String(err)}`);
+				log.error("connect failed", err);
+				new Notice(`Copal: ${userMessage(err)}`);
 			}
 		});
 
@@ -267,7 +270,8 @@ export default class CopalPlugin extends Plugin {
 				if (this.sync === undefined) return false;
 				if (checking) return true;
 				void this.sync.syncNow().catch((err: unknown) => {
-					new Notice(`Copal sync failed: ${err instanceof Error ? err.message : String(err)}`);
+					log.error("sync failed", err);
+					new Notice(`Copal: ${userMessage(err)}`);
 				});
 				return true;
 			},
@@ -345,8 +349,34 @@ export default class CopalPlugin extends Plugin {
 		});
 	}
 
+	/**
+	 * Obsidian's unload hook is synchronous, so it can only start the teardown — see {@link shutdown}.
+	 */
 	override onunload(): void {
-		this.stopSync();
+		void this.shutdown();
+	}
+
+	/**
+	 * Release everything this plugin owns (G5).
+	 *
+	 * `onunload` used to call `stopSync()` alone, which closed the active note's socket and stopped the
+	 * change bus — and left every persisted doc resident with its IndexedDB connection open, plus any
+	 * coalesced write unflushed. On a plugin reload (an update, or toggling it off and on) that meant a
+	 * second set of documents and connections alongside the first.
+	 *
+	 * The order is load-bearing: stop accepting work, stop the sockets, let what is already in flight
+	 * finish under a bounded wait, and only then close the documents and the database — a `closeAll()`
+	 * that raced an in-flight page would tear a doc out from under it. The drain is bounded because
+	 * Obsidian is not obliged to wait for us; the `.md` files are the safety net for whatever misses it.
+	 */
+	private async shutdown(): Promise<void> {
+		this.syncActive = false;
+		this.sync?.stop(); // the change bus and its reconnect timer
+		this.crdt?.stopPaging(); // refuse new pages
+		await this.crdt?.close(); // the active note's socket and editor binding
+		// Bounded: a page that cannot reach the server must not hold the unload open.
+		await withBudget(this.crdt?.idle() ?? Promise.resolve(), SHUTDOWN_DRAIN_MS, undefined);
+		await this.registry?.closeAll(); // flush coalesced writes, close every doc, close the database
 	}
 
 	/**
@@ -454,14 +484,14 @@ export default class CopalPlugin extends Plugin {
 			// sync that cannot reach the server is normal (offline). A burst now resolves several queued
 			// waiters, so an uncaught rejection would be logged once per edit rather than once per sync.
 			void this.pushLocalChange(file.path).catch((err: unknown) => {
-				if (debugEnabled()) console.debug(`[copal] local push failed for ${file.path}: ${err}`);
+				log.debug(`local push failed for ${file.path}:`, err);
 			});
 			return;
 		}
 		// A non-`.md` attachment → the file-level last-writer-wins channel (never the text CRDT).
 		if (isAttachmentPath(file.path)) {
 			void this.binarySync?.pushLocal(file.path).catch((err: unknown) => {
-				if (debugEnabled()) console.debug(`[copal binary] push failed for ${file.path}: ${err}`);
+				log.debug(`[binary] push failed for ${file.path}:`, err);
 			});
 		}
 	}
@@ -502,7 +532,7 @@ export default class CopalPlugin extends Plugin {
 			try {
 				await this.crdt?.flushAll();
 			} catch (err) {
-				console.warn(`[copal] sign-out flush failed: ${err instanceof Error ? err.message : err}`);
+				log.warn("sign-out flush failed:", err);
 			}
 		}
 		this.stopSync();
@@ -524,9 +554,7 @@ export default class CopalPlugin extends Plugin {
 			try {
 				await this.crdt?.flushAll();
 			} catch (err) {
-				console.warn(
-					`[copal] disconnect flush failed: ${err instanceof Error ? err.message : err}`,
-				);
+				log.warn("disconnect flush failed:", err);
 			}
 		}
 		this.stopSync();
@@ -551,9 +579,7 @@ export default class CopalPlugin extends Plugin {
 	 */
 	private openForSync(path: string): void {
 		void this.crdt?.open(path).catch((err: unknown) => {
-			console.warn(
-				`[copal] could not open ${path} for sync: ${err instanceof Error ? err.message : err}`,
-			);
+			log.warn(`could not open ${path} for sync:`, err);
 		});
 	}
 
@@ -583,7 +609,7 @@ export default class CopalPlugin extends Plugin {
 		} catch (err) {
 			// `tearDownCredential` deletes the local tokens in a `finally`, so the user IS signed out
 			// even here. Log and carry on: throwing would leave the settings pane mid-sign-out.
-			console.warn(`[copal] revoke failed: ${err instanceof Error ? err.message : err}`);
+			log.warn("revoke failed:", err);
 		}
 		this.tokens = this.newTokenManager();
 		this.reauthPrompted = false;
@@ -628,11 +654,10 @@ export default class CopalPlugin extends Plugin {
 	private async serverReachable(): Promise<boolean> {
 		if (!this.api) return false;
 		try {
-			await Promise.race([
-				this.api.listVaults(),
-				new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 4000)),
-			]);
-			return true;
+			// `withTimeout` clears its timer when the probe wins, which the old inline race did not —
+			// it left a 4s timer alive on every sign-out reachability check.
+			const probe = await withTimeout(this.api.listVaults(), 4000);
+			return !probe.timedOut;
 		} catch {
 			return false;
 		}
@@ -677,7 +702,7 @@ export default class CopalPlugin extends Plugin {
 				 * and it is a developer artefact: somebody whose session expired cannot do anything
 				 * with a number. The status still reaches the console for whoever is debugging.
 				 */
-				console.error("Copal: listVaults failed", err);
+				log.error("Copal: listVaults failed", err);
 				const status = err instanceof ApiError ? err.status : undefined;
 				new Notice(
 					status === 401 || status === 403
@@ -742,7 +767,8 @@ export default class CopalPlugin extends Plugin {
 			await this.startBound("adopt"); // pull the chosen vault down (remote-wins; local files → trash)
 		} catch (err) {
 			this.setStatus("offline");
-			new Notice(`Copal sync failed: ${err instanceof Error ? err.message : String(err)}`);
+			log.error("sync failed", err);
+			new Notice(`Copal: ${userMessage(err)}`);
 		}
 	}
 
@@ -768,6 +794,9 @@ export default class CopalPlugin extends Plugin {
 		// now hand their path to the pager, which queues it behind the import on the `live` lane instead
 		// of dropping it, so opening the gate first is safe as well as correct.
 		this.syncActive = true;
+		// A sign-out or a dead credential stopped paging through `stopSync`, and signing back in lands
+		// here on the same CrdtSync. Without this, every closed note stayed unsynced until a restart.
+		this.crdt?.startPaging();
 		await this.sync?.start(mode);
 		await this.settingsTab?.refresh();
 		const active = this.app.workspace.getActiveFile();
@@ -839,7 +868,8 @@ export default class CopalPlugin extends Plugin {
 				.setIcon("refresh-cw")
 				.onClick(() => {
 					void this.sync?.syncNow().catch((err: unknown) => {
-						new Notice(`Copal sync failed: ${err instanceof Error ? err.message : String(err)}`);
+						log.error("sync failed", err);
+						new Notice(`Copal: ${userMessage(err)}`);
 					});
 				}),
 		);

@@ -1,6 +1,8 @@
 import { type App, Notice, PluginSettingTab, Setting } from "obsidian";
+import { log } from "./log";
 import type CopalPlugin from "./main";
 import { confirmModal } from "./ui/confirm";
+import { userMessage } from "./ui/user-error";
 
 /** Settings tab: a single Connect / Disconnect control reflecting the stored token state. */
 export class CopalSettingTab extends PluginSettingTab {
@@ -58,9 +60,8 @@ export class CopalSettingTab extends PluginSettingTab {
 							try {
 								await this.plugin.flow.start();
 							} catch (err) {
-								new Notice(
-									`Copal sign-in failed: ${err instanceof Error ? err.message : String(err)}`,
-								);
+								log.error("re-auth failed", err);
+								new Notice(`Copal: ${userMessage(err)}`);
 							}
 						}),
 				);
@@ -170,9 +171,8 @@ export class CopalSettingTab extends PluginSettingTab {
 							await this.plugin.flow.start();
 							new Notice("Opening sign-in… finish in your browser.");
 						} catch (err) {
-							new Notice(
-								`Copal connect failed: ${err instanceof Error ? err.message : String(err)}`,
-							);
+							log.error("connect failed", err);
+							new Notice(`Copal: ${userMessage(err)}`);
 						}
 					}),
 			);

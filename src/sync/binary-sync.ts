@@ -1,15 +1,20 @@
+import { log } from "../log";
 import { PreconditionError, type SyncApi } from "./api";
-import type { BinaryCursor } from "./binary-cursor";
+import type { BinaryCursor, BinaryEntry } from "./binary-cursor";
 import { type BinaryFiles, mimeForPath } from "./binary-vault";
 import { uniqueConflictName } from "./conflict-name";
-import { fnv1a } from "./fnv";
+import { fnv1a, fnv1aChunked } from "./fnv";
 import type { MutationQueue } from "./mutation-queue";
+import { runWithinBudget, type SizedTask } from "./run-bounded";
 import { safePath } from "./safe-path";
 
 /** One server entry for reconcile: an attachment path + its R2 etag (the manifest `version`). */
 export interface BinaryManifestEntry {
 	path: string;
 	version: string;
+	/** Server-side byte length, used to budget in-flight memory during reconcile (ROADMAP P4). Optional
+	 *  because a caller may not have it; an unknown size is treated as 0, i.e. never the reason to park. */
+	size?: number;
 }
 
 export interface BinarySyncDeps {
@@ -26,23 +31,39 @@ export interface BinarySyncDeps {
 }
 
 /**
- * True if `path` is a syncable attachment: a non-`.md` vault file that isn't Obsidian config (`.obsidian`)
- * or trash. The markdown/CRDT engine owns `.md`; this is its non-`.md` counterpart. Scope is deliberately
+ * True if `path` is a syncable attachment: a non-`.md` vault file that `safePath` accepts. The
+ * markdown/CRDT engine owns `.md`; this is its non-`.md` counterpart. Scope is deliberately
  * attachments-only — plugin/theme config never leaves the device.
+ *
+ * ⚠️ No prefix checks of its own (S1). It used to exclude `.obsidian/` and `.trash/` by exact-case
+ * prefix, which let `.Obsidian/plugins/copal/main.js` through to a case-insensitive filesystem. `safePath`
+ * refuses every dot-prefixed segment in any case, and a control char in the name (unroutable over HTTP,
+ * so the /file request would 404-loop) too.
  */
 export function isAttachmentPath(path: string): boolean {
-	return (
-		!path.endsWith(".md") &&
-		!path.startsWith(".obsidian/") &&
-		!path.startsWith(".trash/") &&
-		// A control char in the name (e.g. from a shared social post) can't be routed over HTTP — the /file
-		// request 404s — so it's not syncable; skip it rather than retry-loop.
-		safePath(path) !== null
-	);
+	return !path.endsWith(".md") && safePath(path) !== null;
 }
 
 /** Max concurrent transfers during reconcile (bounded so a big vault doesn't open N requests at once). */
 const RECONCILE_CONCURRENCY = 6;
+
+/**
+ * Attachments at or above this are skipped rather than synced. ROADMAP P4.
+ *
+ * ⚠️ The ceiling is about MEMORY, not politeness. `putFile`/`getFile` buffer the whole body, and
+ * `MAX_FILE_BYTES` in `api.ts` already refuses a 100 MB download for the same reason — on a phone that
+ * allocation IS the process. Skipping is loud (a one-time warning) rather than silent, because a file
+ * that never syncs and never says so looks like data loss.
+ */
+const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
+
+/**
+ * Total bytes allowed in flight across concurrent transfers. ROADMAP P4.
+ *
+ * Six concurrent 90 MB attachments is 540 MB resident; the concurrency limit alone cannot see that,
+ * because it counts a 2 KB icon and a 90 MB video as one unit each.
+ */
+const MAX_IN_FLIGHT_BYTES = 64 * 1024 * 1024;
 
 /**
  * File-level last-writer-wins sync for binary attachments (images, PDFs, `.canvas`) — the non-`.md`
@@ -60,22 +81,24 @@ export class BinarySync {
 		const file = await this.deps.api.getFile(path);
 		if (file === null) return; // vanished between the manifest and the fetch
 		await this.deps.files.writeBinary(path, file.bytes);
-		this.deps.cursor.set(path, { etag: file.etag, hash: fnv1a(new Uint8Array(file.bytes)) });
-		await this.deps.cursor.persist();
+		await this.record(path, file.etag, await fnv1aChunked(new Uint8Array(file.bytes)));
 	}
 
 	/** Upload a local attachment if it changed since the last sync. On a 412 (server also changed) it keeps
 	 *  a conflict copy of the local bytes, then last-writer-wins-pulls the server version. */
 	async pushLocal(path: string): Promise<void> {
+		// Check the size BEFORE reading: the point of the ceiling is never to allocate the buffer.
+		const stat = await this.deps.files.stat(path);
+		if (stat !== null && stat.size >= MAX_ATTACHMENT_BYTES)
+			return this.skipTooLarge(path, stat.size);
 		const bytes = await this.readSafe(path);
 		if (bytes === null) return;
-		const hash = fnv1a(new Uint8Array(bytes));
+		const hash = await fnv1aChunked(new Uint8Array(bytes));
 		const known = this.deps.cursor.get(path);
 		if (known?.hash === hash) return; // unchanged since last sync → echo / no-op
 		try {
 			const { etag } = await this.deps.api.putFile(path, bytes, mimeForPath(path), known?.etag);
-			this.deps.cursor.set(path, { etag, hash });
-			await this.deps.cursor.persist();
+			await this.record(path, etag, hash);
 		} catch (err) {
 			if (err instanceof PreconditionError) {
 				await this.resolveConflict(path, bytes);
@@ -129,38 +152,71 @@ export class BinarySync {
 	async reconcile(manifest: BinaryManifestEntry[], mode: "merge" | "adopt"): Promise<void> {
 		await this.drainPending(); // land any offline-queued deletes first, so the manifest is post-delete
 		const serverByPath = new Map(manifest.map((e) => [e.path, e.version]));
+		const serverSize = new Map(manifest.map((e) => [e.path, e.size ?? 0]));
 		const localPaths = new Set(await this.deps.files.list());
-		const tasks: Array<() => Promise<void>> = [];
+		/** Each task carries what it will hold in memory, so the runner can cap total in-flight bytes. */
+		const tasks: SizedTask[] = [];
+		const push = (path: string, run: () => Promise<void>): void => {
+			tasks.push({ bytes: serverSize.get(path) ?? 0, run });
+		};
 
 		for (const [path, etag] of serverByPath) {
 			if (mode === "adopt") {
-				tasks.push(() => this.pull(path)); // remote-first: overwrite local with the server version
+				push(path, () => this.pull(path)); // remote-first: overwrite local with the server version
 				continue;
 			}
 			const known = this.deps.cursor.get(path);
 			if (!localPaths.has(path)) {
-				tasks.push(
+				push(
+					path,
 					known === undefined
 						? () => this.pull(path) // new remote file → download
 						: () => this.deleteLocal(path), // known here but gone locally → local delete → propagate
 				);
 				continue;
 			}
-			tasks.push(() => this.reconcileLocalVsServer(path, etag, known));
+			push(path, () => this.reconcileLocalVsServer(path, etag, known));
 		}
 
 		for (const path of localPaths) {
 			if (serverByPath.has(path)) continue;
 			const known = this.deps.cursor.get(path);
 			if (mode === "adopt" || known !== undefined) {
-				tasks.push(() => this.trashLocal(path)); // adopt cruft, or a known-then-remotely-deleted file
+				push(path, () => this.trashLocal(path)); // adopt cruft, or a known-then-remotely-deleted file
 			} else {
-				tasks.push(() => this.pushLocal(path)); // genuinely-new local file → upload
+				push(path, () => this.pushLocal(path)); // genuinely-new local file → upload
 			}
 		}
 
-		await runBounded(RECONCILE_CONCURRENCY, tasks);
+		await runWithinBudget(RECONCILE_CONCURRENCY, MAX_IN_FLIGHT_BYTES, tasks);
 		await this.deps.cursor.persist();
+	}
+
+	/**
+	 * Record a synced attachment, including the local size/mtime the stat gate compares next time.
+	 *
+	 * ⚠️ The stat is read AFTER the write, not before: writing changes the mtime, so a stat taken first
+	 * would be recorded stale and the gate would miss the very next change.
+	 */
+	private async record(path: string, etag: string, hash: string): Promise<void> {
+		const stat = await this.deps.files.stat(path);
+		this.deps.cursor.set(
+			path,
+			stat === null ? { etag, hash } : { etag, hash, size: stat.size, mtime: stat.mtime },
+		);
+		await this.deps.cursor.persist();
+	}
+
+	/** Warned about once per path per session, so a skipped file is visible without becoming spam. */
+	private readonly warnedTooLarge = new Set<string>();
+
+	private skipTooLarge(path: string, size: number): void {
+		if (this.warnedTooLarge.has(path)) return;
+		this.warnedTooLarge.add(path);
+		const mb = Math.round(size / (1024 * 1024));
+		log.warn(
+			`skipping attachment over the ${MAX_ATTACHMENT_BYTES / (1024 * 1024)} MB limit: ${JSON.stringify(path)} (${mb} MB). It stays in your vault but will not sync.`,
+		);
 	}
 
 	/** Replay durably-queued deletes now connectivity may be back (WS reconnect + the top of reconcile). */
@@ -187,15 +243,34 @@ export class BinarySync {
 		await Promise.all([queue.persist(), this.deps.cursor.persist()]);
 	}
 
-	/** A local file that's also on the server: decide push / pull / conflict from the known cursor. */
+	/**
+	 * A local file that's also on the server: decide push / pull / conflict from the known cursor.
+	 *
+	 * ⚠️ **The stat gate comes first (ROADMAP P4).** This used to read and hash EVERY attachment on EVERY
+	 * reconcile, on the main thread. When the server etag still matches what we last synced AND the local
+	 * file's size and mtime are unchanged, neither side has moved and there is nothing to decide — so it
+	 * returns without touching the bytes. A vault of 2,000 attachments went from 2,000 full reads per
+	 * reconcile to none in the steady state.
+	 *
+	 * The gate is deliberately conservative: a cursor written before P4 has no `size`/`mtime`, and that
+	 * absence means "unknown, so read it", never "unchanged".
+	 */
 	private async reconcileLocalVsServer(
 		path: string,
 		serverEtag: string,
-		known: { etag: string; hash: string } | undefined,
+		known: BinaryEntry | undefined,
 	): Promise<void> {
+		if (known !== undefined && serverEtag === known.etag && known.size !== undefined) {
+			const stat = await this.deps.files.stat(path);
+			if (stat !== null && stat.size === known.size && stat.mtime === known.mtime) {
+				return; // neither side moved — no read, no hash
+			}
+			if (stat !== null && stat.size >= MAX_ATTACHMENT_BYTES)
+				return this.skipTooLarge(path, stat.size);
+		}
 		const bytes = await this.readSafe(path);
 		if (bytes === null) return this.pull(path); // can't read local → take the server copy
-		const localHash = fnv1a(new Uint8Array(bytes));
+		const localHash = await fnv1aChunked(new Uint8Array(bytes));
 		if (known === undefined) return this.reconcileUnknownBoth(path, bytes, localHash);
 		if (serverEtag === known.etag) {
 			if (localHash !== known.hash) await this.pushLocal(path); // local edit, server unchanged → push
@@ -261,16 +336,4 @@ export class BinarySync {
 		queue.dequeue(path);
 		await queue.persist();
 	}
-}
-
-/** Run `thunks` with at most `limit` in flight; a thrown thunk is swallowed (best-effort transfer). */
-async function runBounded(limit: number, thunks: Array<() => Promise<void>>): Promise<void> {
-	let next = 0;
-	const worker = async (): Promise<void> => {
-		while (next < thunks.length) {
-			const idx = next++;
-			await thunks[idx]?.().catch(() => undefined);
-		}
-	};
-	await Promise.all(Array.from({ length: Math.min(limit, thunks.length) }, worker));
 }

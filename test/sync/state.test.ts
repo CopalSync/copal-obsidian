@@ -8,7 +8,7 @@ describe("SyncState", () => {
 	it("starts empty and round-trips lastSeq + knownServer through persist()", async () => {
 		const m = await mem();
 		const s = new SyncState(m.slice);
-		await s.init();
+		s.init();
 		expect(s.lastSeq).toBe(0);
 		expect(s.knownServer).toEqual([]);
 		s.lastSeq = 5;
@@ -19,7 +19,7 @@ describe("SyncState", () => {
 
 	it("loads an existing cursor on init", async () => {
 		const s = new SyncState((await mem({ lastSeq: 3, knownServer: ["x.md"] })).slice);
-		await s.init();
+		s.init();
 		expect(s.lastSeq).toBe(3);
 		expect(s.knownServer).toEqual(["x.md"]);
 	});
@@ -27,7 +27,7 @@ describe("SyncState", () => {
 	it("reset() zeroes the cursor + knownServer and persists (clean disconnect)", async () => {
 		const m = await mem({ lastSeq: 9, knownServer: ["a.md", "b.md"] });
 		const s = new SyncState(m.slice);
-		await s.init();
+		s.init();
 		await s.reset();
 		expect(s.lastSeq).toBe(0);
 		expect(s.knownServer).toEqual([]);
@@ -37,7 +37,7 @@ describe("SyncState", () => {
 	it("back-compat: a pre-upgrade record without knownServer loads as []", async () => {
 		// Older data.json `sync` records only had `{ lastSeq }`.
 		const s = new SyncState((await mem({ lastSeq: 4 } as SyncData)).slice);
-		await s.init();
+		s.init();
 		expect(s.lastSeq).toBe(4);
 		expect(s.knownServer).toEqual([]);
 	});

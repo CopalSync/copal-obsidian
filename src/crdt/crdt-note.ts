@@ -48,6 +48,20 @@ export class CrdtNote {
 	/** Presence for the CM6 binding. Local-only until awareness is relayed over the WS. */
 	readonly awareness: Awareness;
 	private readonly ytext: Y.Text;
+	/**
+	 * Held by reference so {@link disconnect} can remove them (P7).
+	 *
+	 * ⛔ The doc update handler is the one that mattered. It is attached to the **injected, persisted**
+	 * doc, which outlives this peer by design — so every peer left one behind, still firing into a
+	 * transport that had been closed. Opening a series of notes accumulated a handler per note on docs
+	 * the registry keeps resident.
+	 */
+	private readonly onDocUpdate: (update: Uint8Array, origin: unknown) => void;
+	private readonly onAwarenessChange: () => void;
+	private readonly onAwarenessUpdate: (
+		changes: { added: number[]; updated: number[]; removed: number[] },
+		origin: unknown,
+	) => void;
 	/** Whether we created the doc (and must destroy it) — false when a persisted `LocalDocStore` doc is injected. */
 	private readonly ownsDoc: boolean;
 	private synced = false;
@@ -80,7 +94,8 @@ export class CrdtNote {
 		 * constructor has run — and y-protocols calls listeners in registration order. So this one
 		 * normalises the states map before anything draws from it, rather than a moment too late.
 		 */
-		this.awareness.on("change", () => this.normaliseRemotePresence());
+		this.onAwarenessChange = (): void => this.normaliseRemotePresence();
+		this.awareness.on("change", this.onAwarenessChange);
 		// An unobserved rejection is not an error here: a transient peer may be disposed without anyone
 		// ever awaiting `whenSynced()`. Marking it handled keeps that from surfacing as a crash.
 		void this.syncedPromise.catch(() => undefined);
@@ -111,18 +126,20 @@ export class CrdtNote {
 				this.poison(`unusable frame (${err instanceof Error ? err.message : String(err)})`);
 			}
 		});
-		this.doc.on("update", (update: Uint8Array, origin: unknown) => {
+		this.onDocUpdate = (update: Uint8Array, origin: unknown): void => {
 			if (origin !== transport) transport.send(encodeUpdate(update)); // don't echo a remote apply
-		});
+		};
+		this.doc.on("update", this.onDocUpdate);
 		// Relay local presence changes (cursor/user) to peers; skip a change we just applied from a peer.
-		this.awareness.on(
-			"update",
-			(changes: { added: number[]; updated: number[]; removed: number[] }, origin: unknown) => {
-				if (origin === transport) return;
-				const clients = [...changes.added, ...changes.updated, ...changes.removed];
-				transport.send(encodeAwareness(this.awareness, clients));
-			},
-		);
+		this.onAwarenessUpdate = (
+			changes: { added: number[]; updated: number[]; removed: number[] },
+			origin: unknown,
+		): void => {
+			if (origin === transport) return;
+			const clients = [...changes.added, ...changes.updated, ...changes.removed];
+			transport.send(encodeAwareness(this.awareness, clients));
+		};
+		this.awareness.on("update", this.onAwarenessUpdate);
 		// (Re)handshake on every (re)connect — so after a reconnect the socket re-syncs (offline ops flush).
 		transport.onOpen(() => {
 			// A reconnect is a clean slate: the state vector below re-derives what this peer is missing,
@@ -162,17 +179,29 @@ export class CrdtNote {
 	 * Normalising the value was the other option; deriving it is stronger, because there is then nothing
 	 * to get the sanitiser wrong about. The colour is ours to choose and a stable function of the client
 	 * id, so peers stay distinguishable without being able to say how. Our own state is left alone.
+	 *
+	 * ⚠️ It must be TOTAL: a peer's state is whatever JSON it sent. This used to assign into `user` in
+	 * place, so `user: null` (or a string, a number, a boolean) threw inside Awareness's change event,
+	 * which has no try/catch. That aborted the loop, leaving a later peer in the same frame with the
+	 * colours it chose, and reached the unusable-frame handler, which closed this note's socket for
+	 * good. So a `user` of any type is REPLACED with an object built here, and a state that is not an
+	 * object at all is skipped.
 	 */
 	private normaliseRemotePresence(): void {
 		const mine = this.awareness.clientID;
 		for (const [clientId, state] of this.awareness.getStates()) {
-			if (clientId === mine) continue;
-			const user = (state as { user?: Record<string, unknown> }).user;
-			if (user === undefined) continue;
-			user.color = colorFromId(clientId);
-			user.colorLight = colorLightFromId(clientId);
-			user.name =
-				typeof user.name === "string" ? user.name.slice(0, MAX_PEER_NAME) : "Someone else";
+			if (clientId === mine || typeof state !== "object" || state === null) continue;
+			const peer = state as { user?: unknown };
+			if (peer.user === undefined) continue;
+			const name =
+				typeof peer.user === "object" && peer.user !== null
+					? (peer.user as { name?: unknown }).name
+					: undefined;
+			peer.user = {
+				name: typeof name === "string" ? name.slice(0, MAX_PEER_NAME) : "Someone else",
+				color: colorFromId(clientId),
+				colorLight: colorLightFromId(clientId),
+			};
 		}
 	}
 
@@ -198,6 +227,11 @@ export class CrdtNote {
 		// they drop our caret immediately instead of waiting ~30s for yCollab's outdatedTimeout. Explicit and
 		// ordered — not left to rely on `awareness.destroy()`'s internal `setLocalState(null)` firing in time.
 		this.awareness.setLocalState(null);
+		// Remove what this peer attached, in the reverse of the order it was attached. `awareness.destroy()`
+		// drops its own observers, but the DOC's handler is on a doc that survives this peer.
+		this.awareness.off("update", this.onAwarenessUpdate);
+		this.awareness.off("change", this.onAwarenessChange);
+		this.doc.off("update", this.onDocUpdate);
 		this.awareness.destroy(); // then clear the presence heartbeat interval + local state
 		this.transport.close();
 		if (this.ownsDoc) this.doc.destroy(); // a persisted (injected) doc is owned by LocalDocStore

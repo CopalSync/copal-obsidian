@@ -111,6 +111,17 @@ export class SyncPager {
 		return new Promise<void>((resolve) => this.idleWaiters.push(resolve));
 	}
 
+	/**
+	 * Take work again after `stop()`. Sync stops and restarts on the same pager within one session (a
+	 * sign-out and a sign-in), and a pager that could only stop left every closed note unsynced until
+	 * Obsidian restarted. The back-off starts over: whatever it was backing off from belonged to the
+	 * session that stopped.
+	 */
+	start(): void {
+		this.stopped = false;
+		this.backoff = this.base;
+	}
+
 	/** Refuse new work and abandon what is queued; an in-flight page finishes. Lets `idle()` resolve. */
 	stop(): void {
 		this.stopped = true;

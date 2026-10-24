@@ -3,10 +3,6 @@ export interface PkcePair {
 	challenge: string;
 }
 
-export interface ClientReg {
-	client_id: string;
-}
-
 export interface Tokens {
 	access_token: string;
 	refresh_token?: string;

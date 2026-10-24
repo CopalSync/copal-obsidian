@@ -1,9 +1,9 @@
 {
 	"id": "copal",
 	"name": "Copal",
-	"version": "0.1.36",
-	"minAppVersion": "1.5.0",
-	"description": "Connect Obsidian to your Copal vault \u2014 real-time sync of notes and attachments, keep-both conflicts, and by-meaning search.",
+	"version": "0.2.0",
+	"minAppVersion": "1.7.2",
+	"description": "Sync your notes and attachments to a hosted Copal vault in real time, with keep-both conflict copies and search across your whole vault by meaning.",
 	"author": "Bison Labs Limited",
 	"authorUrl": "https://copal.uk",
 	"isDesktopOnly": false

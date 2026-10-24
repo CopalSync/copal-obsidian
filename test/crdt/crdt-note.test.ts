@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
+import { Awareness, applyAwarenessUpdate, encodeAwarenessUpdate } from "y-protocols/awareness";
 import { CrdtNote, type YTransport } from "../../src/crdt/crdt-note";
 
 /**
@@ -268,6 +269,43 @@ describe("CrdtNote: a peer does not get to choose how it is drawn", () => {
 		await settle();
 
 		expect(String(remoteStateOn(mine)?.user?.name).length).toBeLessThanOrEqual(64);
+	});
+
+	it("survives a peer whose user is not an object, and still redraws the peer after it", () => {
+		// The normaliser assigned `user.color = …` on anything that was not undefined, so `user: null`
+		// (or a string, a number, a boolean) threw inside Awareness's change event, which has no
+		// try/catch. That aborted the loop, so a peer later in the same frame kept the colours it chose.
+		const { a } = pairedTransports();
+		const mine = new CrdtNote(a);
+		const relay = new Awareness(new Y.Doc());
+		const bad = [null, "x", 0, true];
+		const ids = bad.map((_, i) => 9000 + i);
+		for (const [i, user] of bad.entries()) {
+			relay.states.set(ids[i] as number, { user });
+			relay.meta.set(ids[i] as number, { clock: 1, lastUpdated: Date.now() });
+		}
+		relay.states.set(9100, { user: { name: "Peer", color: "red;x", colorLight: "url(x)" } });
+		relay.meta.set(9100, { clock: 1, lastUpdated: Date.now() });
+		const frame = encodeAwarenessUpdate(relay, [...ids, 9100]);
+
+		expect(() => applyAwarenessUpdate(mine.awareness, frame, "remote")).not.toThrow();
+		const after = mine.awareness.getStates().get(9100) as { user?: Record<string, unknown> };
+		expect(after.user?.color).toMatch(/^#[0-9A-Fa-f]{6}$/);
+		expect(after.user?.colorLight).toMatch(/^#[0-9A-Fa-f]{6,8}$/);
+	});
+
+	it("keeps the note's socket open when a peer sends a malformed presence", async () => {
+		// The throw reached CrdtNote's unusable-frame handler, which closes the transport for good: the
+		// note silently stopped syncing until it was closed and reopened.
+		const { a, b } = pairedTransports();
+		const close = vi.spyOn(a, "close");
+		const mine = new CrdtNote(a);
+		const peer = new CrdtNote(b);
+		peer.awareness.setLocalStateField("user", null);
+		await settle();
+
+		expect(close, "a peer's presence closed our socket").not.toHaveBeenCalled();
+		expect(remoteStateOn(mine), "the peer's state never arrived").toBeDefined();
 	});
 
 	it("leaves our own presence alone", async () => {

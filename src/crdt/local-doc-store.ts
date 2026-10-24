@@ -1,26 +1,16 @@
-import { IndexeddbPersistence } from "y-indexeddb";
+import * as idb from "lib0/indexeddb";
 import * as Y from "yjs";
-
-interface Entry {
-	doc: Y.Doc;
-	/**
-	 * Resolves once the y-indexeddb provider exists. Deferred, because the database NAME needs the
-	 * linked vault id and that is an async read of `data.json`.
-	 */
-	provider: Promise<IndexeddbPersistence>;
-	whenLoaded: Promise<void>;
-}
+import { DocDb, type DocRecord, mergeRows } from "./doc-db";
 
 /**
  * The Copal vault a local doc belongs to, proven rather than asserted.
  *
- * ⛔ **THIS TYPE EXISTS TO STOP ONE SPECIFIC BUG COMING BACK.** The store has always keyed databases
- * `copal:${tenant}:${path}` and a test has always asserted that shape, but production passed the
- * literal string `"vault"` for the tenant, so every install shared one namespace. Obsidian desktop
- * loads every vault window from the same `app://obsidian.md` origin, so two folders linked to
- * different Copal vaults (or different accounts) shared every database and the `copal-index` record:
- * note contents crossed accounts, same-path notes converged into one document, and a disconnect in
- * one folder destroyed the other's history.
+ * ⛔ **THIS TYPE EXISTS TO STOP ONE SPECIFIC BUG COMING BACK.** The store keys its storage by vault, and
+ * a test has always asserted that shape, but production once passed the literal string `"vault"`, so
+ * every install shared one namespace. Obsidian desktop loads every vault window from the same
+ * `app://obsidian.md` origin, so two folders linked to different Copal vaults (or different accounts)
+ * shared everything: note contents crossed accounts, same-path notes converged into one document, and a
+ * disconnect in one folder destroyed the other's history.
  *
  * A branded type makes that regression a **compile** error rather than something review has to catch.
  * `new LocalDocStore("vault")` does not typecheck, and CI runs `pnpm typecheck` across the workspace.
@@ -40,45 +30,101 @@ export function asVaultId(raw: string | undefined): VaultId {
 	if (raw === undefined || raw.trim() === "") {
 		throw new Error("no linked Copal vault: this folder has nothing to persist against");
 	}
-	// `:` separates the key's three parts, so an id containing one could be read back as a path
-	// prefix by `enumerateDatabases`. Server-minted ids are `vlt_<uuid>`, so this only ever fires on
-	// something malformed.
+	// `:` separates the database name's parts, so an id containing one could collide with another
+	// vault's namespace. Server-minted ids are `vlt_<uuid>`, so this only fires on something malformed.
 	if (raw.includes(":")) throw new Error(`malformed vault id: ${raw}`);
 	return raw as VaultId;
 }
 
+/** Coalescing window for local updates: one transaction per burst of keystrokes, not per keystroke. */
+const WRITE_COALESCE_MS = 250;
+/** Compact a note's log once it grows past this many rows. */
+const COMPACT_ROWS = 500;
+/** Compact on close when a note is cheap to tidy, so a reopen is one row rather than dozens. */
+const COMPACT_ON_CLOSE_ROWS = 50;
+
 /**
- * Per-note persistent local Y.Doc store — the local-first spine. Each note's Yjs update log is persisted
- * client-side in IndexedDB (via y-indexeddb), so an edit — offline, closed, or active — is an op on shared
- * history that survives a reload with **no server round-trip**. This makes the client symmetric with the
- * server DO (which persists the same per-note log); the `.md` file is this doc's projection. Keyed
- * `copal:${vaultId}:${path}` so vaults are isolated — see `VaultId` for why that is load-bearing and
- * why it is a branded type. IndexedDB is a browser global present in Obsidian's Electron renderer and
- * the mobile Capacitor webview (tests shim it with `fake-indexeddb`).
+ * Origin tag for updates this store applies while loading a doc, so its own writes never come back
+ * through the update handler and get re-persisted.
+ */
+const PERSISTENCE_ORIGIN = Object.freeze({ persistence: true });
+/** Ops that arrived from the server are not local work, so they must not mark a note dirty. */
+const SERVER_ORIGIN = "server";
+
+interface Entry {
+	doc: Y.Doc;
+	whenLoaded: Promise<void>;
+	record: DocRecord;
+	unsubscribe: () => void;
+	/** Updates awaiting their coalesced write. */
+	pending: Uint8Array[];
+	timer: ReturnType<typeof setTimeout> | undefined;
+	/** In-flight flush, so `close`/`flush` can await the write actually landing. */
+	writing: Promise<void>;
+	dirtied: boolean;
+}
+
+/**
+ * Per-note persistent local Y.Doc store — the local-first spine. Every note's Yjs update log lives in
+ * **one IndexedDB database per vault** (`copal:${vaultId}`, two stores keyed by path), so an edit —
+ * offline, closed, or active — is an op on shared history that survives a reload with no server round
+ * trip. This makes the client symmetric with the server DO, which persists the same per-note log; the
+ * `.md` file is the doc's projection.
+ *
+ * Replaces one-database-per-note (P2). That scheme never closed or evicted anything, so a large vault
+ * accumulated a database and an open connection per note, and listing them needed
+ * `indexedDB.databases()` — which WebKit does not implement, so iOS needed a second index database to
+ * fall back on. One database per vault removes all three problems at once: `paths()` is a `getAllKeys`,
+ * and desktop and iOS run the same code.
+ *
+ * Writes are coalesced in a {@link WRITE_COALESCE_MS} window and merged with `Y.mergeUpdates`, so a burst
+ * of keystrokes is one transaction. Logs compact at {@link COMPACT_ROWS}, and on close past
+ * {@link COMPACT_ON_CLOSE_ROWS}.
  */
 export class LocalDocStore {
 	private readonly entries = new Map<string, Entry>();
 	/** In-flight teardowns, so `open` can wait one out instead of racing it. Keyed by path. */
 	private readonly closing = new Map<string, Promise<void>>();
-	private readonly index: PersistedIndex;
-	private vaultIdPromise: Promise<VaultId> | undefined;
+	private dbPromise: Promise<DocDb> | undefined;
+	/** The vault the open database belongs to, set and cleared with `dbPromise`. */
+	private openFor: VaultId | undefined;
 
-	constructor(private readonly vaultIdProvider: VaultIdProvider) {
-		this.index = new PersistedIndex(() => this.vaultId());
-	}
+	constructor(private readonly vaultIdProvider: VaultIdProvider) {}
 
 	/**
-	 * The vault id, resolved once.
+	 * The database of the vault linked NOW, with the one-time import from the per-note scheme already
+	 * run.
 	 *
-	 * ⚠️ A FAILURE IS NOT CACHED, the same way `PersistedIndex.db()` does not cache a failed open: an
-	 * unlinked folder throws here, and it can be linked a moment later without a reload.
+	 * ⛔ **The id is read on every call, never memoised.** It used to be resolved once for the life of the
+	 * store, and `main.ts` keeps one store for the whole session while `resetLocalVaultState` wipes it
+	 * with the OLD vault still linked. So the wipe pinned the old id, and after a relink to another
+	 * account's vault every pulled note was persisted under the old one, where a later merge reconcile
+	 * for that vault found them and uploaded them into it. `closeAll` and `destroyAll` release the
+	 * database, so the next call opens whichever vault is linked by then.
+	 *
+	 * If the link changes while a database is open, this refuses rather than write under a vault the
+	 * folder no longer belongs to: the `asVaultId` rule, that persisting a note under the wrong vault is
+	 * worse than not persisting it at all.
 	 */
-	private vaultId(): Promise<VaultId> {
-		this.vaultIdPromise ??= this.vaultIdProvider().catch((err: unknown) => {
-			this.vaultIdPromise = undefined;
-			throw err;
-		});
-		return this.vaultIdPromise;
+	private async database(): Promise<DocDb> {
+		const vaultId = await this.vaultIdProvider();
+		if (this.dbPromise === undefined) {
+			this.openFor = vaultId;
+			this.dbPromise = (async () => {
+				const db = await DocDb.open(vaultId);
+				await importLegacyDatabases(db, vaultId);
+				return db;
+			})().catch((err: unknown) => {
+				this.dbPromise = undefined;
+				this.openFor = undefined;
+				throw err;
+			});
+		} else if (this.openFor !== vaultId) {
+			throw new Error(
+				`linked vault changed from ${this.openFor} to ${vaultId}; close the local store first`,
+			);
+		}
+		return this.dbPromise;
 	}
 
 	/** Open (or reuse) a note's persisted local Y.Doc. `whenLoaded` resolves once IndexedDB rehydrates it. */
@@ -86,104 +132,110 @@ export class LocalDocStore {
 		const existing = this.entries.get(path);
 		if (existing) return { doc: existing.doc, whenLoaded: existing.whenLoaded };
 		const doc = new Y.Doc();
-		// ⚠️ Wait out any teardown still running for this path. `close()` is fire-and-forget, so a re-open
-		// that ignored it would build a second `IndexeddbPersistence` on the same database name while the
-		// first was still calling `db.close()` — and the new provider's `whenSynced` can then never
-		// resolve, hanging every caller that awaits `whenLoaded`. Latent since `close()` existed; batched
-		// syncing exercises it constantly, because a finished page releases every note it synced.
+		// ⚠️ Wait out any teardown still running for this path, or a re-open races it.
 		const settled = this.closing.get(path) ?? Promise.resolve();
-		// Synchronous signature, async key: the caller gets its `Y.Doc` immediately (editors bind to it
-		// before anything is loaded) while the database name waits on the vault id.
-		const provider = settled
-			.then(() => this.key(path))
-			.then((name) => new IndexeddbPersistence(name, doc));
-		void provider.catch(() => {}); // the real failure surfaces through `whenLoaded`, which callers await
-		const whenLoaded = provider.then((p) => p.whenSynced).then(() => undefined);
-		this.entries.set(path, { doc, provider, whenLoaded });
-		void this.index.add(path); // record it so `listPersisted()` is correct even where `databases()` is absent
-		return { doc, whenLoaded };
+		const entry: Entry = {
+			doc,
+			whenLoaded: Promise.resolve(),
+			record: { path, rows: 0, seq: 0, dirty: 0, serverSv: null, fileHash: "", updatedAt: 0 },
+			unsubscribe: () => undefined,
+			pending: [],
+			timer: undefined,
+			writing: Promise.resolve(),
+			dirtied: false,
+		};
+		entry.whenLoaded = (async () => {
+			await settled;
+			const db = await this.database();
+			const loaded = await db.load(path);
+			entry.record = loaded.record;
+			// One transaction, and tagged with our own origin so the handler below does not re-persist it.
+			if (loaded.updates.length > 0) {
+				doc.transact(() => {
+					for (const update of loaded.updates) Y.applyUpdate(doc, update, PERSISTENCE_ORIGIN);
+				}, PERSISTENCE_ORIGIN);
+			}
+			const handler = (update: Uint8Array, origin: unknown): void => {
+				if (origin === PERSISTENCE_ORIGIN) return; // our own load, coming back around
+				entry.pending.push(update);
+				if (origin !== SERVER_ORIGIN) entry.dirtied = true;
+				this.arm(path, entry);
+			};
+			doc.on("update", handler);
+			entry.unsubscribe = () => doc.off("update", handler);
+		})();
+		void entry.whenLoaded.catch(() => undefined); // surfaced to callers that await it
+		this.entries.set(path, entry);
+		return { doc, whenLoaded: entry.whenLoaded };
 	}
 
-	/**
-	 * Rename a note's persisted local doc `oldPath` → `newPath`, **preserving its Yjs lineage** (same struct
-	 * client IDs + clocks) rather than starting a fresh doc. Transfers the full state into a new-keyed
-	 * persisted doc, then destroys the old — so a rename keeps the note's CRDT history locally (symmetric with
-	 * the server-side move). The in-memory new entry carries the lineage immediately; y-indexeddb flushes it.
-	 * The persisted index follows automatically: `open(newPath)` adds it, `destroy(oldPath)` removes the old.
-	 */
-	async rename(oldPath: string, newPath: string): Promise<void> {
-		const from = this.open(oldPath);
-		await from.whenLoaded; // the old lineage must be rehydrated before we copy it
-		const to = this.open(newPath);
-		await to.whenLoaded;
-		Y.applyUpdate(to.doc, Y.encodeStateAsUpdate(from.doc)); // carry every struct (same client IDs/clocks)
-		await this.destroy(oldPath);
+	/** Arm (or re-arm) the coalescing window. A burst of keystrokes becomes one write. */
+	private arm(path: string, entry: Entry): void {
+		if (entry.timer !== undefined) clearTimeout(entry.timer);
+		entry.timer = setTimeout(() => {
+			entry.timer = undefined;
+			entry.writing = entry.writing.then(() => this.flushEntry(path, entry)).catch(() => undefined);
+		}, WRITE_COALESCE_MS);
 	}
 
-	/** Stop holding a note in memory + persisting it (the stored data is kept for next open). */
-	close(path: string): void {
+	private async flushEntry(path: string, entry: Entry): Promise<void> {
+		if (entry.pending.length === 0) return;
+		const merged = mergeRows(entry.pending.splice(0));
+		const dirty = entry.dirtied;
+		entry.dirtied = false;
+		const db = await this.database();
+		entry.record = await db.append(path, merged, dirty ? { dirty: 1 } : {});
+		if (entry.record.rows >= COMPACT_ROWS) await this.compact(path, entry);
+	}
+
+	private async compact(path: string, entry: Entry): Promise<void> {
+		const db = await this.database();
+		entry.record = await db.compact(path, Y.encodeStateAsUpdate(entry.doc));
+	}
+
+	/** Land any coalesced writes for `path` now. */
+	async flush(path: string): Promise<void> {
 		const entry = this.entries.get(path);
 		if (!entry) return;
-		this.entries.delete(path);
-		// Fire-and-forget as before, but the provider may not exist yet (its name needed the vault id).
-		// Close it FIRST where it does, so y-indexeddb never flushes into a destroyed doc.
-		// The promise is RECORDED so a re-open of this path can wait it out — see `open`.
-		const done = entry.provider
-			.then(
-				(p) => p.destroy().then(() => entry.doc.destroy()),
-				() => entry.doc.destroy(), // never opened; nothing to close
-			)
-			.catch(() => undefined);
-		this.closing.set(path, done);
-		void done.then(() => {
-			if (this.closing.get(path) === done) this.closing.delete(path);
-		});
+		if (entry.timer !== undefined) {
+			clearTimeout(entry.timer);
+			entry.timer = undefined;
+		}
+		await entry.whenLoaded.catch(() => undefined);
+		entry.writing = entry.writing.then(() => this.flushEntry(path, entry));
+		await entry.writing;
 	}
 
-	/** Permanently delete a note's persisted local data (on a confirmed remote delete / bring-existing purge).
-	 *  Closes any open connection, then **awaits** the actual database deletion — `y-indexeddb`'s `clearData()`
-	 *  fires `deleteDB` without awaiting it, so relying on it leaves the (emptied) DB visible to
-	 *  `listPersisted()` for a beat, and a racing reconcile could re-push it. Awaiting makes `destroy()`
-	 *  authoritative: the doc is gone from `listPersisted()` the moment this resolves. */
-	async destroy(path: string): Promise<void> {
+	/** Land every coalesced write. Used by teardown before the database closes. */
+	async flushAll(): Promise<void> {
+		await Promise.all([...this.entries.keys()].map((path) => this.flush(path)));
+	}
+
+	/** What is known about a note without loading it. */
+	async record(path: string): Promise<DocRecord> {
 		const entry = this.entries.get(path);
 		if (entry) {
-			this.entries.delete(path);
-			try {
-				await (await entry.provider).destroy(); // close the connection so the delete isn't blocked
-			} catch {
-				/* never opened (no vault id): there is no connection to close */
-			}
-			entry.doc.destroy();
+			await entry.whenLoaded.catch(() => undefined);
+			return entry.record;
 		}
-		await this.deleteDb(path);
-		await this.index.remove(path); // keep the persisted index in step with the actual DB deletion
+		return (await this.database()).record(path);
 	}
 
-	/** Permanently delete ALL of this store's persisted docs (a clean disconnect). Enumerates the persisted
-	 *  set ∪ any open entries so nothing is missed, and awaits each deletion. */
-	async destroyAll(): Promise<void> {
-		const paths = new Set([...(await this.listPersisted()), ...this.entries.keys()]);
-		await Promise.all([...paths].map((p) => this.destroy(p)));
-		await this.index.clear(); // belt-and-suspenders: nothing should remain, but never leave stale entries
-	}
-
-	/** Delete the whole per-note database, resolving once done (or if unavailable). */
-	private async deleteDb(path: string): Promise<void> {
-		const idb = globalThis.indexedDB;
-		if (!idb?.deleteDatabase) return;
-		let name: string;
-		try {
-			name = await this.key(path);
-		} catch {
-			return; // no vault id, so no database of ours can exist under one
-		}
-		await new Promise<void>((resolve) => {
-			const req = idb.deleteDatabase(name);
-			req.onsuccess = () => resolve();
-			req.onerror = () => resolve();
-			req.onblocked = () => resolve(); // an open connection elsewhere; the delete completes when it closes
+	/** Patch a note's metadata (the server's state vector, the dirty hint, the file hash). */
+	async setMeta(
+		path: string,
+		patch: { serverSv?: Uint8Array | null; dirty?: boolean; fileHash?: string },
+	): Promise<void> {
+		const db = await this.database();
+		const record = await db.patch(path, {
+			...(patch.serverSv === undefined
+				? {}
+				: { serverSv: patch.serverSv === null ? null : toBuffer(patch.serverSv) }),
+			...(patch.dirty === undefined ? {} : { dirty: patch.dirty ? 1 : 0 }),
+			...(patch.fileHash === undefined ? {} : { fileHash: patch.fileHash }),
 		});
+		const entry = this.entries.get(path);
+		if (entry) entry.record = record;
 	}
 
 	/** Paths currently open in memory. */
@@ -192,157 +244,164 @@ export class LocalDocStore {
 	}
 
 	/**
-	 * Every note that already has a **persisted** local doc (in IndexedDB), whether or not it's open. Lets
-	 * reconcile first-import only the notes the client has never seen — so a steady-state reload syncs
-	 * nothing.
-	 *
-	 * `indexedDB.databases()` is the ground truth where it exists (Chromium/Electron desktop), so we return
-	 * it AND heal the self-owned index to match (this also migrates installs that predate the index). On
-	 * iOS/WebKit `databases()` is **not implemented**, so we fall back to the maintained index — which
-	 * `open()`/`destroy()`/`rename()` keep current — instead of degrading to `[]` (which made reconcile
-	 * needlessly re-sync every note on iOS).
+	 * Every note with persisted local state, open or not. One `getAllKeys` — which is what replaced
+	 * enumerating `indexedDB.databases()` and the separate iOS index database it needed.
 	 */
 	async listPersisted(): Promise<string[]> {
-		if (typeof globalThis.indexedDB?.databases === "function") {
-			const enumerated = await this.enumerateDatabases();
-			await this.index.replace(enumerated); // heal / migrate the index toward ground truth
-			return enumerated;
-		}
-		return this.index.list(); // no databases() (iOS) → the maintained index is authoritative
+		return (await this.database()).paths();
 	}
 
-	/** Persisted paths derived from `indexedDB.databases()` (desktop only). */
-	private async enumerateDatabases(): Promise<string[]> {
-		const prefix = `copal:${await this.vaultId()}:`;
+	/** Notes holding ops the server may not have, read from the index without loading any document. */
+	async listDirty(): Promise<string[]> {
+		return (await this.database()).dirtyPaths();
+	}
+
+	/** Stop holding a note in memory (its stored data is kept for next open). */
+	close(path: string): void {
+		const entry = this.entries.get(path);
+		if (!entry) return;
+		this.entries.delete(path);
+		const done = (async () => {
+			await entry.whenLoaded.catch(() => undefined);
+			if (entry.timer !== undefined) clearTimeout(entry.timer);
+			entry.timer = undefined;
+			await this.flushEntry(path, entry).catch(() => undefined);
+			// Tidy a log that is cheap to tidy, so the next open is one row rather than dozens.
+			if (entry.record.rows > COMPACT_ON_CLOSE_ROWS) {
+				await this.compact(path, entry).catch(() => undefined);
+			}
+			entry.unsubscribe();
+			entry.doc.destroy();
+		})();
+		this.closing.set(path, done);
+		void done.then(() => {
+			if (this.closing.get(path) === done) this.closing.delete(path);
+		});
+	}
+
+	/** Close every open note and the database itself. */
+	async closeAll(): Promise<void> {
+		// oxlint-disable-next-line unicorn/no-useless-spread -- iterating a SNAPSHOT: the body mutates this map
+		for (const path of [...this.entries.keys()]) this.close(path);
+		await Promise.all(this.closing.values());
+		if (this.dbPromise) {
+			const db = await this.dbPromise.catch(() => undefined);
+			db?.close();
+			this.dbPromise = undefined;
+			this.openFor = undefined;
+		}
+	}
+
+	/**
+	 * Rename a note's persisted local doc, **preserving its Yjs lineage** (same struct client ids and
+	 * clocks) rather than starting a fresh doc — symmetric with the server-side move.
+	 */
+	async rename(oldPath: string, newPath: string): Promise<void> {
+		const from = this.open(oldPath);
+		await from.whenLoaded;
+		const to = this.open(newPath);
+		await to.whenLoaded;
+		Y.applyUpdate(to.doc, Y.encodeStateAsUpdate(from.doc)); // carry every struct
+		const carried = await this.record(oldPath);
+		await this.flush(newPath);
+		await this.setMeta(newPath, { fileHash: carried.fileHash, dirty: carried.dirty === 1 });
+		await this.destroy(oldPath);
+	}
+
+	/** Permanently delete a note's persisted local data. */
+	async destroy(path: string): Promise<void> {
+		this.close(path);
+		await this.closing.get(path)?.catch(() => undefined);
+		await (await this.database()).remove(path);
+	}
+
+	/**
+	 * Wipe every persisted local doc for this vault (a clean disconnect). The database that is OPEN, if
+	 * one is, even when the link has moved on since: teardown must not be refused by the check in
+	 * `database()`, or a disconnect after an external relink could never finish.
+	 */
+	async destroyAll(): Promise<void> {
+		// oxlint-disable-next-line unicorn/no-useless-spread -- iterating a SNAPSHOT: the body mutates this map
+		for (const path of [...this.entries.keys()]) this.close(path);
+		await Promise.all(this.closing.values());
+		const db = await (this.dbPromise ?? this.database());
+		await db.destroy();
+		this.dbPromise = undefined;
+		this.openFor = undefined;
+	}
+}
+
+function toBuffer(u8: Uint8Array): ArrayBuffer {
+	const buf = new ArrayBuffer(u8.byteLength);
+	new Uint8Array(buf).set(u8);
+	return buf;
+}
+
+/** y-indexeddb's store name, for reading the databases this replaces. */
+const LEGACY_UPDATES_STORE = "updates";
+/** The iOS-only path index the old scheme needed because WebKit has no `indexedDB.databases()`. */
+const LEGACY_INDEX_DB = "copal-index";
+const LEGACY_INDEX_STORE = "paths";
+/** Import in pages, so a large vault does not hold every legacy doc at once. */
+const IMPORT_PAGE = 50;
+
+/**
+ * One-time import from the per-note databases (`copal:${vaultId}:${path}`) into this vault's single
+ * database, then delete them. An importer that removes its inputs, so it cannot run twice.
+ *
+ * Runs only when the new `docs` store is empty and something legacy exists, so a normal start pays one
+ * `getAllKeys`. Legacy paths come from `indexedDB.databases()` on desktop and from the old `copal-index`
+ * record on iOS — which is the whole reason that database existed.
+ */
+async function importLegacyDatabases(db: DocDb, vaultId: string): Promise<void> {
+	if ((await db.paths()).length > 0) return; // already migrated (or a fresh install that has synced)
+	const prefix = `copal:${vaultId}:`;
+	const paths = await legacyPaths(prefix, vaultId);
+	if (paths.length === 0) return;
+	for (let i = 0; i < paths.length; i += IMPORT_PAGE) {
+		const page = paths.slice(i, i + IMPORT_PAGE);
+		// oxlint-disable-next-line no-await-in-loop -- paged on purpose: bounded memory over speed
+		await Promise.all(page.map((path) => importOne(db, `${prefix}${path}`, path)));
+	}
+	await idb.deleteDB(LEGACY_INDEX_DB).catch(() => undefined);
+}
+
+async function legacyPaths(prefix: string, vaultId: string): Promise<string[]> {
+	if (typeof globalThis.indexedDB?.databases === "function") {
 		const dbs = (await globalThis.indexedDB.databases()) ?? [];
 		return dbs
 			.map((d) => d.name ?? "")
 			.filter((n) => n.startsWith(prefix))
 			.map((n) => n.slice(prefix.length));
 	}
-
-	private async key(path: string): Promise<string> {
-		return `copal:${await this.vaultId()}:${path}`;
+	try {
+		const index = await idb.openDB(LEGACY_INDEX_DB, (raw) => {
+			raw.createObjectStore(LEGACY_INDEX_STORE);
+		});
+		const [store] = idb.transact(index, [LEGACY_INDEX_STORE], "readonly");
+		if (!store) return [];
+		const record = (await idb.get(store, vaultId)) as unknown as string[] | undefined;
+		index.close();
+		return record ?? [];
+	} catch {
+		return []; // no index, nothing to import
 	}
 }
 
-/**
- * A tiny persisted set of the note paths that HAVE a local doc — the iOS-safe replacement for enumerating
- * `indexedDB.databases()` (which iOS/WebKit does not implement). One dedicated IndexedDB database
- * (`copal-index`), object store `paths` keyed by VAULT ID → the array of persisted paths. All operations run
- * through a serial queue so concurrent add/remove can't lose an update (read-modify-write races). Every
- * method fails **open** (errors resolve to a no-op / empty list), so a broken index never blocks the store
- * or throws into the sync engine — the caller's `databases()` path still works on desktop.
- */
-class PersistedIndex {
-	private static readonly DB = "copal-index";
-	private static readonly STORE = "paths";
-	private chain: Promise<unknown> = Promise.resolve();
-	private dbPromise: Promise<IDBDatabase> | undefined;
-
-	/**
-	 * ⚠️ The `copal-index` DATABASE is shared by every vault in the origin; the vault id is the record
-	 * KEY inside it. That is why scoping this key is enough, and why passing a constant meant two
-	 * different vaults read and wrote each other's path list.
-	 */
-	constructor(private readonly vaultId: () => Promise<VaultId>) {}
-
-	add(path: string): Promise<void> {
-		return this.mutate((set) => set.add(path));
-	}
-
-	remove(path: string): Promise<void> {
-		return this.mutate((set) => set.delete(path));
-	}
-
-	clear(): Promise<void> {
-		return this.enqueue(() => this.write([]));
-	}
-
-	/** Overwrite the whole set (used to heal/migrate toward `databases()` ground truth on desktop). */
-	replace(paths: string[]): Promise<void> {
-		return this.enqueue(() => this.write([...new Set(paths)]));
-	}
-
-	list(): Promise<string[]> {
-		return this.enqueue(() => this.read());
-	}
-
-	private mutate(fn: (set: Set<string>) => void): Promise<void> {
-		return this.enqueue(async () => {
-			try {
-				const set = new Set(await this.read());
-				fn(set);
-				await this.write([...set]);
-			} catch {
-				/* fail-open — a broken index must never throw into the store */
-			}
+async function importOne(db: DocDb, legacyName: string, path: string): Promise<void> {
+	try {
+		const legacy = await idb.openDB(legacyName, (raw) => {
+			// Created only if it does not exist, which means there was nothing to import.
+			raw.createObjectStore(LEGACY_UPDATES_STORE, { autoIncrement: true });
 		});
-	}
-
-	/** Serialize every operation so read-modify-write is atomic within this instance. Never rejects. */
-	private enqueue<T>(op: () => Promise<T>): Promise<T> {
-		const run = this.chain.then(op, op);
-		this.chain = run.then(
-			() => undefined,
-			() => undefined,
-		);
-		return run;
-	}
-
-	private read(): Promise<string[]> {
-		return this.tx("readonly", (store, key) => store.get(key)).then(
-			(v) => (Array.isArray(v) ? (v as string[]) : []),
-			() => [],
-		);
-	}
-
-	private write(paths: string[]): Promise<void> {
-		return this.tx("readwrite", (store, key) => store.put(paths, key)).then(
-			() => undefined,
-			() => undefined,
-		);
-	}
-
-	/** Resolves the record key (the vault id) as part of the transaction, so an unlinked folder fails
-	 *  into the same fail-open paths as a broken database rather than throwing into the store. */
-	private async tx<T>(
-		mode: IDBTransactionMode,
-		fn: (store: IDBObjectStore, key: string) => IDBRequest<T>,
-	): Promise<T> {
-		const key = await this.vaultId();
-		const db = await this.db();
-		return new Promise<T>((resolve, reject) => {
-			const req = fn(
-				db.transaction(PersistedIndex.STORE, mode).objectStore(PersistedIndex.STORE),
-				key,
-			);
-			req.onsuccess = () => resolve(req.result);
-			req.onerror = () => reject(req.error ?? new Error("index request failed"));
-		});
-	}
-
-	private db(): Promise<IDBDatabase> {
-		if (!this.dbPromise) {
-			this.dbPromise = new Promise<IDBDatabase>((resolve, reject) => {
-				const idb = globalThis.indexedDB;
-				if (!idb) {
-					reject(new Error("no indexedDB"));
-					return;
-				}
-				const req = idb.open(PersistedIndex.DB, 1);
-				req.onupgradeneeded = () => {
-					if (!req.result.objectStoreNames.contains(PersistedIndex.STORE)) {
-						req.result.createObjectStore(PersistedIndex.STORE);
-					}
-				};
-				req.onsuccess = () => resolve(req.result);
-				req.onerror = () => reject(req.error ?? new Error("index open failed"));
-			}).catch((err) => {
-				this.dbPromise = undefined; // don't cache a failed open — retry next time
-				throw err;
-			});
+		const [store] = idb.transact(legacy, [LEGACY_UPDATES_STORE], "readonly");
+		const rows = store ? ((await idb.getAll(store)) as ArrayBuffer[]) : [];
+		legacy.close();
+		if (rows.length > 0) {
+			await db.append(path, mergeRows(rows.map((b) => new Uint8Array(b))), { dirty: 1 });
 		}
-		return this.dbPromise;
+		await idb.deleteDB(legacyName);
+	} catch {
+		/* a legacy database we cannot read is left alone rather than failing the whole import */
 	}
 }

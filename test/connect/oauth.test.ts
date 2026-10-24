@@ -6,7 +6,6 @@ import {
 	discover,
 	exchangeCode,
 	refresh,
-	registerClient,
 	revoke,
 	REDIRECT_URI,
 } from "../../src/connect/oauth";
@@ -49,7 +48,6 @@ describe("discover", () => {
 	// every endpoint shares that origin. RFC 8414 §3.3 requires the first; `discover` now enforces both.
 	const asMetadata = {
 		issuer: "https://auth.copal.uk",
-		registration_endpoint: "https://auth.copal.uk/oauth2/register",
 		authorization_endpoint: "https://auth.copal.uk/oauth2/authorize",
 		token_endpoint: "https://auth.copal.uk/oauth2/token",
 	};
@@ -95,8 +93,8 @@ describe("discover", () => {
 
 		const d = await discover(f);
 
-		expect(d.registration_endpoint).toBe("https://auth.copal.uk/oauth2/register");
 		expect(f.mock.calls[1]![0]).toBe("https://api.copal.uk/.well-known/oauth-protected-resource");
+		expect(d.token_endpoint).toBe("https://auth.copal.uk/oauth2/token");
 	});
 
 	it("refuses a document that names no authorization server", async () => {
@@ -199,27 +197,6 @@ describe("discover", () => {
 
 			await expect(discover(f)).rejects.toThrow();
 		});
-	});
-});
-
-describe("registerClient", () => {
-	it("registers against the https bounce, not obsidian:// — which 1.7 refuses outright", async () => {
-		const f = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({ client_id: "abc123" }, 201));
-		const reg = await registerClient(f, asTrustedUrl("https://api.copal.uk/register"));
-		expect(reg.client_id).toBe("abc123");
-		const [, init] = f.mock.calls[0]!;
-		const body = JSON.parse(init!.body as string) as {
-			redirect_uris: string[];
-			token_endpoint_auth_method: string;
-			application_type: string;
-		};
-		// A private-use scheme can be claimed by any app, so RFC 8252 §7.1 wants a reverse-domain one
-		// and better-auth 1.7 enforces it — `obsidian://copal-connect` is rejected at registration.
-		// copal.uk/plugin/connect forwards the code inward instead.
-		expect(body.redirect_uris).toEqual([REDIRECT_URI]);
-		expect(REDIRECT_URI).toBe("https://copal.uk/plugin/connect");
-		expect(body.token_endpoint_auth_method).toBe("none");
-		expect(body.application_type).toBe("native");
 	});
 });
 
@@ -354,7 +331,7 @@ describe("the resource indicator", () => {
 });
 
 /** S9. The token and registration bodies were shape-cast: only presence was checked, never type. */
-describe("token and registration responses are typed, not just present", () => {
+describe("token responses are typed, not just present", () => {
 	const tokenFetch = (body: unknown) => vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(body));
 
 	it("refuses an access token that is not a string", async () => {
@@ -389,12 +366,5 @@ describe("token and registration responses are typed, not just present", () => {
 				"r",
 			),
 		).rejects.toThrow(/refresh_token/i);
-	});
-
-	it("refuses a client_id that is not a string", async () => {
-		const f = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({ client_id: 99 }, 201));
-		await expect(registerClient(f, asTrustedUrl("https://auth.copal.uk/r"))).rejects.toThrow(
-			/client_id/i,
-		);
 	});
 });

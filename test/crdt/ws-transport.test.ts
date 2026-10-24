@@ -109,4 +109,47 @@ describe("WsTransport", () => {
 		ws.open(); // when it finally opens, it closes cleanly (sees `closed`)
 		expect(ws.closes).toBe(1);
 	});
+
+	describe("WsTransport — the shared reconnect policy (P8)", () => {
+		it("a scheduled retirement comes back on the BASE delay, not the walked-up one", async () => {
+			// ⚠️ Walk the backoff up first. Straight after a successful open the counter is 0, so a retirement
+			// and an ordinary drop would schedule the same delay and the assertion could not tell them apart.
+			// The gateway retires every socket after 30 minutes by design, so a note left open all day must
+			// not reach the 15s cap through healthy rotations alone.
+			const t = new WsTransport(() => Promise.resolve("wss://api.copal.uk/ycrdt/a.md?ticket=x"));
+			t.connect();
+			await vi.advanceTimersByTimeAsync(0);
+			created.at(-1)?.open();
+
+			for (let i = 0; i < 4; i += 1) {
+				created.at(-1)?.emit("close", {}); // ordinary drops, walking the delay up
+				await vi.advanceTimersByTimeAsync(20_000);
+			}
+			const before = created.length;
+
+			created.at(-1)?.emit("close", { code: 4001 }); // WS_REAUTH_CLOSE
+			await vi.advanceTimersByTimeAsync(1100); // at most the jittered base delay
+			expect(created.length, "a retirement that inherited the backoff would still be waiting").toBe(
+				before + 1,
+			);
+			t.close();
+		});
+
+		it("a closed transport does not reconnect", async () => {
+			// ⚠️ This proves the `closed` flag, NOT that `close()` releases the Reconnector's
+			// online/visibility listeners — removing `reconnector.stop()` leaves this green, because
+			// `closed` already blocks the reconnect on its own. The listener release is what stops a
+			// transport outliving its note while still listening for `online` (the G5 class of leak), and
+			// it is proven where it can be observed: `test/sync/reconnector.test.ts`.
+			const t = new WsTransport(() => Promise.resolve("wss://api.copal.uk/ycrdt/a.md?ticket=x"));
+			t.connect();
+			await vi.advanceTimersByTimeAsync(0);
+			created.at(-1)?.open();
+			created.at(-1)?.emit("close", {});
+			t.close();
+			const after = created.length;
+			await vi.advanceTimersByTimeAsync(60_000);
+			expect(created.length, "a closed transport must not reconnect").toBe(after);
+		});
+	});
 });

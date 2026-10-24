@@ -126,32 +126,18 @@ describe("wirePersistence", () => {
 		expect(d.peek().binary?.known["img.png"]?.etag).toBe("e");
 	});
 
-	it("starting a connect attempt is one write, not two", async () => {
-		const d = fakeDisk({ clientId: "dead", clientScope: "old", connectAttemptPending: true });
+	it("a sign-in lands the tokens and their client in one write", async () => {
+		// Two writes would leave a window in which the tokens on disk belong to a different client from
+		// the id beside them, and a refresh in that window presents the wrong one.
+		const d = fakeDisk({ clientId: "self-registered-by-an-older-build" });
 		const p = await wirePersistence(d.io);
 		const before = d.save.mock.calls.length;
 
-		await p.store.beginConnectAttempt(true);
+		await p.store.completeSignIn({ access_token: "at", refresh_token: "rt" }, "the-plugin");
 
-		expect(
-			d.save.mock.calls.length - before,
-			"discarding the registration and marking the attempt are one decision",
-		).toBe(1);
-		expect(d.peek().clientId).toBeUndefined();
-		expect(d.peek().clientScope).toBeUndefined();
-		expect(d.peek().connectAttemptPending).toBe(true);
-	});
-
-	it("keeps a registration it was not told to discard", async () => {
-		const d = fakeDisk({ clientId: "good", clientScope: "s" });
-		const p = await wirePersistence(d.io);
-
-		await p.store.beginConnectAttempt(false);
-
-		// The falsifier for the test above: a `beginConnectAttempt` that always cleared would pass it
-		// while re-registering the client on every single connect.
-		expect(d.peek().clientId).toBe("good");
-		expect(d.peek().connectAttemptPending).toBe(true);
+		expect(d.save.mock.calls.length - before).toBe(1);
+		expect(d.peek().clientId).toBe("the-plugin");
+		expect(d.peek().tokens?.refresh_token).toBe("rt");
 	});
 
 	it("a queue mutating its own list does not reach the file until it persists", async () => {

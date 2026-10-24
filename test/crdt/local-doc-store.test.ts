@@ -36,7 +36,7 @@ describe("LocalDocStore", () => {
 		expect(b.doc.getText("content").toString()).toBe("shared history"); // content preserved
 		expect(Array.from(Y.encodeStateVector(b.doc))).toEqual(svBefore); // SAME lineage, not a fresh doc
 		expect(await s.listPersisted()).not.toContain("a.md"); // old persisted doc destroyed
-		await s.destroy("b.md");
+		await s.closeAll();
 	});
 
 	it("persists a note's Y.Doc across store instances (survives a reload)", async () => {
@@ -44,15 +44,15 @@ describe("LocalDocStore", () => {
 		const a = s1.open("a.md");
 		await a.whenLoaded;
 		a.doc.getText("content").insert(0, "hi");
-		await new Promise((r) => setTimeout(r, 60)); // let the update flush to IndexedDB
-		s1.close("a.md");
+		await s1.flush("a.md"); // explicit, rather than sleeping past the coalescing window
+		await s1.closeAll();
 
 		// A fresh store (a "reload") rehydrates the same content — no server round-trip.
 		const s2 = new LocalDocStore(vaultIdOf("t1"));
 		const b = s2.open("a.md");
 		await b.whenLoaded;
 		expect(b.doc.getText("content").toString()).toBe("hi");
-		await s2.destroy("a.md");
+		await s2.destroyAll();
 	});
 
 	it("lists persisted notes (so reconcile can skip them)", async () => {
@@ -60,10 +60,9 @@ describe("LocalDocStore", () => {
 		const a = s.open("a.md");
 		await a.whenLoaded;
 		a.doc.getText("content").insert(0, "x");
-		await new Promise((r) => setTimeout(r, 60)); // flush to idb
-		const persisted = await s.listPersisted();
-		expect(persisted).toContain("a.md");
-		await s.destroy("a.md");
+		await s.flush("a.md");
+		expect(await s.listPersisted()).toContain("a.md");
+		await s.destroyAll();
 	});
 
 	it("destroyAll() removes every persisted doc for the store (clean disconnect)", async () => {
@@ -74,82 +73,162 @@ describe("LocalDocStore", () => {
 			await e.whenLoaded;
 			e.doc.getText("content").insert(0, "x");
 		}
-		await new Promise((r) => setTimeout(r, 60)); // flush to idb
+		await s.flushAll();
 		expect((await s.listPersisted()).length).toBe(3);
 		await s.destroyAll();
 		expect(await s.listPersisted()).toEqual([]);
 	});
 
-	it("iOS (no indexedDB.databases): listPersisted() reads the maintained index", async () => {
+	/**
+	 * ⚠️ iOS/WebKit has never implemented `indexedDB.databases()`. The old one-database-per-note scheme
+	 * needed a second database (`copal-index`) purely to list notes there, and the two paths could drift.
+	 * One database per vault makes listing a `getAllKeys`, so desktop and iOS now run the same code — this
+	 * asserts the read path never reaches for `databases()` at all.
+	 */
+	it("lists and mutates notes on iOS, where databases() does not exist", async () => {
 		const s = new LocalDocStore(vaultIdOf("ios1"));
-		const a = s.open("a.md");
-		const b = s.open("dir/b.md");
-		await a.whenLoaded;
-		await b.whenLoaded;
-		await withoutDatabasesApi(async () => {
-			// The serial index queue guarantees the open()-time adds run before this read — no flush wait needed.
-			expect(new Set(await s.listPersisted())).toEqual(new Set(["a.md", "dir/b.md"]));
-		});
-		await s.destroyAll();
-	});
-
-	it("iOS: destroy + rename keep the index correct (no databases() fallback)", async () => {
-		const s = new LocalDocStore(vaultIdOf("ios2"));
-		for (const p of ["a.md", "b.md"]) {
+		for (const p of ["a.md", "dir/b.md"]) {
 			const e = s.open(p);
 			// oxlint-disable-next-line no-await-in-loop
 			await e.whenLoaded;
+			e.doc.getText("content").insert(0, "x");
 		}
+		await s.flushAll();
 		await withoutDatabasesApi(async () => {
+			expect(new Set(await s.listPersisted())).toEqual(new Set(["a.md", "dir/b.md"]));
 			await s.destroy("a.md");
-			expect(await s.listPersisted()).toEqual(["b.md"]);
-			await s.rename("b.md", "c.md");
+			expect(await s.listPersisted()).toEqual(["dir/b.md"]);
+			await s.rename("dir/b.md", "c.md");
 			const after = await s.listPersisted();
 			expect(after).toContain("c.md");
-			expect(after).not.toContain("b.md");
+			expect(after).not.toContain("dir/b.md");
 		});
 		await s.destroyAll();
 	});
 
-	it("desktop: heals the index from databases(), migrating a pre-index install", async () => {
-		// A doc persisted BEFORE the index existed: create its y-indexeddb DB directly, leaving the index empty.
+	/**
+	 * The importer that retires the per-note scheme. Built with the REAL y-indexeddb writer rather than a
+	 * hand-made imitation of its shape, because the thing being tested is whether we can read what it
+	 * actually wrote — a fixture matching my guess at the format would prove nothing.
+	 */
+	it("imports a legacy per-note database, then deletes it", async () => {
 		const tenant = "mig1";
-		const p = new IndexeddbPersistence(`copal:${tenant}:legacy.md`, new Y.Doc());
+		const legacyName = `copal:${tenant}:legacy.md`;
+		const legacyDoc = new Y.Doc();
+		const p = new IndexeddbPersistence(legacyName, legacyDoc);
 		await p.whenSynced;
-		await p.destroy(); // close the connection but keep the DB on disk
-		await new Promise((r) => setTimeout(r, 30));
+		legacyDoc.getText("content").insert(0, "written by the old scheme");
+		await new Promise((r) => setTimeout(r, 50)); // y-indexeddb writes on its own schedule
+		await p.destroy();
 
 		const s = new LocalDocStore(vaultIdOf(tenant));
-		expect(await s.listPersisted()).toContain("legacy.md"); // found via databases() despite the empty index
+		expect(await s.listPersisted()).toContain("legacy.md");
+		const opened = s.open("legacy.md");
+		await opened.whenLoaded;
+		expect(opened.doc.getText("content").toString()).toBe("written by the old scheme");
 
-		// …and the index was healed, so an iOS read now sees it too.
-		await withoutDatabasesApi(async () => {
-			expect(await s.listPersisted()).toContain("legacy.md");
-		});
+		// An importer that removes its inputs, so it cannot run twice or leave the old data behind.
+		const names = (await indexedDB.databases()).map((d) => d.name);
+		expect(names).not.toContain(legacyName);
+		// Imported notes are marked dirty: the server may never have seen them.
+		expect(await s.listDirty()).toContain("legacy.md");
 		await s.destroyAll();
 	});
 
 	it("returns the same live doc for repeated open() of one path", async () => {
-		const s = new LocalDocStore(vaultIdOf("t1"));
+		const s = new LocalDocStore(vaultIdOf("tsame"));
 		const first = s.open("b.md");
 		const second = s.open("b.md");
 		expect(second.doc).toBe(first.doc);
-		await s.destroy("b.md");
+		await s.closeAll();
 	});
 
-	it("isolates tenants (same path, different tenant → different data)", async () => {
+	it("isolates vaults (same path, different vault → different data)", async () => {
 		const sa = new LocalDocStore(vaultIdOf("ta"));
 		const da = sa.open("n.md");
 		await da.whenLoaded;
 		da.doc.getText("content").insert(0, "alpha");
-		await new Promise((r) => setTimeout(r, 60));
-		sa.close("n.md");
+		await sa.flush("n.md");
+		await sa.closeAll();
 
 		const sb = new LocalDocStore(vaultIdOf("tb"));
 		const db = sb.open("n.md");
 		await db.whenLoaded;
-		expect(db.doc.getText("content").toString()).toBe(""); // tenant tb never wrote n.md
-		await sb.destroy("n.md");
-		await new LocalDocStore(vaultIdOf("ta")).destroy("n.md");
+		expect(db.doc.getText("content").toString()).toBe(""); // vault tb never wrote n.md
+		await sb.destroyAll();
+		await new LocalDocStore(vaultIdOf("ta")).destroyAll();
+	});
+
+	/** A burst of keystrokes must be one transaction, not one per character. */
+	it("coalesces a burst of updates into a single row", async () => {
+		const s = new LocalDocStore(vaultIdOf("tcoal"));
+		const a = s.open("n.md");
+		await a.whenLoaded;
+		for (let i = 0; i < 50; i++) a.doc.getText("content").insert(i, "x");
+		await s.flush("n.md");
+
+		expect((await s.record("n.md")).rows).toBeLessThanOrEqual(2);
+		expect(a.doc.getText("content").toString()).toHaveLength(50);
+		await s.destroyAll();
+	});
+
+	it("compacts a long log on close, so the next open is one row", async () => {
+		const s = new LocalDocStore(vaultIdOf("tcomp"));
+		const a = s.open("n.md");
+		await a.whenLoaded;
+		// 60 separate flushed writes, past the close-time compaction threshold of 50.
+		for (let i = 0; i < 60; i++) {
+			a.doc.getText("content").insert(0, "y");
+			// oxlint-disable-next-line no-await-in-loop -- one row per write is the point here
+			await s.flush("n.md");
+		}
+		expect((await s.record("n.md")).rows).toBe(60);
+
+		s.close("n.md");
+		await s.closeAll();
+
+		const again = new LocalDocStore(vaultIdOf("tcomp"));
+		expect((await again.record("n.md")).rows).toBe(1);
+		const reopened = again.open("n.md");
+		await reopened.whenLoaded;
+		expect(reopened.doc.getText("content").toString()).toHaveLength(60);
+		await again.destroyAll();
+	});
+
+	/**
+	 * ⛔ The record that makes eviction safe. `LocalNote.lastHash` was in-memory only, so a closed and
+	 * reopened note reported `fileStateUnknown()` and `adoptUnseenFileEdits` merged the older `.md` back
+	 * over freshly-pulled content. P1 had to abandon its per-page doc release for exactly that.
+	 */
+	it("persists the server state vector and the file hash across a close", async () => {
+		const s = new LocalDocStore(vaultIdOf("tmeta"));
+		const a = s.open("n.md");
+		await a.whenLoaded;
+		a.doc.getText("content").insert(0, "body");
+		await s.flush("n.md");
+		await s.setMeta("n.md", { serverSv: new Uint8Array([1, 2, 3]), fileHash: "abc", dirty: false });
+		await s.closeAll();
+
+		const again = new LocalDocStore(vaultIdOf("tmeta"));
+		const rec = await again.record("n.md");
+		expect(new Uint8Array(rec.serverSv ?? new ArrayBuffer(0))).toEqual(new Uint8Array([1, 2, 3]));
+		expect(rec.fileHash).toBe("abc");
+		expect(rec.dirty).toBe(0);
+		expect(await again.listDirty()).not.toContain("n.md");
+		await again.destroyAll();
+	});
+
+	it("marks a locally edited note dirty, and a server-applied one not", async () => {
+		const s = new LocalDocStore(vaultIdOf("tdirty"));
+		const local = s.open("local.md");
+		const remote = s.open("remote.md");
+		await Promise.all([local.whenLoaded, remote.whenLoaded]);
+
+		local.doc.getText("content").insert(0, "mine");
+		remote.doc.transact(() => remote.doc.getText("content").insert(0, "theirs"), "server");
+		await s.flushAll();
+
+		expect(await s.listDirty()).toEqual(["local.md"]);
+		await s.destroyAll();
 	});
 });

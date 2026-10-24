@@ -12,29 +12,13 @@ import type { Tokens } from "../types";
  * REMOVE keys, and only a removal round-trips through JSON as an absence.
  */
 export interface PersistedData {
-	/** The dynamically-registered OAuth client id — kept across disconnects so re-connect reuses it.
-	 *  ⚠️ DISCARDED when a connect attempt is started while `connectAttemptPending` is still set: see
-	 *  the note on `ConnectFlow.start`. A registration the server has forgotten is otherwise a dead
-	 *  end with no way out from inside the plugin. */
-	clientId?: string;
 	/**
-	 * The scope `clientId` was REGISTERED with — the registration's identity, not a preference.
-	 *
-	 * ⛔ `/oauth2/authorize` validates the requested scope against `client.scopes` as captured at
-	 * registration, so a client registered with one scope can never be authorized with another: it
-	 * is refused with `invalid_scope` before any redirect we can observe. Reusing a registration is
-	 * therefore only safe when it was made with the scope we are about to ask for, and this field is
-	 * how `ConnectFlow.start` knows. `undefined` means "registered before this was recorded", which
-	 * is not the same as "matches" — see the migration note there.
+	 * The OAuth client `tokens` were issued to, which every refresh and revoke must present: the plugin's
+	 * own `CLIENT_ID` once it has connected under it, or the id an older build registered for itself,
+	 * until its next connect.
 	 */
-	clientScope?: string;
-	/** Set when a connect attempt opens the browser, cleared when the callback lands. Still set at
-	 *  the start of the next attempt means the last one died somewhere the plugin cannot see —
-	 *  `/oauth2/authorize` refusing an unknown client never reaches our redirect. */
-	connectAttemptPending?: boolean;
+	clientId?: string;
 	tokens?: Tokens;
-	/** A stable id for this install, stamped into conflict-copy names and the presence colour. */
-	deviceId?: string;
 	/** The Copal vault this Obsidian folder is linked to — sent as `X-Copal-Vault`. Set while connected;
 	 *  a linked folder resumes on reload/re-auth. **Disconnect clears it** (fully unlink) → the next login
 	 *  shows the adopt screen. */
@@ -80,14 +64,12 @@ export interface PluginDataIo {
  *
  * These are the account-scoped facts that legitimately travel with a synced vault. Everything absent
  * from this list is deliberately absent:
- *  - `deviceId` is cached into a field at load and an adoption would desynchronise it;
- *  - `connectAttemptPending` belongs to a browser hop happening on THIS device;
  *  - `sync`, `pending`, `binary` and `binaryPending` describe this device's relationship to the server.
  *    Adopting another device's `lastSeq` would skip journal frames this client never applied, and its
  *    `binary.known` would skip pulls for files this device does not have.
  *  - `tokens` is handled separately and asymmetrically — see `reloadExternal`.
  */
-const ADOPTABLE = ["clientId", "clientScope", "vaultId", "vaultName", "legacyCrdtPurged"] as const;
+const ADOPTABLE = ["clientId", "vaultId", "vaultName", "legacyCrdtPurged"] as const;
 
 /** The single key the write queue is serialised on. There is one file, so there is one key. */
 const THE_FILE = "data.json";

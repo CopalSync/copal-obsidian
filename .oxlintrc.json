@@ -1,0 +1,90 @@
+{
+	"$schema": "./node_modules/oxlint/configuration_schema.json",
+	"plugins": ["typescript", "unicorn", "oxc", "import", "vitest"],
+	"categories": {
+		"correctness": "error",
+		"suspicious": "warn",
+		"perf": "warn"
+	},
+	"env": {
+		"builtin": true,
+		"browser": true,
+		"es2024": true
+	},
+	"rules": {
+		// ⛔ ROADMAP G7. Everything logs through `src/log.ts`, which gates verbose output behind
+		// `localStorage['copal-debug']` and de-duplicates the per-file warnings that used to repeat on
+		// every reconcile. A rule nothing can route around is the only kind that stays true — `log.ts`
+		// itself is the one exemption, below.
+		"no-console": "error",
+		"no-unused-vars": [
+			"error",
+			{
+				"argsIgnorePattern": "^_",
+				"varsIgnorePattern": "^_",
+				"caughtErrorsIgnorePattern": "^_"
+			}
+		],
+		// Side-effect imports (`fake-indexeddb/auto`, test setup) are intentional.
+		"import/no-unassigned-import": "off",
+		// Asserting that something throws, without coupling to an exact message, is valid.
+		"vitest/require-to-throw-message": "off",
+		// Typed mocks are a fair style, but turning this on means rewriting 40+ pre-existing call sites
+		// across files this row did not touch — a config change should not smuggle in a sweep. The rule
+		// the roadmap asked for is `no-console`, above, which IS on and clean.
+		"vitest/require-mock-type-parameters": "off",
+		// `expect-expect` cannot see an assertion made inside a shared helper, and
+		// `test/sync/vault-contract.ts` is deliberately built that way — one contract, two implementations.
+		"vitest/expect-expect": "off",
+		// Asserting in `beforeAll` is right for a fixture: the live suite creates a throwaway vault, and a
+		// failure to create it must stop the file rather than make every test fail for an unrelated reason.
+		"vitest/no-standalone-expect": "off",
+		// `__`-prefixed members are this codebase's deliberate test-seam convention (`__put`, `__seed`,
+		// `__setRequestUrl`): visibly not production API, and greppable as a group.
+		"no-underscore-dangle": "off",
+		// `new Notice(...)` for its side effect is Obsidian's own documented API shape.
+		"no-new": "off",
+		// ⛔ Do NOT act on these two. They suggest `toSorted()`/`toReversed()`, which are ES2023 —
+		// `tsconfig.json`'s `lib` is ES2022, so taking the advice FAILS `pnpm typecheck` while vitest runs
+		// it happily. Worse, the pre-commit hook runs `oxlint --fix`, so leaving them on meant the
+		// AUTOFIXER broke the build on commit, which is how this was found. Use `[...x].sort()` /
+		// `x.slice().reverse()` where a copy is wanted.
+		"unicorn/no-array-sort": "off",
+		"unicorn/no-array-reverse": "off",
+		// Sequential awaits are deliberate throughout the sync paths — ordering and gentleness on the
+		// network are the point, and each site already carries a comment saying so.
+		"no-await-in-loop": "off",
+		"typescript/no-floating-promises": "error",
+		"typescript/no-misused-promises": "error",
+		"typescript/await-thenable": "error",
+		// Off: clashes with async methods implementing a Promise-returning port.
+		"typescript/require-await": "off",
+		"typescript/no-unsafe-type-assertion": "off",
+		"typescript/no-unnecessary-type-assertion": "off",
+		"typescript/no-unnecessary-type-arguments": "off",
+		"typescript/no-unnecessary-type-conversion": "off",
+		"typescript/no-unnecessary-boolean-literal-compare": "off",
+		"typescript/consistent-return": "off",
+		// Yjs' `Y.Text` DOES declare `toString()`, but tsgolint resolves it to Object's and flags every
+		// `${ytext}` in the CRDT tests. The alternative is wrapping a dozen assertions in `.toJSON()` to
+		// satisfy a rule that is wrong about this type.
+		"typescript/no-base-to-string": "off"
+	},
+	"overrides": [
+		{
+			"files": ["src/log.ts"],
+			"rules": { "no-console": "off" }
+		},
+		{
+			"files": ["test/**", "tools/**"],
+			"rules": { "no-console": "off" }
+		}
+	],
+	"ignorePatterns": [
+		"main.js",
+		"node_modules",
+		// Untyped dev harnesses that are never built or shipped (G12). Type-aware rules have no types to
+		// work from here, so they only produce noise.
+		"tools"
+	]
+}

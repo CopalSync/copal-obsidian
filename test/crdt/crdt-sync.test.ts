@@ -150,7 +150,7 @@ function makeSync(
 				sv: bytesToBase64(Y.encodeStateVector(doc)),
 			});
 		}
-		return out.reverse();
+		return out.slice().reverse();
 	};
 	const crdt = new CrdtSync({
 		api: {
@@ -430,7 +430,7 @@ describe("CrdtSync (local-first op-sync)", () => {
 
 	it("a fully-offline rename durably queues the old-path delete and keeps the old doc (no resurrect)", async () => {
 		const { q } = await makeQueue();
-		await q.init();
+		q.init();
 		const { crdt, registry, vault } = makeSync(
 			{ "old.md": "hello" },
 			{ queue: q },
@@ -717,7 +717,7 @@ describe("CrdtSync (local-first op-sync)", () => {
 describe("CrdtSync — durable delete queue (offline mutation durability)", () => {
 	it("deleteLocal enqueues + persists the delete when the server delete fails, and re-throws", async () => {
 		const { q, peek } = await makeQueue();
-		await q.init();
+		q.init();
 		const { crdt, registry } = makeSync(
 			{ "d.md": "x" },
 			{ queue: q },
@@ -738,7 +738,7 @@ describe("CrdtSync — durable delete queue (offline mutation durability)", () =
 
 	it("drainPending replays a queued delete: deletes server-side, drops the doc, dequeues", async () => {
 		const { q } = await makeQueue({ deletes: ["gone.md"] });
-		await q.init();
+		q.init();
 		// Post-offline-delete state: the .md is gone but its persisted doc was KEPT + the delete queued.
 		const { crdt, registry, deleted } = makeSync({}, { queue: q });
 		const { note, whenLoaded } = registry.note("gone.md");
@@ -755,7 +755,7 @@ describe("CrdtSync — durable delete queue (offline mutation durability)", () =
 
 	it("drainPending is idempotent — an empty queue is a no-op", async () => {
 		const { q } = await makeQueue();
-		await q.init();
+		q.init();
 		const { crdt, deleted } = makeSync({}, { queue: q });
 		await crdt.drainPending();
 		await crdt.drainPending();
@@ -764,7 +764,7 @@ describe("CrdtSync — durable delete queue (offline mutation durability)", () =
 
 	it("drainPending KEEPS a queued delete when the server delete still fails (still offline)", async () => {
 		const { q } = await makeQueue({ deletes: ["gone.md"] });
-		await q.init();
+		q.init();
 		const { crdt, registry } = makeSync(
 			{},
 			{ queue: q },
@@ -784,7 +784,7 @@ describe("CrdtSync — durable delete queue (offline mutation durability)", () =
 
 	it("drainPending supersedes a queued delete whose .md was re-created locally (local wins)", async () => {
 		const { q } = await makeQueue({ deletes: ["back.md"] });
-		await q.init();
+		q.init();
 		// The user re-created the note: its .md is back on disk. The stale delete intent must be dropped, NOT
 		// sent (else the re-creation would be deleted). Doc-presence is not the signal — a queued delete keeps
 		// its doc — the .md file is.
@@ -798,7 +798,7 @@ describe("CrdtSync — durable delete queue (offline mutation durability)", () =
 
 	it("reconcile drains pending deletes before reconciling", async () => {
 		const { q } = await makeQueue({ deletes: ["gone.md"] });
-		await q.init();
+		q.init();
 		const { crdt, registry, deleted } = makeSync({}, { queue: q }); // manifest empty (server has nothing)
 		const { note, whenLoaded } = registry.note("gone.md");
 		await whenLoaded;
@@ -1024,6 +1024,22 @@ describe("P6: a local edit is never lost", () => {
  * P1 at scale. The old path minted a ticket and opened a WebSocket per closed note, then slept 1.5s:
  * 10k notes took ~53 minutes and ~10k metered calls, which a solo plan (2,000/day) cannot finish.
  */
+describe("sync restarted in the same session", () => {
+	it("a reconcile after stopPaging and startPaging syncs closed notes again", async () => {
+		// The sign-out → sign-in path in `main.ts`: `stopSync` stops paging, and `startBound` starts the
+		// SAME CrdtSync again. Paging used to stay stopped, so the reconcile sent nothing and every closed
+		// note sat unsynced until Obsidian restarted.
+		const { crdt, serverDocs, pages } = makeSync({ "closed.md": "written while signed out" });
+		crdt.stopPaging();
+		crdt.startPaging();
+
+		await crdt.reconcile([], "merge");
+
+		expect(pages.flat()).toContain("closed.md");
+		expect(serverText(serverDocs, "closed.md")).toBe("written while signed out");
+	});
+});
+
 describe("P1: closed notes sync in pages", () => {
 	it("syncs 500 notes in a handful of exchanges, opening no sockets at all", async () => {
 		const files: Record<string, string> = {};
@@ -1046,7 +1062,10 @@ describe("P1: closed notes sync in pages", () => {
 		for (let i = 0; i < 500; i++) {
 			expect(serverText(serverDocs, `n${i}.md`)).toBe(`body ${i}`);
 		}
-	});
+		// ⚠️ An explicit budget. 500 notes is a few hundred ms alone, but it sat just inside the 5s
+		// default and timed out once the suite grew — a test that passes alone and fails under load
+		// is the kind that shows up as a random CI failure and gets re-run rather than read.
+	}, 30_000);
 
 	/**
 	 * ⛔ The lost-edit guarantee, at burst scale. Obsidian autosaves repeatedly while a page is in flight,

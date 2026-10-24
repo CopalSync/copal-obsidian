@@ -1,53 +1,97 @@
-# Copal for Obsidian
+# Copal
 
-The native plugin. Real-time sync of notes and attachments between an Obsidian vault and a hosted
-Copal vault, keep-both conflict handling, one-tap connect, and a "search by meaning" pane that calls
-the same server-side index an agent uses.
+Real-time sync for your notes and attachments, with a hosted vault your AI agents can read and write
+through MCP. Notes merge rather than clobber, conflicts keep both copies, and a search pane finds notes
+by meaning rather than by exact words.
 
-Public repo: [`CopalSync/copal-obsidian`](https://github.com/CopalSync/copal-obsidian) (BRAT beta).
-This directory is the source of truth; releases are cut from it.
+- **Notes sync live.** Two devices editing the same paragraph merge; neither overwrites the other.
+- **Attachments sync too**, on a separate channel, with a keep-both copy if two devices change one.
+- **Search by meaning.** The pane in the sidebar queries a server-side index, so "what did I decide
+  about pricing" finds the note even when it never uses those words.
+- **Your Markdown stays Markdown.** Files on disk are ordinary notes. Disconnecting leaves every one
+  of them where it is.
 
-## How sync works
+## Requires an account, a subscription, and a network connection
 
-**Notes are CRDT.** One Yjs `Y.Doc` per note, persisted locally, synced over a per-note WebSocket to
-that note's `YNoteDO`. Local-first: edits apply immediately and converge, so two devices editing the
-same paragraph merge rather than one clobbering the other. This replaced an earlier file-level
-push/pull engine outright — there is no fallback path, deliberately.
+Copal is a hosted service, and this plugin is the client for it. Please read this before installing.
 
-**Attachments are not.** Binaries cannot CRDT-merge, so non-`.md` files go through `BinarySync`:
-file-level last-writer-wins keyed on the **R2 etag** — never `mtime`, which is a server clock — with
-an echo-suppressing etag+hash cursor, a keep-both `(conflicted copy)` on a 412, and a durable delete
-queue so an offline delete is not lost.
+- **An account is required.** Sign-in is a one-time link opened in your browser. There is no token to
+  paste. You can create an account at [copal.uk](https://copal.uk).
+- **A paid subscription is required** to sync a vault (Solo or Pro). Pricing is at
+  [copal.uk](https://copal.uk). Payment is taken in your browser by Stripe; the plugin never sees a
+  card number and cannot subscribe on your behalf.
+- **It sends your note content over the network**, to `api.copal.uk`, which is where your vault is
+  stored. That is the purpose of the plugin. Nothing is sent anywhere else, and nothing is sent at all
+  until you sign in and link a folder.
+- **Nothing is downloaded or executed.** The plugin ships as a single `main.js` and fetches no code at
+  runtime.
+- **No analytics or telemetry.** Errors are logged to your own developer console, not collected.
 
-The two are kept apart by three quarantine seams in `crdt-sync.ts`; `vault.list()` is markdown-only,
-so a binary provably cannot reach `syncOnce`, and a mixed-manifest test asserts it.
+[Privacy policy](https://copal.uk/privacy) · [Terms](https://copal.uk/terms) ·
+[Sub-processors](https://copal.uk/subprocessors)
 
-## Things that bit, and the guards that came out of them
+## Where your sign-in is stored, and what that means
 
-- ⚠️ **A control character in a filename breaks everything.** A note whose name contained a newline
-  (from sharing a social post into Obsidian) could not be routed over HTTP, so its `/ycrdt` socket
-  404'd and the client reconnect-looped — killing sync for the whole vault, not just that file. The
-  `safePath` guard now applies to _local_ paths at the sync entry points; an unsyncable name is
-  skipped with a one-time notice.
-- ⚠️ **Vaults over 200 files never fully reconciled**, because the server manifest was capped. The
-  manifest is now paged and the client loops pages.
-- The `requestUrl` adapter (`sync/request-url-fetch.ts`) exists because Obsidian's mobile webview is
-  not a browser: binary bodies, `ETag` and `Content-Type` passthrough all had to be handled by hand.
-- Search is deliberately case-insensitive — iOS auto-capitalise was dropping borderline matches.
-- Mobile has no `window.confirm`; destructive actions use a `ConfirmModal`.
+⚠️ **Your Copal sign-in is stored in this vault's plugin data (`.obsidian/plugins/copal/data.json`).**
+Obsidian offers plugins no cross-platform secret store, so there is nowhere more protected to put it.
 
-## Testing on mobile without publishing
+The consequence is worth understanding. **If you sync this vault somewhere else** (iCloud, Obsidian
+Sync, Dropbox, git) **your Copal sign-in travels with it**, and any copy of the vault can use it.
 
-`app.emulateMobile(true)` on desktop covers the UI and `Platform` branches. Real-device deep links,
-IndexedDB and WebSocket behaviour need a side-load (iCloud/Obsidian Sync/BRAT, or adb).
+Signing out asks Copal to revoke that sign-in, so the other copies cannot renew it, and tells you if it
+could not reach Copal to do so. Access already granted can take up to an hour to lapse. The same
+disclosure appears in the plugin's own settings pane.
 
-## Release
+## Installing
 
-Bump `manifest.json` + `versions.json` → `pnpm build` → rsync `src`/`test` to the public clone →
-push → `gh release create <ver> --prerelease` with `main.js`, `manifest.json`, `styles.css`.
+**From the community directory** (once approved): Settings → Community plugins → Browse → "Copal".
 
-⛔ **No AI attribution anywhere** — not in commits, releases, issues or code comments.
+**Before then, with [BRAT](https://github.com/TfTHacker/obsidian42-brat):** install BRAT, then
+_Add a beta plugin_ and give it `CopalSync/copal-obsidian`. Enable Copal in Community plugins.
 
-## Commands
+**Manually:** download `main.js`, `manifest.json` and `styles.css` from a
+[release](https://github.com/CopalSync/copal-obsidian/releases) into
+`<vault>/.obsidian/plugins/copal/`, then reload Obsidian.
+
+Then open Settings → Copal and choose **Log in**. Your browser opens, you sign in, and you come back.
+
+## Getting started
+
+Signing in links this folder to a Copal vault. What happens next depends on what you already have:
+
+- **No vaults yet** → this folder is uploaded as your first one. Nothing is deleted.
+- **You already have a vault** → you are asked to choose. **Upload** makes a new Copal vault from this
+  folder, keeping everything. **Adopt** replaces this folder's notes with an existing vault's, and says
+  how many local files will move to Obsidian's trash before it does anything.
+
+To pull an existing Copal vault down for the first time, make a new empty Obsidian vault and adopt into
+that, which avoids any question of displacing notes you already have.
+
+**Sign out** pauses sync and keeps the link, so signing back in resumes exactly where you were.
+**Disconnect** unlinks the folder entirely and clears Copal's local sync state. Either way your
+Markdown files stay.
+
+## Mobile
+
+Fully supported on iOS and Android, including the search pane (reachable from the ribbon icon, since
+mobile has no status bar). Requires Obsidian 1.7.2 or later.
+
+## Support
+
+[copal.uk](https://copal.uk) ·
+[Report an issue](https://github.com/CopalSync/copal-obsidian/issues)
+
+For a bug report, turn on verbose logging first: run `localStorage['copal-debug'] = '1'` in the
+developer console, reproduce the problem, and include what the console prints.
+
+## Development
+
+The source of truth is a private monorepo. This repository is the published build, and releases are cut
+from it by a script. The architecture notes, the incident history behind each guard, and the testing
+approach live in [`docs/plugin-notes.md`](docs/plugin-notes.md).
 
 `pnpm dev` · `build` · `test` · `typecheck` · `lint` · `format`.
+
+## Licence
+
+See [LICENSE](LICENSE).

@@ -7,8 +7,7 @@ describe("TokenStore", () => {
 	it("round-trips client id and tokens through the injected save", async () => {
 		const m = await memStore();
 		const store = m.store;
-		await store.setClientId("cid");
-		await store.setTokens({ access_token: "at", scope: "vault.read vault.write" });
+		await store.completeSignIn({ access_token: "at", scope: "vault.read vault.write" }, "cid");
 		expect(store.getClientId()).toBe("cid");
 		expect(store.getTokens()?.access_token).toBe("at");
 		expect(m.peek().clientId).toBe("cid");
@@ -25,8 +24,7 @@ describe("TokenStore", () => {
 	it("signOut() drops tokens but keeps the vault link (sign back in → resume)", async () => {
 		const m = await memStore();
 		const store = m.store;
-		await store.setClientId("cid");
-		await store.setTokens({ access_token: "at" });
+		await store.completeSignIn({ access_token: "at" }, "cid");
 		await store.setVault("vlt_1", "Work");
 		await store.signOut();
 		expect(store.getTokens()).toBeUndefined();
@@ -72,12 +70,9 @@ describe("TokenStore", () => {
 		expect(store.isConnected()).toBe(false);
 	});
 
-	it("getDeviceId generates once and returns the same id thereafter", async () => {
-		const m = await memStore();
-		const store = m.store;
-		const first = await store.getDeviceId();
-		expect(first).toMatch(/[0-9a-f-]{36}/);
-		expect(await store.getDeviceId()).toBe(first);
-		expect(m.peek().deviceId).toBe(first);
-	});
+	/*
+	 * `getDeviceId` was removed by N5: the id lived in `data.json`, which travels with a synced vault, so
+	 * two devices shared one. P5's echo filter then made device B discard device A's changes as its own
+	 * echo. It is per-install now, and tested in `test/connect/device-id.test.ts`.
+	 */
 });

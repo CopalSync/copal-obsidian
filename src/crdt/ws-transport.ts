@@ -1,8 +1,9 @@
+import { Reconnector } from "../sync/reconnector";
 import { assertWssUrl } from "../sync/safe-url";
 import { closeCode, WS_REAUTH_CLOSE } from "../sync/ws-close";
 import type { YTransport } from "./crdt-note";
 
-/** Reconnect backoff: base delay, doubled per attempt, capped. */
+/** Reconnect backoff: base delay, doubled per attempt, capped. Jitter/offline/auth live in `Reconnector`. */
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_CAP_MS = 15000;
 
@@ -19,8 +20,12 @@ export class WsTransport implements YTransport {
 	private msgCb: ((d: ArrayBuffer) => void) | undefined;
 	private openCb: (() => void) | undefined;
 	private closed = false;
-	private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
-	private attempt = 0;
+	/** The one reconnect policy (ROADMAP P8): jittered backoff, offline/visibility aware. */
+	private readonly reconnector = new Reconnector({
+		baseMs: RECONNECT_BASE_MS,
+		capMs: RECONNECT_CAP_MS,
+		connect: () => void this.doConnect(),
+	});
 
 	/** @param urlFor mints a fresh ticketed `wss://…/ycrdt/<path>?ticket=…` URL for each (re)connect. */
 	constructor(private readonly urlFor: () => Promise<string>) {}
@@ -36,7 +41,7 @@ export class WsTransport implements YTransport {
 			url = await this.urlFor();
 			assertWssUrl(url); // reject a downgraded ws:// URL → fail closed to a reconnect
 		} catch {
-			this.scheduleReconnect();
+			this.reconnector.schedule();
 			return;
 		}
 		if (this.closed) return;
@@ -48,7 +53,7 @@ export class WsTransport implements YTransport {
 				ws.close(); // closed while connecting — close cleanly now, no console warning
 				return;
 			}
-			this.attempt = 0;
+			this.reconnector.succeeded();
 			for (const m of this.queue) ws.send(m);
 			this.queue.length = 0;
 			this.openCb?.(); // (re)handshake
@@ -65,20 +70,10 @@ export class WsTransport implements YTransport {
 			 * by `error` handlers and by test doubles with no event at all — and a throw in here would
 			 * lose the reconnect entirely, turning a momentary blip into a permanently dead socket.
 			 */
-			if (closeCode(e) === WS_REAUTH_CLOSE) this.attempt = 0;
-			if (!this.closed) this.scheduleReconnect();
+			if (closeCode(e) === WS_REAUTH_CLOSE) this.reconnector.scheduledRetirement();
+			if (!this.closed) this.reconnector.schedule();
 		});
 		ws.addEventListener("error", () => ws.close());
-	}
-
-	private scheduleReconnect(): void {
-		if (this.closed || this.reconnectTimer !== undefined) return;
-		const delay = Math.min(RECONNECT_BASE_MS * 2 ** this.attempt, RECONNECT_CAP_MS);
-		this.attempt++;
-		this.reconnectTimer = setTimeout(() => {
-			this.reconnectTimer = undefined;
-			void this.doConnect();
-		}, delay);
 	}
 
 	send(data: ArrayBuffer): void {
@@ -98,10 +93,9 @@ export class WsTransport implements YTransport {
 
 	close(): void {
 		this.closed = true;
-		if (this.reconnectTimer !== undefined) {
-			clearTimeout(this.reconnectTimer);
-			this.reconnectTimer = undefined;
-		}
+		// Releases the pending attempt AND the online/visibility listeners — a transport that outlived its
+		// note while still listening for `online` is exactly the leak G5 was about.
+		this.reconnector.stop();
 		const ws = this.ws;
 		this.ws = undefined;
 		// A still-CONNECTING socket closes cleanly via its own `open` handler (which sees `closed`), avoiding

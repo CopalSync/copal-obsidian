@@ -109,6 +109,16 @@ export class PreconditionError extends Error {
 	}
 }
 
+/**
+ * `RequestInit`, with `headers` narrowed to the record form.
+ *
+ * ⚠️ `HeadersInit` also admits `string[][]` and `Headers`, and spreading EITHER into an object literal
+ * produces numeric indices rather than header names — a silently unauthenticated request. Every caller
+ * here passes a record, so narrowing the type makes the spread sound without changing any behaviour.
+ * `sync/request-url-fetch.ts` also casts `init.headers` to a record, so this is the shape it needs.
+ */
+type CopalRequestInit = Omit<RequestInit, "headers"> & { headers?: Record<string, string> };
+
 /** Encode each path segment (preserving the `/` separators) for a URL, matching the note routes. */
 const encodePath = (path: string): string => path.split("/").map(encodeURIComponent).join("/");
 /** Strip a weak-validator prefix + surrounding quotes from an ETag header → the raw etag. */
@@ -144,7 +154,7 @@ export interface SyncApiDeps {
 export class SyncApi {
 	constructor(private readonly deps: SyncApiDeps) {}
 
-	private async send(path: string, token: string, init?: RequestInit): Promise<Response> {
+	private async send(path: string, token: string, init?: CopalRequestInit): Promise<Response> {
 		const vaultId = this.deps.getVaultId?.();
 		return this.deps.f(`${API_BASE}${path}`, {
 			...init,
@@ -173,7 +183,7 @@ export class SyncApi {
 	 *
 	 * Exactly one retry: `refreshAfterUnauthorized` never recurses into this.
 	 */
-	private async authed(path: string, init?: RequestInit): Promise<Response> {
+	private async authed(path: string, init?: CopalRequestInit): Promise<Response> {
 		const token = await this.deps.getToken();
 		const res = await this.send(path, token, init);
 		if (res.status !== 401 || !this.deps.onUnauthorized) return res;

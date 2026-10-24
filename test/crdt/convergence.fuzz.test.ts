@@ -62,6 +62,9 @@ describe("adversarial convergence fuzzer", () => {
 
 			// Zero loss: every inserted character survives exactly once (concurrent interior inserts legitimately
 			// interleave tokens, so compare the character MULTISET, not substring order).
+			// A CHARACTER multiset is the point, and the fuzz alphabet is ASCII, so code-point splitting is
+			// exactly the desired behaviour.
+			// oxlint-disable-next-line typescript/no-misused-spread -- deliberate
 			const multiset = (s: string) => [...s].sort().join("");
 			const expected = `BASE\n${[...tokens].join("")}`;
 			expect(multiset(text)).toBe(multiset(expected));

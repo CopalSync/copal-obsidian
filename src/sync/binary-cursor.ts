@@ -5,6 +5,13 @@ import type { DataSlice } from "../data/plugin-data-store";
 export interface BinaryEntry {
 	etag: string;
 	hash: string;
+	/**
+	 * Local size and mtime as of the last sync, so reconcile can tell a file has NOT changed without
+	 * reading it. Optional because records written before P4 do not have them — and their absence must
+	 * mean "unknown, so read it", never "unchanged". ROADMAP P4.
+	 */
+	size?: number;
+	mtime?: number;
 }
 
 /** The persisted attachment cursor, under the `binary` key of the plugin's `data.json`. */

@@ -226,4 +226,17 @@ describe("SyncPager", () => {
 		await tick(2000);
 		expect(pages).toHaveLength(0); // refuses new work too
 	});
+
+	it("start() after stop() takes new work again", async () => {
+		// A sign-out stops the pager, and a sign-in in the same session starts sync again on the SAME
+		// pager. Without a way back, every closed note stayed unsynced until Obsidian restarted.
+		const pages: PageEntry[][] = [];
+		const pager = makePager(async (e) => void pages.push(e));
+
+		pager.stop();
+		pager.start();
+		pager.notify("c.md", { lane: "live" });
+		await tick(2000);
+		expect(pages).toEqual([[{ path: "c.md", readFile: false, adopt: false }]]);
+	});
 });

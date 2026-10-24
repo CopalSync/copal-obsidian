@@ -98,14 +98,19 @@ describe("PluginDataStore: the write queue", () => {
 				r.vaultName = "c";
 			}),
 			store.update((r) => {
-				r.deviceId = "d";
+				r.legacyCrdtPurged = true;
 			}),
 		]);
 		await all;
 
 		expect(d.save.mock.calls.length, "four updates must not be four writes").toBeLessThanOrEqual(2);
 		// The count alone would pass for a writer that never writes, so pin the content too.
-		expect(d.peek()).toEqual({ clientId: "a", vaultId: "b", vaultName: "c", deviceId: "d" });
+		expect(d.peek()).toEqual({
+			clientId: "a",
+			vaultId: "b",
+			vaultName: "c",
+			legacyCrdtPurged: true,
+		});
 	});
 
 	it("resolves an update only once ITS value is on disk, not when an earlier write lands", async () => {
@@ -350,27 +355,25 @@ describe("PluginDataStore: an external change to the file", () => {
 		expect(store.read().vaultName).toBe("New");
 	});
 
-	it("does NOT adopt another device's sync cursor, queues or device id", async () => {
-		const d = fakeDisk({ deviceId: "mine", sync: { lastSeq: 2, knownServer: [] } });
+	it("does NOT adopt another device's sync cursor or queues", async () => {
+		// `deviceId` used to be in this list. N5 moved it out of `data.json` entirely, which is a stronger
+		// fix than refusing to adopt it: a field that is not in the file cannot travel with a copy of it.
+		const d = fakeDisk({ sync: { lastSeq: 2, knownServer: [] } });
 		const store = await PluginDataStore.open(d.io);
 
 		d.externalWrite({
-			deviceId: "theirs",
 			sync: { lastSeq: 900, knownServer: ["theirs.md"] },
 			binary: { known: { "theirs.png": { etag: "e", hash: "h" } } },
 			pending: { deletes: ["theirs.md"] },
 			binaryPending: { deletes: [] },
-			connectAttemptPending: true,
 		});
 		await store.reloadExternal();
 
 		// Adopting lastSeq would skip journal frames this client never applied; adopting binary.known
 		// would skip pulls for files it does not have.
-		expect(store.read().deviceId).toBe("mine");
 		expect(store.read().sync).toEqual({ lastSeq: 2, knownServer: [] });
 		expect(store.read().binary).toBeUndefined();
 		expect(store.read().pending).toBeUndefined();
-		expect(store.read().connectAttemptPending).toBeUndefined();
 	});
 
 	it("follows a sign-out from another copy", async () => {
@@ -415,13 +418,13 @@ describe("PluginDataStore: an external change to the file", () => {
 		d.externalWrite({ clientId: "cid", vaultId: "adopted", vaultName: "Adopted" });
 		await store.reloadExternal();
 		await store.update((r) => {
-			r.deviceId = "mine";
+			r.vaultName = "Mine";
 		});
 
 		expect(
 			d.peek().vaultId,
 			"caching without a reload silently destroys another copy's fields",
 		).toBe("adopted");
-		expect(d.peek().deviceId).toBe("mine");
+		expect(d.peek().vaultName).toBe("Mine");
 	});
 });
