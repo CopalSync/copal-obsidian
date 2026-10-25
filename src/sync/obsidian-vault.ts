@@ -3,6 +3,35 @@ import { type App, normalizePath, TFile } from "obsidian";
 import { isConfigDirPath, safePath } from "./safe-path";
 import type { VaultWriter } from "./vault";
 
+/**
+ * A server path Obsidian would store under another name, which on this device is another note.
+ *
+ * ⛔ Obsidian's `normalizePath` maps U+00A0/U+202F to a space and composes to NFC, so a
+ * server note `Meeting<NBSP>notes.md` and the user's `Meeting notes.md` are one file here. Writing the
+ * first wrote over the second, pushed it back into the server's copy of the user's note, and a later
+ * delete of the variant trashed the real one. Thrown by `write` so the sync engine can say so; read,
+ * exists and remove treat such a path as absent.
+ */
+export class UnrepresentablePathError extends Error {
+	constructor(
+		readonly path: string,
+		readonly stored: string,
+	) {
+		super(
+			`Obsidian would store ${JSON.stringify(path)} as ${JSON.stringify(stored)}, which is a different note`,
+		);
+		this.name = "UnrepresentablePathError";
+	}
+}
+
+/** The name Obsidian would store a safe `path` under, when that is not `path` itself; else null. */
+export function foldedName(path: string): string | null {
+	const safe = safePath(path);
+	if (safe === null) return null;
+	const stored = normalizePath(safe);
+	return stored === safe ? null : stored;
+}
+
 /** Real `VaultWriter` over Obsidian's `app.vault`. Creates parent folders as needed on write. */
 export class ObsidianVault implements VaultWriter {
 	constructor(private readonly app: App) {}
@@ -22,7 +51,12 @@ export class ObsidianVault implements VaultWriter {
 			log.warnOnce(`vault:${path}`, `refusing unsafe vault path: ${JSON.stringify(path)}`);
 			return null;
 		}
-		return normalizePath(safe);
+		// A path `normalizePath` would change names a different note here, never this one.
+		if (normalizePath(safe) !== safe) {
+			log.warnOnce(`vault:${path}`, `refusing a path Obsidian would fold: ${JSON.stringify(path)}`);
+			return null;
+		}
+		return safe;
 	}
 
 	exists(path: string): Promise<boolean> {
@@ -56,6 +90,8 @@ export class ObsidianVault implements VaultWriter {
 	}
 
 	async write(path: string, content: string): Promise<void> {
+		const stored = foldedName(path);
+		if (stored !== null) throw new UnrepresentablePathError(path, stored);
 		const p = this.resolve(path);
 		if (p === null) return;
 		const existing = this.app.vault.getAbstractFileByPath(p);

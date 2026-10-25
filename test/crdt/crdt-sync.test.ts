@@ -1146,3 +1146,74 @@ describe("P1: closed notes sync in pages", () => {
 		expect(await registry.listPersisted()).not.toContain("dead.md");
 	});
 });
+
+const seed = (serverDocs: Map<string, Y.Doc>, notes: Record<string, string>) => {
+	for (const [path, text] of Object.entries(notes)) {
+		const doc = new Y.Doc();
+		doc.getText("content").insert(0, text);
+		serverDocs.set(path, doc);
+	}
+};
+/** A vault whose filesystem refuses one path, as Obsidian's create does for a folder clash. */
+const refusing = (vault: { write: (p: string, c: string) => Promise<void> }, refused: string) => {
+	const write = vault.write.bind(vault);
+	vault.write = (path, content) =>
+		path === refused
+			? Promise.reject(new Error(`File already exists: ${refused}`))
+			: write(path, content);
+};
+const settle = (p: Promise<unknown>, ms = 3000) =>
+	Promise.race([
+		p.then(() => "settled" as const),
+		new Promise<"stalled">((r) => setTimeout(() => r("stalled"), ms)),
+	]);
+
+/**
+ * ⛔ A note this device cannot create is that note's problem, never the page's.
+ *
+ * The server's note identity is byte-exact, so it can hold a note a device's filesystem refuses: a
+ * case-only variant on a case-insensitive disk, or a note at an existing folder's name. Obsidian
+ * refusing the create is right. What was wrong is that the refusal threw out of the page: the rest of
+ * the page was abandoned after its metered request, the pager re-queued it for ever at up to 30 s,
+ * `reconcile` never finished (so the change bus never opened), and live frames stopped applying.
+ */
+describe("a note this device cannot create", () => {
+	it("does not stall the reconcile, and the note after it in the page still lands", async () => {
+		const notices: string[] = [];
+		const { crdt, serverDocs, vault, manifestState } = makeSync({}, {
+			notifyUser: (message: string) => notices.push(message),
+		} as Partial<CrdtSyncDeps>);
+		seed(serverDocs, { "Alpha.md": "alpha", "Topic.md": "topic", "Zeta.md": "zeta" });
+		manifestState.entries = [{ path: "Alpha.md" }, { path: "Topic.md" }, { path: "Zeta.md" }];
+		refusing(vault, "Topic.md");
+
+		expect(await settle(crdt.reconcile([], "merge"))).toBe("settled");
+		expect(vault.snapshot()["Alpha.md"]).toBe("alpha");
+		expect(vault.snapshot()["Zeta.md"]).toBe("zeta");
+		expect(notices.filter((n) => n.includes("Topic.md"))).toHaveLength(1);
+	});
+
+	it("keeps no record of it, so the next launch tries it again rather than skipping it for ever", async () => {
+		const { crdt, serverDocs, vault, manifestState, registry } = makeSync({}, {
+			notifyUser: () => undefined,
+		} as Partial<CrdtSyncDeps>);
+		seed(serverDocs, { "Topic.md": "topic" });
+		manifestState.entries = [{ path: "Topic.md" }];
+		refusing(vault, "Topic.md");
+
+		expect(await settle(crdt.reconcile([], "merge"))).toBe("settled");
+		expect(await registry.listPersisted()).not.toContain("Topic.md");
+	});
+
+	it("does not stop the change frames after it", async () => {
+		const { crdt, serverDocs, vault } = makeSync({}, {
+			notifyUser: () => undefined,
+		} as Partial<CrdtSyncDeps>);
+		seed(serverDocs, { "Topic.md": "topic", "Later.md": "later" });
+		refusing(vault, "Topic.md");
+
+		expect(await settle(crdt.onRemoteChange({ path: "Topic.md", op: "put" }))).toBe("settled");
+		expect(await settle(crdt.onRemoteChange({ path: "Later.md", op: "put" }))).toBe("settled");
+		await waitFor(() => vault.snapshot()["Later.md"] === "later");
+	});
+});

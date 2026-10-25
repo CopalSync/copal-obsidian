@@ -790,9 +790,18 @@ export function setIcon(el: unknown, icon: string): void {
 export function setTooltip(el: unknown, text: string, _opts?: unknown): void {
 	(el as HTMLElement | undefined)?.setAttribute?.("aria-label", text);
 }
-/** Obsidian collapses duplicate separators and strips a leading one; paths here are already safe. */
+/**
+ * Obsidian 1.14.5's `normalizePath`, transcribed from its app bundle:
+ * `Fl(e){return xl(Rl(e)).normalize("NFC")}`.
+ *
+ * ⛔ Kept faithful, folds and all. The stub used to only collapse slashes, so no test could see that
+ * the real one maps U+00A0/U+202F to a space and composes to NFC — which is how a distinct server
+ * note was folded onto the user's own note on every device.
+ */
 export function normalizePath(p: string): string {
-	return p.replace(/\/{2,}/g, "/").replace(/^\//, "");
+	let e = p.replace(/([\\/])+/g, "/").replace(/(^\/+|\/+$)/g, "");
+	if (e === "") e = "/";
+	return e.replace(/\u00A0|\u202F/g, " ").normalize("NFC");
 }
 export class Notice {
 	static readonly shown: string[] = [];

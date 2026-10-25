@@ -179,6 +179,7 @@ export default class CopalPlugin extends Plugin {
 			queue: mutationQueue,
 			deviceId: () => deviceId(),
 			binarySync,
+			notifyUser: (message) => new Notice(message, 15_000),
 			bind: (peer) => {
 				// Give the human a presence identity so yCollab labels the local user and the agent's caret
 				// reads as distinct. A stable per-device colour distinguishes concurrent devices; the agent

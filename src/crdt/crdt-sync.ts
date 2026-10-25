@@ -42,6 +42,11 @@ export interface CrdtSyncDeps {
 	/** Trailing debounce before a page goes out. Tests pass 0. */
 	debounceMs?: number;
 	log?: (msg: string) => void;
+	/**
+	 * Tell the person something went wrong that only they can resolve: a note this device cannot
+	 * create. Once per path per session. `main.ts` shows it as an Obsidian notice.
+	 */
+	notifyUser?: (message: string) => void;
 }
 
 /** Safety cap: proceed even if the initial sync never signals completion (e.g. a network failure). */
@@ -536,8 +541,13 @@ export class CrdtSync {
 				/* leave it unknown — the next push sends full state, which is the safe direction */
 			}
 		}
-		await this.reconcileFileAfterSync(note, path, wasEmpty, undefined, adopt);
-		await note.materialize();
+		try {
+			await this.reconcileFileAfterSync(note, path, wasEmpty, undefined, adopt);
+			await note.materialize();
+		} catch (err) {
+			await this.cannotHold(note, path, wasEmpty, err);
+			return;
+		}
 
 		// The acknowledgement, and it must come LAST. With the server's new state vector in hand, does it
 		// cover everything we hold? ⚠️ Checked AFTER the file reconciliation, because that is what creates
@@ -549,6 +559,39 @@ export class CrdtSync {
 		// and so an edit whose page never ran (offline, then a restart) is still known to be unpushed.
 		note.setDirty(behind);
 		if (behind) this.pager.notify(path, { lane: "bulk" });
+	}
+
+	/** Paths this session has already told the person it cannot create, so each is said once. */
+	private readonly cannotCreate = new Set<string>();
+
+	/**
+	 * ⛔ A note this device cannot create is that note's failure, never the page's.
+	 *
+	 * The server's identity is byte-exact, so it can hold a note a device's filesystem refuses: a
+	 * case-only variant on a case-insensitive disk, a note at a folder's name, a path Obsidian would fold
+	 * onto another note. That refusal used to throw out of the page: the rest of the page was abandoned
+	 * after its metered request, the pager re-queued it for ever, `reconcile` never finished (so the
+	 * change bus never opened) and live frames stopped applying. Now it is said once, and nothing is
+	 * re-queued: a later change to the path tries again, one item at a time.
+	 *
+	 * A note new to this device whose every op came from the server keeps no local record, because
+	 * dropping it loses nothing and the next launch then pulls it again instead of counting it as
+	 * already local and skipping it for good. A note that was here before keeps its doc: it may hold
+	 * edits the server has not seen.
+	 */
+	private async cannotHold(
+		note: LocalNote,
+		path: string,
+		wasEmpty: boolean,
+		err: unknown,
+	): Promise<void> {
+		const reason = err instanceof Error ? err.message : String(err);
+		this.deps.log?.(`cannot create ${path} on this device: ${reason}`);
+		if (!this.cannotCreate.has(path)) {
+			this.cannotCreate.add(path);
+			this.deps.notifyUser?.(`Copal could not create "${path}" on this device: ${reason}`);
+		}
+		if (wasEmpty && this.serverCoversOurOps(note)) await this.deps.registry.destroy(path);
 	}
 
 	/**

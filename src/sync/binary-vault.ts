@@ -50,7 +50,17 @@ export class ObsidianBinaryVault implements BinaryFiles {
 			);
 			return null;
 		}
-		return normalizePath(safe);
+		// A path `normalizePath` would change names a different file here, never this one.
+		// Refused silently, as an unsafe path is: an attachment pulled under it would overwrite, or a
+		// delete trash, the file Obsidian folds it onto.
+		if (normalizePath(safe) !== safe) {
+			log.warnOnce(
+				`attachment:${path}`,
+				`refusing a path Obsidian would fold: ${JSON.stringify(path)}`,
+			);
+			return null;
+		}
+		return safe;
 	}
 
 	exists(path: string): Promise<boolean> {

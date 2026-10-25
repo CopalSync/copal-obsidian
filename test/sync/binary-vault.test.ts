@@ -205,3 +205,15 @@ describe("mimeForPath", () => {
 		expect(mimeForPath("noextension")).toBe("application/octet-stream");
 	});
 });
+
+/** ⛔ Attachments too: a path Obsidian would fold names another file here. */
+describe("an attachment path Obsidian would fold onto another file", () => {
+	it("is never written onto, trashed through, or reported as that file", async () => {
+		const { files, stub } = subject({ "Café.png": [1, 2, 3] });
+		await files.writeBinary("Café.png", new Uint8Array([9]).buffer as ArrayBuffer);
+		await files.trash("Café.png");
+		expect(stub.trashed).toEqual([]);
+		expect(new Uint8Array(await files.readBinary("Café.png"))).toEqual(new Uint8Array([1, 2, 3]));
+		expect(await files.exists("Café.png")).toBe(false);
+	});
+});

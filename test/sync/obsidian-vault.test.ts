@@ -214,3 +214,47 @@ describe("the TFile branches", () => {
 		expect(stub.snapshot()["dir/inner.md"], "the folder's contents are untouched").toBe("x");
 	});
 });
+
+/**
+ * ⛔ A server path Obsidian would fold onto a DIFFERENT note is refused, never written onto it.
+ *
+ * Obsidian's `normalizePath` maps U+00A0/U+202F to a space and composes to NFC. `resolve` used to hand
+ * its result to the vault, so a server note `Meeting<NBSP>notes.md` became the user's own
+ * `Meeting notes.md`: the bundle's text was written over it and pushed back into it on the server, and
+ * a later delete of the variant trashed the user's real note.
+ */
+describe("a server path Obsidian would fold onto another note", () => {
+	const VARIANTS = [
+		["a no-break space", "Meeting notes.md", "Meeting notes.md"],
+		["a narrow no-break space", "Meeting notes.md", "Meeting notes.md"],
+		["a decomposed accent", "Café.md", "Café.md"],
+		["the Kelvin sign", "Key ideas.md", "Key ideas.md"],
+	] as const;
+
+	it.each(VARIANTS)(
+		"write() refuses %s rather than writing onto the user's note",
+		async (_, variant, existing) => {
+			const { vault, stub } = subject({ [existing]: "mine" });
+			await expect(vault.write(variant, "theirs")).rejects.toThrow(/would store/);
+			expect(stub.snapshot()).toEqual({ [existing]: "mine" });
+		},
+	);
+
+	it.each(VARIANTS)(
+		"remove() of %s never trashes the user's note",
+		async (_, variant, existing) => {
+			const { vault, stub } = subject({ [existing]: "mine" });
+			await vault.remove(variant);
+			expect(stub.trashed).toEqual([]);
+			expect(stub.snapshot()).toEqual({ [existing]: "mine" });
+		},
+	);
+
+	it.each(VARIANTS)(
+		"exists() does not report %s as the user's note",
+		async (_, variant, existing) => {
+			const { vault } = subject({ [existing]: "mine" });
+			expect(await vault.exists(variant)).toBe(false);
+		},
+	);
+});
