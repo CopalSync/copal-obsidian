@@ -268,6 +268,46 @@ describe("revoke", () => {
 			revoke(f, asTrustedUrl("https://auth.copal.uk/oauth2/revoke"), "cid", "rt"),
 		).rejects.toThrow(/503/);
 	});
+
+	/*
+	 * ⛔ Measured on production 2026-10-30: Copal's authorization server (Better Auth's OAuth provider)
+	 * answers a refresh token it does not hold with 400 `token not found`, and one already revoked with
+	 * 400 `refresh token revoked` (after invalidating its whole family), where RFC 7009 §2.2 answers 200.
+	 * Either way that token can never be used again, which is all a revoke is for. Read as failures, a
+	 * sign-in found in the vault folder whose token another device had already rotated would be retried
+	 * at every start for ever, and a sign-out of a dead token would say it could not reach Copal.
+	 */
+	it.each(["token not found", "refresh token revoked"])(
+		"counts the server's 400 `%s` as done: that token is already dead",
+		async (description) => {
+			const f = vi
+				.fn<typeof fetch>()
+				.mockResolvedValue(
+					jsonResponse({ error: "invalid_request", error_description: description }, 400),
+				);
+			await expect(
+				revoke(f, asTrustedUrl("https://auth.copal.uk/oauth2/revoke"), "cid", "rt"),
+			).resolves.toBeUndefined();
+		},
+	);
+
+	it.each([
+		[
+			"another invalid_request",
+			{ error: "invalid_request", error_description: "missing a required token" },
+		],
+		["invalid_client", { error: "invalid_client", error_description: "token not found" }],
+		["a body that is not JSON", "token not found"],
+	])("still fails on any other 400 (%s)", async (_label, body) => {
+		const f = vi
+			.fn<typeof fetch>()
+			.mockResolvedValue(
+				typeof body === "string" ? new Response(body, { status: 400 }) : jsonResponse(body, 400),
+			);
+		await expect(
+			revoke(f, asTrustedUrl("https://auth.copal.uk/oauth2/revoke"), "cid", "rt"),
+		).rejects.toThrow(/400/);
+	});
 });
 
 describe("refresh", () => {

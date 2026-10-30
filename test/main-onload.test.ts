@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import "fake-indexeddb/auto";
 import { App } from "obsidian";
-import { workspaceOf } from "./stubs/obsidian";
+import { secretsOf, workspaceOf } from "./stubs/obsidian";
 import { describe, expect, it, vi } from "vitest";
 import CopalPlugin from "../src/main";
 import type { PersistedData } from "../src/data/plugin-data-store";
@@ -66,7 +66,7 @@ async function loaded(initial: PersistedData | null = null) {
 describe("CopalPlugin.onload — the persistence wiring", () => {
 	it("reads data.json exactly once for the whole plugin", async () => {
 		const { load } = await loaded({
-			tokens: { access_token: "at" },
+			vaultId: "vlt-1",
 			sync: { lastSeq: 3, knownServer: ["a.md"] },
 			binary: { known: { "p.png": { etag: "e", hash: "h" } } },
 		});
@@ -92,7 +92,6 @@ describe("CopalPlugin.onload — the persistence wiring", () => {
 
 	it("loads every persister's key off the one record it read", async () => {
 		const { plugin } = await loaded({
-			tokens: { access_token: "at" },
 			vaultId: "vlt-1",
 			sync: { lastSeq: 3, knownServer: ["a.md"] },
 			pending: { deletes: ["gone.md"] },
@@ -113,11 +112,8 @@ describe("CopalPlugin.onload — the persistence wiring", () => {
 		expect(internals.binaryQueue.list()).toEqual(["old.png"]);
 	});
 
-	it("a sign-out through the real plugin is not undone by a concurrent sync persist", async () => {
-		const { plugin, peek } = await loaded({
-			tokens: { access_token: "at", refresh_token: "rt" },
-			vaultId: "vlt-1",
-		});
+	it("an unlink through the real plugin is not undone by a concurrent sync persist", async () => {
+		const { plugin, peek } = await loaded({ vaultId: "vlt-1", vaultName: "Mine" });
 		const internals = plugin as unknown as {
 			syncState: { lastSeq: number; persist(): Promise<void> };
 			binaryCursor: {
@@ -131,15 +127,42 @@ describe("CopalPlugin.onload — the persistence wiring", () => {
 		internals.binaryCursor.set("p.png", { etag: "e", hash: "h" });
 		await Promise.all([
 			internals.binaryCursor.persist(),
-			plugin.store.signOut(),
+			plugin.store.unlinkVault(),
 			internals.syncState.persist(),
 		]);
 
 		const disk = await peek();
-		expect(disk.tokens, "a concurrent persist resurrected the credential").toBeUndefined();
+		expect("vaultId" in disk, "a concurrent persist resurrected the link").toBe(false);
 		expect(disk.sync?.lastSeq).toBe(11);
 		expect(disk.binary?.known["p.png"]?.etag).toBe("e");
-		expect(disk.vaultId).toBe("vlt-1");
+	});
+
+	/** ⛔ NV33, through the assembled plugin: the sign-in goes to `app.secretStorage`, never the file. */
+	it("a sign-in lands in Obsidian's secret store and not in data.json", async () => {
+		const { plugin, app, peek } = await loaded({ vaultId: "vlt-1" });
+		await plugin.store.completeSignIn(
+			{ access_token: "DUMMY-AT", refresh_token: "DUMMY-RT" },
+			"cid",
+		);
+
+		expect(JSON.stringify(await peek())).not.toContain("DUMMY");
+		const secrets = secretsOf(app);
+		expect(secrets.listSecrets()).toHaveLength(1);
+		expect(secrets.getSecret(secrets.listSecrets()[0] ?? "")).toContain("DUMMY-RT");
+	});
+
+	it("an old build's sign-in in data.json is taken off the disk, kept only to revoke, and not used", async () => {
+		const { plugin, app, peek } = await loaded({
+			tokens: { access_token: "DUMMY-AT", refresh_token: "DUMMY-RT" },
+			clientId: "cid",
+			vaultId: "vlt-1",
+		} as PersistedData);
+
+		expect(JSON.stringify(await peek())).not.toContain("DUMMY");
+		expect(plugin.store.isConnected()).toBe(false);
+		const secrets = secretsOf(app);
+		const held = JSON.parse(secrets.getSecret(secrets.listSecrets()[0] ?? "") ?? "{}") as unknown;
+		expect(held).toEqual({ revoke: [{ refresh_token: "DUMMY-RT", clientId: "cid" }] });
 	});
 
 	it("the quit task waits for a write that is still in flight", async () => {
@@ -171,19 +194,24 @@ describe("CopalPlugin.onload — the persistence wiring", () => {
 	});
 
 	it("an external change to data.json is adopted, not clobbered by the next write", async () => {
-		const { plugin, peek } = await loaded({ clientId: "cid" });
+		const { plugin, peek } = await loaded({ legacyCrdtPurged: true });
 		const io = plugin as unknown as { saveData(d: unknown): Promise<void> };
 
 		// Another copy of the vault syncs in, linking it to a vault.
-		await io.saveData({ clientId: "cid", vaultId: "from-elsewhere", vaultName: "Theirs" });
+		await io.saveData({ legacyCrdtPurged: true, vaultId: "from-elsewhere", vaultName: "Theirs" });
 		await plugin.onExternalSettingsChange();
-		await plugin.store.setTokens({ access_token: "fresh" });
+		// Then this device writes its own key.
+		const internals = plugin as unknown as {
+			syncState: { lastSeq: number; persist(): Promise<void> };
+		};
+		internals.syncState.lastSeq = 5;
+		await internals.syncState.persist();
 
 		const disk = await peek();
 		expect(disk.vaultId, "caching without a reload destroys another copy's fields").toBe(
 			"from-elsewhere",
 		);
-		expect(disk.tokens?.access_token).toBe("fresh");
+		expect(disk.sync?.lastSeq).toBe(5);
 	});
 });
 

@@ -181,13 +181,16 @@ describe("Obsidian store rules", () => {
 
 		it("⛔ carries the credential-storage disclosure", () => {
 			// The security scan's C2/C9 row recorded this as already being in the README when it was only
-			// in the settings pane. The consequence — a synced vault carries the sign-in with it — is the
-			// part a reader needs, so assert that and not just the file path.
-			expect(readme).toMatch(/data\.json/);
-			expect(readme, "the consequence, not just the location").toMatch(
-				/sign-in travels with it|travels with any copy/i,
-			);
+			// in the settings pane. Since 1.1.0 (NV33) the sign-in is in Obsidian's secure storage, and the
+			// part a reader needs is the consequence: a copy of the vault carries no sign-in, and one an
+			// older version left in data.json is revoked.
+			expect(readme).toMatch(/secure storage on this device/i);
+			expect(readme, "the consequence, not just the location").toMatch(/carries no sign-in/i);
+			expect(readme, "what happens to the old data.json sign-in").toMatch(/data\.json/);
 			expect(readme, "and that signing out revokes it").toMatch(/revoke/i);
+			expect(readme, "the old disclosure is no longer true").not.toMatch(
+				/sign-in travels with it/i,
+			);
 		});
 
 		it("tells a reader how to install it", () => {

@@ -40,9 +40,13 @@ IndexedDB and WebSocket behaviour need a side-load (iCloud/Obsidian Sync/BRAT, o
 
 ## Release
 
-`node scripts/release-plugin.mjs <version> [--beta] [--dry-run]` from the monorepo root. It refuses a
-dirty tree, runs every gate, mirrors an allowlist into a fresh clone of the public repo, builds there and
-byte-compares the two bundles, then pushes and creates the release.
+`pnpm release:plugin <version> [--beta] [--dry-run]` from a clean checkout of the monorepo's main
+(`packages/plugin-release`). It runs every gate and builds, then generates this repository's whole tree
+from the monorepo (tracked files under an allowlist, plus a `package.json` pinned to the versions the
+monorepo resolved), rebuilds that tree in isolation with install scripts off and checks it produces the
+identical `main.js`, and makes this repository exactly that tree. The release is created as a draft
+from the monorepo's own build, downloaded back and compared, and only then published. Nothing in this
+repository is ever run by the release.
 
 ⛔ **No AI attribution anywhere** — not in commits, releases, issues or code comments.
 

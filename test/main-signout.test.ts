@@ -2,10 +2,9 @@ import { App } from "obsidian";
 import { describe, expect, it, vi } from "vitest";
 import CopalPlugin from "../src/main";
 import type { TokenStore } from "../src/connect/store";
-import type { PersistedData } from "../src/connect/store";
 import type { PluginDataStore } from "../src/data/plugin-data-store";
 import type { RevokeOutcome } from "../src/connect/token-manager";
-import { memStore } from "./data/fake-plugin-data";
+import { memStore, type Seed } from "./data/fake-plugin-data";
 
 /**
  * ⛔ **THE FILE NOTHING COULD LOAD.**
@@ -21,7 +20,7 @@ import { memStore } from "./data/fake-plugin-data";
  * (`serverReachable()` answers false with no api, so the flush is skipped; `stopSync()` and
  * `settingsTab?.refresh()` are optional-chained).
  */
-async function makePlugin(initial: PersistedData, outcome: RevokeOutcome | Error = "revoked") {
+async function makePlugin(initial: Seed, outcome: RevokeOutcome | Error = "revoked") {
 	const calls: string[] = [];
 	const mem = await memStore(initial);
 	const store = mem.store;
@@ -71,10 +70,10 @@ async function makePlugin(initial: PersistedData, outcome: RevokeOutcome | Error
 		}),
 	};
 
-	return { plugin, internals, calls, tokens, scopes, peek: mem.peek };
+	return { plugin, internals, calls, tokens, scopes, peek: mem.peek, signIn: mem.signIn };
 }
 
-const LINKED: PersistedData = {
+const LINKED: Seed = {
 	clientId: "cid",
 	tokens: { access_token: "at", refresh_token: "rt" },
 	vaultId: "vlt-1",
@@ -83,14 +82,14 @@ const LINKED: PersistedData = {
 
 describe("CopalPlugin.signOut", () => {
 	it("revokes at the server BEFORE deleting the credential locally", async () => {
-		const { plugin, calls, tokens, peek } = await makePlugin(LINKED);
+		const { plugin, calls, tokens, peek, signIn } = await makePlugin(LINKED);
 
 		expect(await plugin.signOut()).toBe("revoked");
 
 		expect(tokens.revokeAndAbandon).toHaveBeenCalledOnce();
 		// The order is the security property: the delete destroys the token revocation needs.
 		expect(calls).toEqual(["revoke", "local-delete"]);
-		expect(peek().tokens).toBeUndefined();
+		expect(signIn()).toBeUndefined();
 		expect(peek().vaultId).toBe("vlt-1"); // sign-out keeps the link, so signing back in resumes
 	});
 
@@ -105,18 +104,18 @@ describe("CopalPlugin.signOut", () => {
 	});
 
 	it("signs out locally and reports failure when revocation cannot be done", async () => {
-		const { plugin, calls, peek } = await makePlugin(LINKED, "failed");
+		const { plugin, calls, signIn } = await makePlugin(LINKED, "failed");
 		expect(await plugin.signOut()).toBe("failed");
 		expect(calls).toEqual(["revoke", "local-delete"]);
-		expect(peek().tokens).toBeUndefined(); // signed out HERE regardless — the point of the finally
+		expect(signIn()).toBeUndefined(); // signed out HERE regardless — the point of the finally
 	});
 
 	it("signs out locally even when revocation throws, and does not rethrow at the button", async () => {
-		const { plugin, peek } = await makePlugin(LINKED, new Error("network is gone"));
+		const { plugin, signIn } = await makePlugin(LINKED, new Error("network is gone"));
 		// `clearCredential` logs and swallows: a rejected promise here would leave the settings pane
 		// wedged mid-sign-out with the tokens already gone.
 		expect(await plugin.signOut()).toBe("failed");
-		expect(peek().tokens).toBeUndefined();
+		expect(signIn()).toBeUndefined();
 	});
 
 	it("replaces the TokenManager, so the next sign-in is not served by an abandoned one", async () => {
@@ -136,13 +135,13 @@ describe("CopalPlugin.disconnect", () => {
 	 * into a different vault.
 	 */
 	it("wipes the local CRDT docs BEFORE unlinking the vault", async () => {
-		const { plugin, calls, peek } = await makePlugin(LINKED);
+		const { plugin, calls, peek, signIn } = await makePlugin(LINKED);
 
 		expect(await plugin.disconnect()).toBe("revoked");
 
 		expect(calls).toEqual(["revoke", "local-delete", "destroy-crdt-docs", "unlink-vault"]);
 		expect(calls.indexOf("destroy-crdt-docs")).toBeLessThan(calls.indexOf("unlink-vault"));
-		expect(peek().tokens).toBeUndefined();
+		expect(signIn()).toBeUndefined();
 		expect(peek().vaultId).toBeUndefined(); // disconnect fully unlinks
 	});
 

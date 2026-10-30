@@ -146,15 +146,15 @@ export class CopalSettingTab extends PluginSettingTab {
 					}),
 			);
 
-		// Credential-storage transparency (S4): tokens live in this vault's plugin data (Obsidian has no
-		// cross-platform secret store). If the vault itself is synced elsewhere, the sign-in travels with it.
+		// Credential-storage transparency (S4): the sign-in is in Obsidian's secret store on this device,
+		// never in the vault folder (NV33), so a synced copy of the vault carries none.
 		containerEl.createEl("p", {
 			cls: "copal-fineprint",
 			text:
-				"Your Copal sign-in is stored in this vault's plugin data. If you sync this vault elsewhere " +
-				"(iCloud, Obsidian Sync, git…), your sign-in travels with it. Signing out asks Copal to " +
-				"revoke that sign-in so the copies cannot renew it, and tells you if it could not reach " +
-				"Copal to do so. Access already granted can take up to an hour to lapse.",
+				"Your Copal sign-in is kept in Obsidian's secure storage on this device, not in the vault " +
+				"folder, so a copy of this vault carries no sign-in. Signing out asks Copal to revoke it, " +
+				"and tells you if it could not reach Copal to do so. Access already granted can take up " +
+				"to an hour to lapse.",
 		});
 	}
 

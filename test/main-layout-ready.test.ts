@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
 import "fake-indexeddb/auto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { PersistedData } from "../src/data/plugin-data-store";
 import CopalPlugin from "../src/main";
+import type { Tokens } from "../src/types";
+import { signInOn } from "./data/fake-plugin-data";
 // `Notice` comes from the stub by relative path, not through the alias: its `shown`/`__reset`
 // statics are stub-only, and tsc resolves "obsidian" to the REAL package.
 import { Notice, stubApp, workspaceOf } from "./stubs/obsidian";
@@ -20,11 +21,10 @@ import { Notice, stubApp, workspaceOf } from "./stubs/obsidian";
  * it starts is covered by the crdt suites against the engine directly, and end-to-end by
  * `test/live/two-device.live.test.ts` against the deployed gateway.
  */
-async function loaded(initial: PersistedData | null) {
+async function loaded(signedIn: Tokens | null) {
 	const app = stubApp({ "existing.md": "hello" });
 	const plugin = new CopalPlugin(app as never, {} as never);
-	const io = plugin as unknown as { saveData(d: unknown): Promise<void> };
-	if (initial !== null) await io.saveData(initial);
+	if (signedIn !== null) signInOn(app, signedIn);
 	await plugin.onload();
 	// Replace the reconcile, keeping the decision to call it observable.
 	const startSync = vi
@@ -33,11 +33,9 @@ async function loaded(initial: PersistedData | null) {
 	return { plugin, app, workspace: workspaceOf(app), startSync };
 }
 
-const CONNECTED: PersistedData = {
-	tokens: { access_token: "at", refresh_token: "rt" },
-} as unknown as PersistedData;
+const CONNECTED: Tokens = { access_token: "at", refresh_token: "rt" };
 /** An install that signed in before `offline_access`: a token it cannot renew. */
-const UNRENEWABLE: PersistedData = { tokens: { access_token: "at" } } as unknown as PersistedData;
+const UNRENEWABLE: Tokens = { access_token: "at" };
 
 beforeEach(() => Notice.__reset());
 

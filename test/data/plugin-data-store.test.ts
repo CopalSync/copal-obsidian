@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { type PersistedData, PluginDataStore } from "../../src/data/plugin-data-store";
+import {
+	type LegacyCredential,
+	type PersistedData,
+	PluginDataStore,
+} from "../../src/data/plugin-data-store";
 
 /**
  * An in-memory `data.json`.
@@ -9,8 +13,14 @@ import { type PersistedData, PluginDataStore } from "../../src/data/plugin-data-
  * would let a LATER mutation rewrite what an EARLIER write is recorded as having persisted. Every
  * negative assertion in this file ("the sign-out is still on disk") would then pass for the wrong reason.
  */
-function fakeDisk(initial: PersistedData = {}) {
-	let disk: PersistedData = JSON.parse(JSON.stringify(initial)) as PersistedData;
+/** What an older build wrote: the record plus the sign-in it kept there. */
+type OnDisk = PersistedData & {
+	tokens?: { access_token: string; refresh_token?: string };
+	clientId?: string;
+};
+
+function fakeDisk(initial: OnDisk = {}) {
+	let disk: OnDisk = JSON.parse(JSON.stringify(initial)) as OnDisk;
 	const writes: PersistedData[] = [];
 	let gate: Promise<void> | undefined;
 	const load = vi.fn(async (): Promise<unknown> => JSON.parse(JSON.stringify(disk)));
@@ -26,10 +36,10 @@ function fakeDisk(initial: PersistedData = {}) {
 		save,
 		writes,
 		/** What a reader of the file would see. */
-		peek: (): PersistedData => disk,
+		peek: (): OnDisk => disk,
 		/** Replace the file underneath the plugin, as a sync service would. */
-		externalWrite: (next: PersistedData) => {
-			disk = JSON.parse(JSON.stringify(next)) as PersistedData;
+		externalWrite: (next: OnDisk) => {
+			disk = JSON.parse(JSON.stringify(next)) as OnDisk;
 		},
 		/** Hold every `save` until the returned release is called. */
 		hold: () => {
@@ -59,12 +69,12 @@ async function until(cond: () => boolean, what: string): Promise<void> {
 
 describe("PluginDataStore: one load", () => {
 	it("reads the file once, however many accessors run", async () => {
-		const d = fakeDisk({ clientId: "cid", vaultId: "vlt-1", tokens: { access_token: "at" } });
+		const d = fakeDisk({ vaultId: "vlt-1", vaultName: "Work" });
 		const store = await PluginDataStore.open(d.io);
 
 		for (let i = 0; i < 20; i += 1) {
 			expect(store.read().vaultId).toBe("vlt-1");
-			expect(store.read().tokens?.access_token).toBe("at");
+			expect(store.read().vaultName).toBe("Work");
 		}
 
 		expect(
@@ -89,7 +99,7 @@ describe("PluginDataStore: the write queue", () => {
 		// coalesce and a burst test built from them would prove nothing.
 		const all = Promise.all([
 			store.update((r) => {
-				r.clientId = "a";
+				r.sync = { lastSeq: 1, knownServer: [] };
 			}),
 			store.update((r) => {
 				r.vaultId = "b";
@@ -106,7 +116,7 @@ describe("PluginDataStore: the write queue", () => {
 		expect(d.save.mock.calls.length, "four updates must not be four writes").toBeLessThanOrEqual(2);
 		// The count alone would pass for a writer that never writes, so pin the content too.
 		expect(d.peek()).toEqual({
-			clientId: "a",
+			sync: { lastSeq: 1, knownServer: [] },
 			vaultId: "b",
 			vaultName: "c",
 			legacyCrdtPurged: true,
@@ -119,7 +129,7 @@ describe("PluginDataStore: the write queue", () => {
 
 		const release = d.hold();
 		const first = store.update((r) => {
-			r.clientId = "first";
+			r.vaultName = "first";
 		});
 		await until(() => d.save.mock.calls.length === 1, "the first write reached the disk");
 
@@ -149,18 +159,18 @@ describe("PluginDataStore: the write queue", () => {
 		const store = await PluginDataStore.open(d.io);
 		const seen: string[] = [];
 		d.save.mockImplementation(async (data: PersistedData) => {
-			seen.push(data.clientId ?? "?");
+			seen.push(data.vaultName ?? "?");
 		});
 
 		const a = store.update((r) => {
-			r.clientId = "a";
+			r.vaultName = "a";
 		});
 		const b = store.update((r) => {
-			r.clientId = "b";
+			r.vaultName = "b";
 		});
 		await Promise.all([a, b]);
 		const c = store.update((r) => {
-			r.clientId = "c";
+			r.vaultName = "c";
 		});
 		await c;
 
@@ -173,7 +183,7 @@ describe("PluginDataStore: the write queue", () => {
 
 		const release = d.hold();
 		void store.update((r) => {
-			r.clientId = "a";
+			r.vaultName = "a";
 		});
 		await until(() => d.save.mock.calls.length === 1, "the write started");
 		void store.update((r) => {
@@ -189,7 +199,7 @@ describe("PluginDataStore: the write queue", () => {
 
 		release();
 		await flushing;
-		expect(d.peek()).toEqual({ clientId: "a", vaultId: "b" });
+		expect(d.peek()).toEqual({ vaultName: "a", vaultId: "b" });
 	});
 
 	it("releases the queue when a write throws, so later writes still land", async () => {
@@ -199,7 +209,7 @@ describe("PluginDataStore: the write queue", () => {
 
 		await expect(
 			store.update((r) => {
-				r.clientId = "a";
+				r.vaultName = "a";
 			}),
 		).rejects.toThrow("disk full");
 
@@ -212,14 +222,15 @@ describe("PluginDataStore: the write queue", () => {
 
 describe("PluginDataStore: S3, the resurrection race", () => {
 	/**
-	 * ⛔ THE ONE THIS EXISTS FOR. A persister's write is suspended; the user signs out while it hangs.
+	 * ⛔ THE ONE THIS EXISTS FOR. A persister's write is suspended; a removal lands while it hangs.
 	 *
 	 * Under the old idiom the suspended writer held `{ ...staleRead }` — a snapshot taken BEFORE the
-	 * delete — and putting it down re-created `tokens`. Sign-out reported success, and `data.json`
-	 * syncs to iCloud, Obsidian Sync and git, so every copy of the vault kept a renewable credential.
+	 * delete — and putting it down re-created the key. It was found as a sign-out resurrecting the
+	 * credential (the credential is not in this file any more, NV33); it holds for every removal, and the
+	 * vault link's is the one left: an unlink that came back would re-link a folder to a vault it left.
 	 */
-	it("a sign-out during a suspended write is not undone by it", async () => {
-		const d = fakeDisk({ tokens: { access_token: "at", refresh_token: "rt" }, vaultId: "vlt-1" });
+	it("a removal during a suspended write is not undone by it", async () => {
+		const d = fakeDisk({ vaultId: "vlt-1", vaultName: "Work", legacyCrdtPurged: true });
 		const store = await PluginDataStore.open(d.io);
 
 		const release = d.hold();
@@ -228,51 +239,49 @@ describe("PluginDataStore: S3, the resurrection race", () => {
 		});
 		await until(() => d.save.mock.calls.length === 1, "the cursor write reached the disk");
 
-		const signOut = store.update((r) => {
-			delete r.tokens;
+		const unlink = store.update((r) => {
+			delete r.vaultId;
+			delete r.vaultName;
 		});
 		release();
-		await Promise.all([cursorPersist, signOut]);
+		await Promise.all([cursorPersist, unlink]);
 
-		expect(
-			d.peek().tokens,
-			"the credential was resurrected by a concurrent persist",
-		).toBeUndefined();
-		expect("tokens" in d.peek(), "the key must be ABSENT, not present-and-undefined").toBe(false);
+		expect(d.peek().vaultId, "the link was resurrected by a concurrent persist").toBeUndefined();
+		expect("vaultId" in d.peek(), "the key must be ABSENT, not present-and-undefined").toBe(false);
 		// The other writer's work is not lost either — this is a merge, not a last-writer-wins.
 		expect(d.peek().binary?.known["a.png"]?.etag).toBe("e");
-		expect(d.peek().vaultId).toBe("vlt-1");
+		expect(d.peek().legacyCrdtPurged).toBe(true);
 	});
 
 	/**
 	 * The falsifier for the test above, kept in the suite rather than done by hand and deleted.
 	 *
 	 * It drives the SAME interleaving against the idiom `main.ts` used to use, and asserts the bug is
-	 * real. If this ever stops resurrecting the credential, the interleaving has stopped being driven
-	 * and the test above is no longer proving anything.
+	 * real. If this ever stops resurrecting the key, the interleaving has stopped being driven and the
+	 * test above is no longer proving anything.
 	 */
 	it("the same interleaving against a read-modify-write persister DOES resurrect it", async () => {
-		const d = fakeDisk({ tokens: { access_token: "at" }, vaultId: "vlt-1" });
+		const d = fakeDisk({ vaultId: "vlt-1" });
 		const store = await PluginDataStore.open(d.io);
 
 		// The old idiom, verbatim: read the whole record...
 		const stale = (await d.io.load()) as PersistedData;
-		// ...the user signs out and it lands...
+		// ...the unlink lands...
 		await store.update((r) => {
-			delete r.tokens;
+			delete r.vaultId;
 		});
-		expect(d.peek().tokens).toBeUndefined();
+		expect(d.peek().vaultId).toBeUndefined();
 		// ...and only now does the persister put its spread of the stale read down.
 		await d.io.save({ ...stale, binary: { known: {} } });
 
 		expect(
-			d.peek().tokens?.access_token,
+			d.peek().vaultId,
 			"if this stops resurrecting, the interleaving above is no longer the dangerous one and the test before it proves nothing",
-		).toBe("at");
+		).toBe("vlt-1");
 	});
 
 	it("removes keys rather than writing them as undefined", async () => {
-		const d = fakeDisk({ tokens: { access_token: "at" }, vaultId: "v", vaultName: "n" });
+		const d = fakeDisk({ legacyCrdtPurged: true, vaultId: "v", vaultName: "n" });
 		const store = await PluginDataStore.open(d.io);
 
 		await store.update((r) => {
@@ -280,7 +289,7 @@ describe("PluginDataStore: S3, the resurrection race", () => {
 			delete r.vaultName;
 		});
 
-		expect(Object.keys(d.peek())).toEqual(["tokens"]);
+		expect(Object.keys(d.peek())).toEqual(["legacyCrdtPurged"]);
 	});
 
 	it("a one-shot migration flag survives writes from every other key", async () => {
@@ -295,7 +304,7 @@ describe("PluginDataStore: S3, the resurrection race", () => {
 				r.pending = { deletes: ["x.md"] };
 			}),
 			store.update((r) => {
-				delete r.tokens;
+				delete r.vaultId;
 			}),
 		]);
 
@@ -344,11 +353,11 @@ describe("PluginDataStore: slices", () => {
 });
 
 describe("PluginDataStore: an external change to the file", () => {
-	it("adopts the account-scoped keys another copy changed", async () => {
-		const d = fakeDisk({ clientId: "cid", vaultId: "vlt-1", vaultName: "Old" });
+	it("adopts the folder's keys another copy changed", async () => {
+		const d = fakeDisk({ vaultId: "vlt-1", vaultName: "Old" });
 		const store = await PluginDataStore.open(d.io);
 
-		d.externalWrite({ clientId: "cid", vaultId: "vlt-2", vaultName: "New" });
+		d.externalWrite({ vaultId: "vlt-2", vaultName: "New" });
 		await store.reloadExternal();
 
 		expect(store.read().vaultId).toBe("vlt-2");
@@ -376,46 +385,11 @@ describe("PluginDataStore: an external change to the file", () => {
 		expect(store.read().pending).toBeUndefined();
 	});
 
-	it("follows a sign-out from another copy", async () => {
-		const d = fakeDisk({ tokens: { access_token: "at", refresh_token: "rt" }, vaultId: "v" });
-		const store = await PluginDataStore.open(d.io);
-
-		d.externalWrite({ vaultId: "v" }); // the other copy signed out
-		await store.reloadExternal();
-
-		expect(store.read().tokens, "a sign-out elsewhere must fail closed here").toBeUndefined();
-		expect("tokens" in store.read()).toBe(false);
-	});
-
-	it("does NOT follow a sign-in from another copy", async () => {
-		const d = fakeDisk({ vaultId: "v" });
-		const store = await PluginDataStore.open(d.io);
-
-		d.externalWrite({ vaultId: "v", tokens: { access_token: "theirs" } });
-		await store.reloadExternal();
-
-		expect(store.read().tokens).toBeUndefined();
-	});
-
-	it("does not resurrect a local sign-out from a stale copy of the file", async () => {
-		const d = fakeDisk({ tokens: { access_token: "at" }, vaultId: "v" });
-		const store = await PluginDataStore.open(d.io);
-
-		await store.update((r) => {
-			delete r.tokens;
-		});
-		// A stale copy, written before the sign-out, syncs in.
-		d.externalWrite({ tokens: { access_token: "at" }, vaultId: "v" });
-		await store.reloadExternal();
-
-		expect(store.read().tokens, "the whole point of S3").toBeUndefined();
-	});
-
 	it("does not clobber an adopted key on the next write", async () => {
-		const d = fakeDisk({ clientId: "cid" });
+		const d = fakeDisk({ legacyCrdtPurged: true });
 		const store = await PluginDataStore.open(d.io);
 
-		d.externalWrite({ clientId: "cid", vaultId: "adopted", vaultName: "Adopted" });
+		d.externalWrite({ legacyCrdtPurged: true, vaultId: "adopted", vaultName: "Adopted" });
 		await store.reloadExternal();
 		await store.update((r) => {
 			r.vaultName = "Mine";
@@ -426,5 +400,59 @@ describe("PluginDataStore: an external change to the file", () => {
 			"caching without a reload silently destroys another copy's fields",
 		).toBe("adopted");
 		expect(d.peek().vaultName).toBe("Mine");
+	});
+});
+
+/**
+ * ⛔ Audit NV33: a sign-in in `data.json` is exposed, so it is taken off the disk and handed over for
+ * revocation, never used. Builds before 1.1.0 kept it there; a device still on one keeps writing it.
+ */
+describe("⛔ PluginDataStore: a sign-in found in the file (NV33)", () => {
+	const LEGACY = { access_token: "DUMMY-ACCESS", refresh_token: "DUMMY-REFRESH" };
+
+	it("hands this device's old sign-in over at load, and takes it off the disk", async () => {
+		const d = fakeDisk({ tokens: LEGACY, clientId: "cid", vaultId: "vlt-1" });
+		const found: LegacyCredential[] = [];
+		const store = await PluginDataStore.open(d.io, (c) => found.push(c));
+
+		expect(found).toEqual([{ tokens: LEGACY, clientId: "cid" }]);
+		expect(d.peek()).toEqual({ vaultId: "vlt-1" });
+		expect(JSON.stringify(d.peek())).not.toContain("DUMMY");
+		expect("tokens" in store.read()).toBe(false);
+	});
+
+	it("writes nothing at load when the file holds no sign-in", async () => {
+		const d = fakeDisk({ vaultId: "vlt-1" });
+		const found: LegacyCredential[] = [];
+		await PluginDataStore.open(d.io, (c) => found.push(c));
+		expect(found).toEqual([]);
+		expect(d.save).not.toHaveBeenCalled();
+	});
+
+	it("never adopts one another device writes in, hands it over, and takes it off the disk", async () => {
+		const d = fakeDisk({ vaultId: "v" });
+		const found: LegacyCredential[] = [];
+		const store = await PluginDataStore.open(d.io, (c) => found.push(c));
+
+		d.externalWrite({
+			vaultId: "v",
+			tokens: { access_token: "theirs", refresh_token: "their-rt" },
+			clientId: "cid",
+		});
+		await store.reloadExternal();
+
+		expect("tokens" in store.read()).toBe(false);
+		expect(found).toEqual([
+			{ tokens: { access_token: "theirs", refresh_token: "their-rt" }, clientId: "cid" },
+		]);
+		expect(d.peek()).toEqual({ vaultId: "v" });
+	});
+
+	it("takes a stray client id off the disk too, with nothing to revoke", async () => {
+		const d = fakeDisk({ clientId: "self-registered-by-an-older-build", vaultId: "v" });
+		const found: LegacyCredential[] = [];
+		await PluginDataStore.open(d.io, (c) => found.push(c));
+		expect(found).toEqual([]);
+		expect(d.peek()).toEqual({ vaultId: "v" });
 	});
 });

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { PersistedData } from "../../src/data/plugin-data-store";
 import { wirePersistence } from "../../src/data/wire-persistence";
+import { memCredentials } from "./fake-plugin-data";
 
 /**
  * The five persisters, wired the way `main.ts` wires them.
@@ -14,30 +15,36 @@ import { wirePersistence } from "../../src/data/wire-persistence";
  * `onLayoutReady` and `vault.on` on the stub — roadmap row G11, not this change. The source rule in
  * `store-rules.test.ts` is what holds that line in the meantime.
  */
-function fakeDisk(initial: PersistedData = {}) {
-	let disk = JSON.parse(JSON.stringify(initial)) as PersistedData;
+/** What an older build wrote: the record plus the sign-in it kept there. */
+type OnDisk = PersistedData & {
+	tokens?: { access_token: string; refresh_token?: string };
+	clientId?: string;
+};
+
+function fakeDisk(initial: OnDisk = {}) {
+	let disk = JSON.parse(JSON.stringify(initial)) as OnDisk;
 	const load = vi.fn(async (): Promise<unknown> => JSON.parse(JSON.stringify(disk)));
 	const save = vi.fn(async (d: PersistedData): Promise<void> => {
-		disk = JSON.parse(JSON.stringify(d)) as PersistedData;
+		disk = JSON.parse(JSON.stringify(d)) as OnDisk;
 	});
-	return { io: { load, save }, load, save, peek: (): PersistedData => disk };
+	return { io: { load, save }, load, save, peek: (): OnDisk => disk };
 }
 
 describe("wirePersistence", () => {
 	it("reads data.json exactly once for all five persisters", async () => {
 		const d = fakeDisk({
-			tokens: { access_token: "at" },
+			vaultId: "vlt-1",
 			sync: { lastSeq: 7, knownServer: ["a.md"] },
 			pending: { deletes: ["gone.md"] },
 			binary: { known: { "img.png": { etag: "e", hash: "h" } } },
 			binaryPending: { deletes: ["old.png"] },
 		});
 
-		const p = await wirePersistence(d.io);
+		const p = await wirePersistence(d.io, memCredentials().credentials);
 
 		expect(d.load, "five persisters used to mean five or more loads").toHaveBeenCalledOnce();
 		// Each one loaded ITS key, not someone else's.
-		expect(p.store.getTokens()?.access_token).toBe("at");
+		expect(p.store.getVaultId()).toBe("vlt-1");
 		expect(p.syncState.lastSeq).toBe(7);
 		expect(p.syncState.knownServer).toEqual(["a.md"]);
 		expect(p.mutationQueue.list()).toEqual(["gone.md"]);
@@ -47,7 +54,7 @@ describe("wirePersistence", () => {
 
 	it("gives the two MutationQueues different keys, not the same one", async () => {
 		const d = fakeDisk();
-		const p = await wirePersistence(d.io);
+		const p = await wirePersistence(d.io, memCredentials().credentials);
 
 		p.mutationQueue.enqueueDelete("note.md");
 		p.binaryQueue.enqueueDelete("pic.png");
@@ -57,32 +64,30 @@ describe("wirePersistence", () => {
 		expect(d.peek().binaryPending?.deletes).toEqual(["pic.png"]);
 	});
 
-	it("a sign-out is not undone by a sync persister writing at the same time", async () => {
-		const d = fakeDisk({ tokens: { access_token: "at", refresh_token: "rt" }, vaultId: "vlt-1" });
-		const p = await wirePersistence(d.io);
+	it("an unlink is not undone by a sync persister writing at the same time", async () => {
+		const d = fakeDisk({ vaultId: "vlt-1", vaultName: "Work" });
+		const p = await wirePersistence(d.io, memCredentials().credentials);
 
-		// The real shape of the S3 bug: attachment sync is mid-flight when the user signs out.
+		// The real shape of the S3 bug: attachment sync is mid-flight when the folder is unlinked.
 		p.binaryCursor.set("img.png", { etag: "e", hash: "h" });
 		p.syncState.lastSeq = 42;
 		await Promise.all([
 			p.binaryCursor.persist(),
-			p.store.signOut(),
+			p.store.unlinkVault(),
 			p.syncState.persist(),
 			p.mutationQueue.persist(),
 		]);
 		await p.data.flush();
 
-		expect(d.peek().tokens, "a concurrent persist resurrected the credential").toBeUndefined();
-		expect("tokens" in d.peek()).toBe(false);
+		expect("vaultId" in d.peek(), "a concurrent persist resurrected the link").toBe(false);
 		// And nobody's work was lost in the process.
 		expect(d.peek().binary?.known["img.png"]?.etag).toBe("e");
 		expect(d.peek().sync?.lastSeq).toBe(42);
-		expect(d.peek().vaultId).toBe("vlt-1");
 	});
 
 	it("four concurrent persists are not four rewrites of the whole record", async () => {
 		const d = fakeDisk();
-		const p = await wirePersistence(d.io);
+		const p = await wirePersistence(d.io, memCredentials().credentials);
 
 		p.syncState.lastSeq = 1;
 		p.mutationQueue.enqueueDelete("a.md");
@@ -109,12 +114,12 @@ describe("wirePersistence", () => {
 		 * without exercising the hazard at all — it did, until deleting the copy failed to break it.
 		 */
 		const d = fakeDisk({ binary: { known: { "old.png": { etag: "e0", hash: "h0" } } } });
-		const p = await wirePersistence(d.io);
+		const p = await wirePersistence(d.io, memCredentials().credentials);
 
 		p.binaryCursor.set("img.png", { etag: "e", hash: "h" });
 		// Someone else writes. The cursor's uncommitted entry must NOT ride along: claiming a file is
 		// synced before it was written makes last-writer-wins skip the pull forever.
-		await p.store.setTokens({ access_token: "at" });
+		await p.store.setVault("vlt-1", "Work");
 
 		expect(
 			d.peek().binary?.known["img.png"],
@@ -126,26 +131,72 @@ describe("wirePersistence", () => {
 		expect(d.peek().binary?.known["img.png"]?.etag).toBe("e");
 	});
 
-	it("a sign-in lands the tokens and their client in one write", async () => {
-		// Two writes would leave a window in which the tokens on disk belong to a different client from
-		// the id beside them, and a refresh in that window presents the wrong one.
-		const d = fakeDisk({ clientId: "self-registered-by-an-older-build" });
-		const p = await wirePersistence(d.io);
+	it("a sign-in lands the tokens and their client together, and writes nothing to the file", async () => {
+		// Apart, a refresh could present a client the tokens do not belong to.
+		const d = fakeDisk({ vaultId: "vlt-1" });
+		const { credentials } = memCredentials();
+		const p = await wirePersistence(d.io, credentials);
 		const before = d.save.mock.calls.length;
 
 		await p.store.completeSignIn({ access_token: "at", refresh_token: "rt" }, "the-plugin");
 
-		expect(d.save.mock.calls.length - before).toBe(1);
-		expect(d.peek().clientId).toBe("the-plugin");
-		expect(d.peek().tokens?.refresh_token).toBe("rt");
+		expect(credentials.signedIn()).toEqual({
+			tokens: { access_token: "at", refresh_token: "rt" },
+			clientId: "the-plugin",
+		});
+		expect(d.save.mock.calls.length - before, "the sign-in reached data.json").toBe(0);
+	});
+
+	it("⛔ queues an old build's sign-in for revocation, signs out, and takes it off the disk (NV33)", async () => {
+		const d = fakeDisk({
+			tokens: { access_token: "at", refresh_token: "DUMMY-RT" },
+			clientId: "cid",
+			vaultId: "vlt-1",
+		});
+		const { credentials } = memCredentials();
+		const p = await wirePersistence(d.io, credentials);
+
+		expect(p.foundExposedSignIn).toBe(true);
+		expect(p.store.isConnected(), "a sign-in from the vault folder must not be used").toBe(false);
+		expect(credentials.pendingRevokes()).toEqual([{ refresh_token: "DUMMY-RT", clientId: "cid" }]);
+		expect(d.peek()).toEqual({ vaultId: "vlt-1" });
+		// The folder's link is kept, so signing in again resumes the same vault.
+		expect(p.store.getVaultId()).toBe("vlt-1");
+	});
+
+	it("⛔ an old build's sign-in with no refresh token has nothing to revoke, and is still dropped", async () => {
+		const d = fakeDisk({ tokens: { access_token: "at" }, clientId: "cid" });
+		const { credentials } = memCredentials();
+		const p = await wirePersistence(d.io, credentials);
+		expect(p.foundExposedSignIn).toBe(true);
+		expect(credentials.pendingRevokes()).toEqual([]);
+		expect(d.peek()).toEqual({});
+	});
+
+	it("⛔ a sign-in another device writes into the file is queued for revocation too", async () => {
+		const d = fakeDisk({ vaultId: "v" });
+		const { credentials } = memCredentials();
+		const p = await wirePersistence(d.io, credentials);
+		expect(p.foundExposedSignIn).toBe(false);
+
+		await d.io.save({
+			vaultId: "v",
+			tokens: { access_token: "x", refresh_token: "THEIR-RT" },
+			clientId: "cid",
+		} as PersistedData);
+		await p.data.reloadExternal();
+
+		expect(credentials.pendingRevokes()).toEqual([{ refresh_token: "THEIR-RT", clientId: "cid" }]);
+		expect(p.store.isConnected()).toBe(false);
+		expect(d.peek()).toEqual({ vaultId: "v" });
 	});
 
 	it("a queue mutating its own list does not reach the file until it persists", async () => {
 		const d = fakeDisk({ pending: { deletes: ["already.md"] } });
-		const p = await wirePersistence(d.io);
+		const p = await wirePersistence(d.io, memCredentials().credentials);
 
 		p.mutationQueue.enqueueDelete("new.md");
-		await p.store.setTokens({ access_token: "at" });
+		await p.store.setVault("vlt-1", "Work");
 
 		expect(d.peek().pending?.deletes).toEqual(["already.md"]);
 		await p.mutationQueue.persist();

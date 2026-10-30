@@ -12,13 +12,6 @@ import type { Tokens } from "../types";
  * REMOVE keys, and only a removal round-trips through JSON as an absence.
  */
 export interface PersistedData {
-	/**
-	 * The OAuth client `tokens` were issued to, which every refresh and revoke must present: the plugin's
-	 * own `CLIENT_ID` once it has connected under it, or the id an older build registered for itself,
-	 * until its next connect.
-	 */
-	clientId?: string;
-	tokens?: Tokens;
 	/** The Copal vault this Obsidian folder is linked to — sent as `X-Copal-Vault`. Set while connected;
 	 *  a linked folder resumes on reload/re-auth. **Disconnect clears it** (fully unlink) → the next login
 	 *  shows the adopt screen. */
@@ -47,6 +40,24 @@ export interface PersistedData {
 	binaryPending?: MutationData;
 }
 
+/**
+ * ⛔ **A sign-in found in `data.json`** (audit NV33). Builds before 1.1.0 kept `tokens` and the `clientId`
+ * they were issued to here, inside the vault folder, so every copy of the folder carried them. This
+ * build never writes them, and treats any it finds as exposed: they are taken out of the record and
+ * handed to `onLegacyCredential`, which revokes them. That covers this device's own pre-1.1.0 sign-in on
+ * its first load, and one a device still on an older build writes into a synced `data.json` later.
+ */
+export interface LegacyCredential {
+	tokens: Tokens;
+	clientId?: string;
+}
+
+/** The keys an older build kept the sign-in under. Never written by this one. */
+interface LegacyKeys {
+	tokens?: Tokens;
+	clientId?: string;
+}
+
 /** One key of the record, handed to the persister that owns it. */
 export interface DataSlice<T> {
 	get(): T | undefined;
@@ -62,14 +73,15 @@ export interface PluginDataIo {
 /**
  * The keys an externally-changed `data.json` is allowed to bring in. See `reloadExternal`.
  *
- * These are the account-scoped facts that legitimately travel with a synced vault. Everything absent
+ * These are the facts about the FOLDER that legitimately travel with a synced vault. Everything absent
  * from this list is deliberately absent:
  *  - `sync`, `pending`, `binary` and `binaryPending` describe this device's relationship to the server.
  *    Adopting another device's `lastSeq` would skip journal frames this client never applied, and its
  *    `binary.known` would skip pulls for files this device does not have.
- *  - `tokens` is handled separately and asymmetrically — see `reloadExternal`.
+ *  - the sign-in is not in this file at all; one found here is revoked, never adopted (see
+ *    {@link LegacyCredential}).
  */
-const ADOPTABLE = ["clientId", "vaultId", "vaultName", "legacyCrdtPurged"] as const;
+const ADOPTABLE = ["vaultId", "vaultName", "legacyCrdtPurged"] as const;
 
 /** The single key the write queue is serialised on. There is one file, so there is one key. */
 const THE_FILE = "data.json";
@@ -94,8 +106,22 @@ function copy<T>(value: T): T {
 	return JSON.parse(JSON.stringify(value)) as T;
 }
 
-function asRecord(loaded: unknown): PersistedData {
-	return typeof loaded === "object" && loaded !== null ? (loaded as PersistedData) : {};
+function asRecord(loaded: unknown): PersistedData & LegacyKeys {
+	return typeof loaded === "object" && loaded !== null
+		? (loaded as PersistedData & LegacyKeys)
+		: {};
+}
+
+/** The sign-in an older build left in `record`, if any, and the record without it. */
+function splitLegacy(record: PersistedData & LegacyKeys): {
+	legacy: LegacyCredential | undefined;
+	held: boolean;
+	rest: PersistedData;
+} {
+	const { tokens, clientId, ...rest } = record;
+	const legacy =
+		tokens === undefined ? undefined : clientId === undefined ? { tokens } : { tokens, clientId };
+	return { legacy, held: tokens !== undefined || clientId !== undefined, rest };
 }
 
 /**
@@ -122,6 +148,7 @@ export class PluginDataStore {
 	private constructor(
 		private readonly io: PluginDataIo,
 		private record: PersistedData,
+		private readonly onLegacyCredential: (credential: LegacyCredential) => void,
 	) {
 		this.disk = copy(record);
 	}
@@ -133,8 +160,16 @@ export class PluginDataStore {
 	 * because Obsidian's `onExternalSettingsChange` hands over no payload. The `io.load` thunk is
 	 * retained for that and is not a leftover.
 	 */
-	static async open(io: PluginDataIo): Promise<PluginDataStore> {
-		return new PluginDataStore(io, asRecord(await io.load()));
+	static async open(
+		io: PluginDataIo,
+		onLegacyCredential: (credential: LegacyCredential) => void = () => {},
+	): Promise<PluginDataStore> {
+		const { legacy, held, rest } = splitLegacy(asRecord(await io.load()));
+		const store = new PluginDataStore(io, rest, onLegacyCredential);
+		if (legacy !== undefined) onLegacyCredential(legacy);
+		// Off the disk at once, so the credential stops travelling with the folder from this load on.
+		if (held) await store.update(() => {});
+		return store;
 	}
 
 	/** The canonical record. Synchronous: there is no I/O behind it. */
@@ -184,18 +219,13 @@ export class PluginDataStore {
 	 * destroy it on the next write. This is the price of the cache, not an extra.
 	 *
 	 * The policy is an explicit allowlist ({@link ADOPTABLE}) rather than "adopt anything this session
-	 * has not written". That rule sounds safer and is not: a device that refreshed its token this
-	 * session would treat `tokens` as its own and write a live credential back over another device's
-	 * sign-out, reversing it on disk and syncing the reversal back.
-	 *
-	 * `tokens` therefore gets one asymmetric rule: **adopt a sign-out, never a sign-in.** Tokens that
-	 * have GONE from disk mean another copy signed out, and following that fails closed. Tokens
-	 * appearing when we have none is a sign-in elsewhere that a reload picks up anyway, and adopting it
-	 * mid-session buys nothing. Telling those apart needs the previous disk record, because with
-	 * `exactOptionalPropertyTypes` an absence is not a value — hence {@link disk}.
+	 * has not written". A sign-in is never adopted: one found on disk was written by a device on an older
+	 * build, is exposed by being there, and is revoked and taken off the disk like the one {@link open}
+	 * finds. That write reaches the other device as a sign-out, which is what an exposed credential
+	 * should cost it.
 	 */
 	async reloadExternal(): Promise<void> {
-		const next = asRecord(await this.io.load());
+		const { legacy, held, rest: next } = splitLegacy(asRecord(await this.io.load()));
 		const previous = this.disk;
 		this.disk = copy(next);
 
@@ -206,9 +236,7 @@ export class PluginDataStore {
 			this.record = { ...this.record, [key]: incoming };
 		}
 
-		if (next.tokens === undefined && previous.tokens !== undefined) {
-			const { tokens: _signedOutElsewhere, ...rest } = this.record;
-			this.record = rest;
-		}
+		if (legacy !== undefined) this.onLegacyCredential(legacy);
+		if (held) await this.update(() => {});
 	}
 }

@@ -381,8 +381,9 @@ export async function refresh(
  * ⚠️ Form-encoded, not JSON: the provider declares `allowedMediaTypes:
  * ["application/x-www-form-urlencoded"]` and rejects a JSON body outright.
  *
- * Throws on a non-ok response so the caller can report honestly. The caller is also the one that
- * decides to swallow: a failed revoke must never block the local sign-out.
+ * Throws on a failure so the caller can report honestly, except the two answers that mean the token is
+ * already dead (see {@link tokenAlreadyDead}). The caller is also the one that decides to swallow: a
+ * failed revoke must never block the local sign-out.
  */
 export async function revoke(
 	f: typeof fetch,
@@ -402,7 +403,30 @@ export async function revoke(
 			client_id: clientId,
 		}).toString(),
 	});
-	if (!res.ok) throw new Error(`token revocation failed: ${res.status}`);
+	if (res.ok || (await tokenAlreadyDead(res))) return;
+	throw new Error(`token revocation failed: ${res.status}`);
+}
+
+/**
+ * The two answers that mean the refresh token can never be used again, which is all a revoke is for.
+ *
+ * ⛔ Measured on production (2026-10-30, NV33): Copal's authorization server — Better Auth's OAuth
+ * provider — answers a refresh token it does not hold with 400 `invalid_request` "token not found", and
+ * one already revoked with 400 "refresh token revoked" after invalidating its whole family. RFC 7009
+ * §2.2 says an invalid token is not an error and answers 200. Read as failures, a sign-in found in the
+ * vault folder whose token another device had since rotated would be retried at every start for ever.
+ * Only these two are done; any other 400 is still a failure.
+ */
+async function tokenAlreadyDead(res: Response): Promise<boolean> {
+	if (res.status !== 400) return false;
+	const body = (await res.json().catch(() => undefined)) as
+		| { error?: unknown; error_description?: unknown }
+		| undefined;
+	return (
+		body?.error === "invalid_request" &&
+		(body.error_description === "token not found" ||
+			body.error_description === "refresh token revoked")
+	);
 }
 
 /**

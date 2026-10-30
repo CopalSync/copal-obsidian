@@ -3,6 +3,7 @@ import "fake-indexeddb/auto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PersistedData } from "../src/data/plugin-data-store";
 import CopalPlugin from "../src/main";
+import { signInOn } from "./data/fake-plugin-data";
 import { __setRequestUrl, Notice, stubApp } from "./stubs/obsidian";
 
 /**
@@ -59,9 +60,7 @@ function serveVaults(body: unknown): void {
 async function openJoinScreen(localFiles: Record<string, string>, ...vaultNames: string[]) {
 	const app = stubApp(localFiles);
 	const plugin = new CopalPlugin(app as never, {} as never);
-	await (plugin as unknown as { saveData(d: unknown): Promise<void> }).saveData({
-		tokens: TOKENS,
-	} as unknown as PersistedData);
+	signInOn(app, TOKENS);
 	await plugin.onload();
 	serveVaults(vaultsBody(...vaultNames));
 	// Don't await: the modal blocks on the user's choice.
@@ -129,11 +128,11 @@ describe("when the folder's vault vanished from the account", () => {
 		// plugin lost their notes.
 		const app = stubApp({ "mine.md": "x" });
 		const plugin = new CopalPlugin(app as never, {} as never);
+		signInOn(app, TOKENS);
 		await (plugin as unknown as { saveData(d: unknown): Promise<void> }).saveData({
-			tokens: TOKENS,
 			vaultId: "vlt-gone",
 			vaultName: "Gone",
-		} as unknown as PersistedData);
+		} satisfies PersistedData);
 		await plugin.onload();
 		serveVaults(vaultsBody("Research"));
 		void (plugin as unknown as { startSync(): Promise<void> }).startSync();

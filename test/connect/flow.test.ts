@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { ConnectFlow } from "../../src/connect/flow";
 import { CLIENT_ID } from "../../src/connect/oauth";
-import type { PersistedData, TokenStore } from "../../src/connect/store";
-import { memStore as memData } from "../data/fake-plugin-data";
+import type { TokenStore } from "../../src/connect/store";
+import { memStore as memData, type Seed } from "../data/fake-plugin-data";
 
 // Discovery is two hops: the gateway's protected-resource document names the authorization
 // server, and the authorization server's own metadata carries the endpoints. They are different
@@ -23,7 +23,7 @@ const json = (b: unknown, status = 200) => new Response(JSON.stringify(b), { sta
 const discovery = (f: ReturnType<typeof vi.fn<typeof fetch>>) =>
 	f.mockResolvedValueOnce(json(PRM)).mockResolvedValueOnce(json(DISC));
 
-async function memStore(initial: PersistedData = {}): Promise<TokenStore> {
+async function memStore(initial: Seed = {}): Promise<TokenStore> {
 	return (await memData(initial)).store;
 }
 

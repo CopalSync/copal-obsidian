@@ -1,42 +1,51 @@
 import type { PersistedData, PluginDataStore } from "../data/plugin-data-store";
 import type { Tokens } from "../types";
+import type { CredentialStore } from "./credential-store";
 
 export type { PersistedData };
 
 /**
- * The connect-side view of the plugin's persisted record.
+ * The connect-side view of the plugin's state: the sign-in, from this device's secret store, and the
+ * vault link, from `data.json`.
  *
- * ⚠️ **Reads are synchronous, and that is the honest signature.** This class used to re-read and
- * re-parse the whole of `data.json` on every single getter — a `settings.ts` render was four file
- * loads, a `flow.start()` about six — with a docblock presenting "never holds stale in-memory state"
- * as the design. {@link PluginDataStore} loads once and keeps one canonical record, so an `await` here
- * would no longer mean a read; leaving it would invite `await`-in-a-loop over something free.
+ * ⛔ **The sign-in never touches `data.json` (audit NV33).** That file is inside the vault folder and
+ * travels with every copy of it; the credential lives in {@link CredentialStore}, which is per device
+ * and outside the folder. The vault link stays in `data.json` on purpose: it describes the FOLDER, so a
+ * second device syncing the same folder resumes the same vault once it signs in.
  *
- * Mutators stay async: they resolve when the bytes are on disk.
+ * ⚠️ **Reads are synchronous, and that is the honest signature.** Both stores answer from memory
+ * (Obsidian's secret store keeps its decrypted map in memory), so an `await` here would not mean a read.
+ * Mutators stay async: callers already await them, and the vault link's resolve when the bytes are on
+ * disk.
  */
 export class TokenStore {
-	constructor(private readonly data: PluginDataStore) {}
+	constructor(
+		private readonly data: PluginDataStore,
+		private readonly credentials: CredentialStore,
+	) {}
 
 	getClientId(): string | undefined {
-		return this.data.read().clientId;
+		return this.credentials.signedIn()?.clientId;
 	}
 
 	getTokens(): Tokens | undefined {
-		return this.data.read().tokens;
+		return this.credentials.signedIn()?.tokens;
 	}
 
-	/** Sign-in landed: record the credential and the client it was issued to, in ONE write. */
+	/** Sign-in landed: record the credential and the client it was issued to, together. */
 	async completeSignIn(tokens: Tokens, clientId: string): Promise<void> {
-		await this.data.update((d) => {
-			d.tokens = tokens;
-			d.clientId = clientId;
-		});
+		this.credentials.setSignedIn({ tokens, clientId });
 	}
 
+	/**
+	 * A refresh rotated the tokens. It updates a sign-in that exists and never creates one: a rotation
+	 * that resolves after sign-out has nothing to update, which backs `TokenManager`'s `abandoned` latch
+	 * (C14) rather than relying on it alone.
+	 */
 	async setTokens(tokens: Tokens): Promise<void> {
-		await this.data.update((d) => {
-			d.tokens = tokens;
-		});
+		const current = this.credentials.signedIn();
+		if (current === undefined) return;
+		this.credentials.setSignedIn({ ...current, tokens });
 	}
 
 	getLegacyCrdtPurged(): boolean {
@@ -66,19 +75,11 @@ export class TokenStore {
 	}
 
 	/**
-	 * Sign out: drop the tokens but **keep the vault link** (and the client id). Signing back in resumes the
-	 * same vault exactly as it was — the everyday pause/re-auth.
-	 *
-	 * ⛔ This delete is what S3 was about. It used to be `save({ ...(await read()) })` with the key
-	 * removed, so any of the four sync persisters holding a read taken before it put the credential
-	 * straight back — and `data.json` travels with the vault to iCloud, Obsidian Sync and git. The
-	 * mutation now lands on the one canonical record with no read in between, so there is nothing stale
-	 * for a concurrent writer to spread.
+	 * Sign out: drop the credential but **keep the vault link**. Signing back in resumes the same vault
+	 * exactly as it was — the everyday pause/re-auth. Revoking it first is `tearDownCredential`'s job.
 	 */
 	async signOut(): Promise<void> {
-		await this.data.update((d) => {
-			delete d.tokens;
-		});
+		this.credentials.setSignedIn(undefined);
 	}
 
 	/**
@@ -104,11 +105,11 @@ export class TokenStore {
 	 * Self-deleting: once an install has re-authenticated it can never re-enter this state.
 	 */
 	needsReauth(): boolean {
-		const tokens = this.data.read().tokens;
+		const tokens = this.getTokens();
 		return tokens?.access_token !== undefined && tokens.refresh_token === undefined;
 	}
 
 	isConnected(): boolean {
-		return Boolean(this.data.read().tokens?.access_token);
+		return Boolean(this.getTokens()?.access_token);
 	}
 }

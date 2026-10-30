@@ -1,8 +1,8 @@
 {
 	"id": "copal",
 	"name": "Copal",
-	"version": "1.0.1",
-	"minAppVersion": "1.7.2",
+	"version": "1.1.0",
+	"minAppVersion": "1.11.4",
 	"description": "Sync your notes and attachments to a hosted Copal vault in real time, with keep-both conflict copies and search across your whole vault by meaning.",
 	"author": "Bison Labs Limited",
 	"authorUrl": "https://copal.uk",

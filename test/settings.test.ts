@@ -148,13 +148,14 @@ describe("connected", () => {
 	});
 
 	it("carries the credential-storage fine print (S4)", async () => {
-		// A transparency promise, not decoration: the sign-in lives in plugin data, so it travels with
-		// a synced vault. `docs/subprocessors.md` is written on the basis that this is disclosed.
+		// A transparency promise, not decoration: where the sign-in lives decides what a copy of the
+		// vault carries. Since NV33 it is Obsidian's secure storage, and a copy carries none.
 		const { container } = tabFor();
 		await vi.waitFor(() => expect(text(container)).toMatch(/Connected/));
 		const fine = container.querySelector(".copal-fineprint");
 		expect(fine, "the disclosure must actually render").not.toBe(null);
-		expect(fine?.textContent ?? "").toMatch(/your sign-in travels with it/i);
+		expect(fine?.textContent ?? "").toMatch(/secure storage on this device/i);
+		expect(fine?.textContent ?? "").toMatch(/carries no sign-in/i);
 		expect(fine?.textContent ?? "").toMatch(/up to an hour/i);
 	});
 

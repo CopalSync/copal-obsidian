@@ -30,6 +30,8 @@ import {
 } from "./connect/token-manager";
 import type { PluginDataStore } from "./data/plugin-data-store";
 import { wirePersistence } from "./data/wire-persistence";
+import { CredentialStore } from "./connect/credential-store";
+import { revokeExposed } from "./connect/revoke-exposed";
 import { CopalSettingTab } from "./settings";
 import { log } from "./log";
 import { ApiError, type SearchHit, type SearchMode, SyncApi, type Vault } from "./sync/api";
@@ -72,6 +74,7 @@ export default class CopalPlugin extends Plugin {
 	store!: TokenStore;
 	/** The one writer for `data.json`. */
 	private data!: PluginDataStore;
+	private credentials!: CredentialStore;
 	flow!: ConnectFlow;
 	private tokens!: TokenManager;
 	/** Once per session: a burst of 401s must not become a burst of notices. */
@@ -96,10 +99,15 @@ export default class CopalPlugin extends Plugin {
 	private lastStatusLabel = "not connected";
 
 	override async onload(): Promise<void> {
-		const persistence = await wirePersistence({
-			load: () => this.loadData() as Promise<unknown>,
-			save: (data) => this.saveData(data),
-		});
+		// The sign-in lives in Obsidian's secret store on this device, never in the vault folder (NV33).
+		this.credentials = new CredentialStore(this.app.secretStorage, this.app);
+		const persistence = await wirePersistence(
+			{
+				load: () => this.loadData() as Promise<unknown>,
+				save: (data) => this.saveData(data),
+			},
+			this.credentials,
+		);
 		this.data = persistence.data;
 		this.store = persistence.store;
 		this.flow = new ConnectFlow({
@@ -339,6 +347,19 @@ export default class CopalPlugin extends Plugin {
 				 * still works until it expires, so do NOT sign them out — interrupting sync that is
 				 * working right now would be gratuitous. Say it once and let Settings offer the button.
 				 */
+				/*
+				 * A sign-in found in the vault folder (a build before 1.1.0 kept it there) is revoked
+				 * before anything else, and this device signs in again into its own secret store. The
+				 * revoke is what makes every copy of the folder useless; one that fails is retried at the
+				 * next start.
+				 */
+				await revokeExposed(this.credentials, requestUrlFetch);
+				if (persistence.foundExposedSignIn) {
+					new Notice(
+						"Copal now keeps your sign-in in Obsidian's secure storage on this device, not in the vault folder. Sign in again in Settings → Copal.",
+						15000,
+					);
+				}
 				if (this.store.needsReauth()) {
 					new Notice(
 						"Copal: this sign-in can't renew itself and will stop working soon. Open Settings → Copal and choose Sign in again.",
@@ -386,11 +407,13 @@ export default class CopalPlugin extends Plugin {
 	 * ⛔ Required by the cache, not a nicety. The old code spread a fresh read into every write, so a
 	 * key another copy owned survived ours by accident. With one in-memory record and no reload, the
 	 * next write would silently destroy it. `PluginDataStore.reloadExternal` states which keys it will
-	 * take and why; the short version is account-scoped facts yes, this device's sync progress no, and
-	 * a sign-out elsewhere is followed while a sign-in elsewhere is not.
+	 * take and why; the short version is facts about the folder yes, this device's sync progress no, and
+	 * a sign-in never: it is not in that file, and one found there is revoked.
 	 */
 	override async onExternalSettingsChange(): Promise<void> {
 		await this.data.reloadExternal();
+		// A device on an older build wrote its sign-in into the synced data.json: take it back.
+		await revokeExposed(this.credentials, requestUrlFetch);
 		await this.settingsTab?.refresh();
 	}
 

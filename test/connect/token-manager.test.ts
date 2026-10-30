@@ -1,12 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { TokenManager, type ReauthReason } from "../../src/connect/token-manager";
 import type { TokenStore } from "../../src/connect/store";
-import type { PersistedData } from "../../src/connect/store";
 import type { Tokens } from "../../src/types";
-import { memStore as memData } from "../data/fake-plugin-data";
+import { memStore as memData, type Seed } from "../data/fake-plugin-data";
 
-async function memStore(initial: PersistedData = {}): Promise<TokenStore> {
-	return (await memData(initial)).store;
+async function memStore(seed: Seed = {}): Promise<TokenStore> {
+	return (await memData(seed)).store;
 }
 
 /**
@@ -24,18 +23,19 @@ const DISCOVERY = {
 };
 
 /**
- * `memStore`, but the raw record stays readable so a test can prove what was NOT written.
+ * `memStore`, but the credential stays readable as the secret store holds it, so a test can prove what
+ * was NOT written.
  *
- * ⚠️ `peek` is the DISK, not the store's in-memory record. The assertions below are negative — "the
- * rotated refresh token was never persisted" — and reading the in-memory record instead would leave
- * them green against an implementation that mutates first and only guards the write.
+ * ⚠️ `peek` parses the stored secret itself rather than asking the `TokenStore`. The assertions below
+ * are negative — "the rotated refresh token was never persisted" — and they must read what a later
+ * load would read.
  */
-async function peekableStore(initial: PersistedData = {}): Promise<{
+async function peekableStore(seed: Seed = {}): Promise<{
 	store: TokenStore;
-	peek: () => PersistedData;
+	peek: () => ReturnType<Awaited<ReturnType<typeof memData>>["signIn"]>;
 }> {
-	const m = await memData(initial);
-	return { store: m.store, peek: m.peek };
+	const m = await memData(seed);
+	return { store: m.store, peek: m.signIn };
 }
 
 function json(body: unknown, status = 200): Response {
@@ -320,8 +320,8 @@ describe("sign-out", () => {
 
 		// THE ASSERTION. `data.json` must still hold the pre-sign-out record: had the rotated token
 		// been written, a copy of this vault could renew from it for another 14 days.
-		expect(peek().tokens?.refresh_token).toBe("old-rt");
-		expect(peek().tokens?.access_token).toBe("old-at");
+		expect(peek()?.tokens?.refresh_token).toBe("old-rt");
+		expect(peek()?.tokens?.access_token).toBe("old-at");
 		// ...and the IN-MEMORY record too. Since `data.json` became a cached canonical record, the
 		// mutation is what resurrects a credential and the write merely follows it, so a disk-only
 		// assertion would no longer see a store that was mutated and not yet flushed.
@@ -395,7 +395,7 @@ describe("sign-out", () => {
 		expect(await inFlight).toBe("threw");
 		await abandoned;
 
-		expect(peek().tokens?.refresh_token).toBe("old-rt");
+		expect(peek()?.tokens?.refresh_token).toBe("old-rt");
 		// The credential was already dead on this path; revoking it would be a pointless round trip.
 		expect(revokedTokens()).toEqual([]);
 	});

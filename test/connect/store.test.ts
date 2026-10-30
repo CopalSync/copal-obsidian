@@ -1,78 +1,140 @@
 import { describe, expect, it } from "vitest";
 import { TokenStore } from "../../src/connect/store";
 import { PluginDataStore } from "../../src/data/plugin-data-store";
-import { memStore } from "../data/fake-plugin-data";
+import { SecretStorage } from "../stubs/obsidian";
+import { memCredentials, memData, memStore } from "../data/fake-plugin-data";
+
+const ROTATED = {
+	access_token: "DUMMY-ACCESS-2",
+	refresh_token: "DUMMY-REFRESH-2-ROTATED",
+	expires_at: 9e15,
+};
 
 describe("TokenStore", () => {
-	it("round-trips client id and tokens through the injected save", async () => {
+	it("round-trips client id and tokens through this device's secret store", async () => {
 		const m = await memStore();
-		const store = m.store;
-		await store.completeSignIn({ access_token: "at", scope: "vault.read vault.write" }, "cid");
-		expect(store.getClientId()).toBe("cid");
-		expect(store.getTokens()?.access_token).toBe("at");
-		expect(m.peek().clientId).toBe("cid");
+		await m.store.completeSignIn({ access_token: "at", scope: "vault.read vault.write" }, "cid");
+		expect(m.store.getClientId()).toBe("cid");
+		expect(m.store.getTokens()?.access_token).toBe("at");
+		expect(m.signIn()).toEqual({
+			tokens: { access_token: "at", scope: "vault.read vault.write" },
+			clientId: "cid",
+		});
 	});
 
 	it("isConnected reflects the presence of an access token", async () => {
 		const m = await memStore();
-		const store = m.store;
-		expect(store.isConnected()).toBe(false);
-		await store.setTokens({ access_token: "at" });
-		expect(store.isConnected()).toBe(true);
+		expect(m.store.isConnected()).toBe(false);
+		await m.store.completeSignIn({ access_token: "at" }, "cid");
+		expect(m.store.isConnected()).toBe(true);
 	});
 
-	it("signOut() drops tokens but keeps the vault link (sign back in → resume)", async () => {
+	it("signOut() drops the sign-in but keeps the vault link (sign back in → resume)", async () => {
 		const m = await memStore();
-		const store = m.store;
-		await store.completeSignIn({ access_token: "at" }, "cid");
-		await store.setVault("vlt_1", "Work");
-		await store.signOut();
-		expect(store.getTokens()).toBeUndefined();
-		expect(store.isConnected()).toBe(false);
-		expect(store.getVaultId()).toBe("vlt_1"); // link kept → resume on sign-in
-		expect(store.getClientId()).toBe("cid");
+		await m.store.completeSignIn({ access_token: "at" }, "cid");
+		await m.store.setVault("vlt_1", "Work");
+		await m.store.signOut();
+		expect(m.store.getTokens()).toBeUndefined();
+		expect(m.store.getClientId()).toBeUndefined();
+		expect(m.store.isConnected()).toBe(false);
+		expect(m.store.getVaultId()).toBe("vlt_1"); // link kept → resume on sign-in
+		// Nothing of the credential is left in the secret store, whose public API has no delete.
+		expect(m.secrets.listSecrets().map((id) => m.secrets.getSecret(id))).toEqual([""]);
 	});
 
 	it("unlinkVault() drops the vault link but stays signed in (linked vault vanished)", async () => {
-		const m = await memStore();
-		const store = m.store;
-		await store.setTokens({ access_token: "at" });
-		await store.setVault("vlt_1", "Work");
-		await store.unlinkVault();
-		expect(store.getVaultId()).toBeUndefined();
-		expect(store.getVaultName()).toBeUndefined();
-		expect(store.isConnected()).toBe(true); // still signed in
-	});
-
-	it("a removal takes the key out of the in-memory record, not just off the disk", async () => {
-		// `JSON.stringify` drops `undefined` values, so the bytes look identical either way and the
-		// disk cannot tell these apart. The canonical record can, and `exactOptionalPropertyTypes`
-		// means "absent" and "present as undefined" are genuinely different types here.
-		const m = await memStore({ tokens: { access_token: "at" }, vaultId: "v", vaultName: "n" });
-		await m.store.signOut();
-		expect("tokens" in m.data.read()).toBe(false);
-
+		const m = await memStore({ clientId: "cid", tokens: { access_token: "at" } });
+		await m.store.setVault("vlt_1", "Work");
 		await m.store.unlinkVault();
+		expect(m.store.getVaultId()).toBeUndefined();
+		expect(m.store.getVaultName()).toBeUndefined();
+		expect(m.store.isConnected()).toBe(true); // still signed in
 		expect("vaultId" in m.data.read()).toBe(false);
 		expect("vaultName" in m.data.read()).toBe(false);
 	});
 
 	it("tolerates a null initial load (fresh install)", async () => {
-		// `PluginDataStore.open` is what turns an absent file into `{}` now, so this is its test as much
-		// as TokenStore's — the behaviour is the same and it is still pinned.
 		const store = new TokenStore(
 			await PluginDataStore.open({
 				load: () => Promise.resolve(null),
 				save: () => Promise.resolve(),
 			}),
+			memCredentials().credentials,
 		);
 		expect(store.getClientId()).toBeUndefined();
 		expect(store.isConnected()).toBe(false);
 	});
+});
 
-	/*
-	 * `getDeviceId` was removed by N5: the id lived in `data.json`, which travels with a synced vault, so
-	 * two devices shared one. P5's echo filter then made device B discard device A's changes as its own
-	 * echo. It is per-install now, and tested in `test/connect/device-id.test.ts`.
-	 */
+/**
+ * ⛔ Audit NV33: the sign-in never reaches the vault folder.
+ *
+ * The audit drove the real persistence and found the rotated refresh token in plain text in the bytes
+ * saved to `data.json` (A1–A2), and a byte copy of that file loading as signed in on another install,
+ * sending its bearer for any vault the account owns (B1–B3). These are those checks, inverted.
+ */
+describe("⛔ the sign-in stays on this device (NV33)", () => {
+	it("no token byte is ever written to data.json, through sign-in and a refresh", async () => {
+		const m = await memStore({ vaultId: "vlt_one" });
+		await m.store.completeSignIn(
+			{ access_token: "DUMMY-ACCESS-1", refresh_token: "DUMMY-REFRESH-1" },
+			"cid",
+		);
+		await m.store.setTokens(ROTATED);
+		await m.data.flush();
+
+		const file = JSON.stringify(m.peek());
+		for (const secret of ["DUMMY-ACCESS", "DUMMY-REFRESH", "cid"])
+			expect(file).not.toContain(secret);
+		expect(m.signIn()?.tokens).toEqual(ROTATED);
+	});
+
+	it("a byte copy of data.json, on another device, is signed out", async () => {
+		const original = await memStore({ vaultId: "vlt_one", vaultName: "One" });
+		await original.store.completeSignIn(
+			{ access_token: "DUMMY-ACCESS-1", refresh_token: "DUMMY-REFRESH-1" },
+			"cid",
+		);
+		await original.data.flush();
+
+		// Another install receives the folder: the same bytes, its own (empty) secret store.
+		const copy = memData(JSON.parse(JSON.stringify(original.peek())));
+		const elsewhere = new TokenStore(await copy.open(), memCredentials().credentials);
+		expect(elsewhere.isConnected()).toBe(false);
+		expect(elsewhere.getTokens()).toBeUndefined();
+		// The folder's link travels, so signing in there resumes the same vault.
+		expect(elsewhere.getVaultId()).toBe("vlt_one");
+	});
+
+	it("a refresh that lands after sign-out creates no sign-in (backs the C14 latch)", async () => {
+		const m = await memStore({
+			clientId: "cid",
+			tokens: { access_token: "at", refresh_token: "rt" },
+		});
+		await m.store.signOut();
+		await m.store.setTokens(ROTATED);
+		expect(m.store.isConnected()).toBe(false);
+		expect(m.signIn()).toBeUndefined();
+	});
+
+	it("two vaults on one phone keep separate sign-ins in the shared store", async () => {
+		const shared = new SecretStorage();
+		const work = new TokenStore(await memData().open(), memCredentials(shared).credentials);
+		const home = new TokenStore(await memData().open(), memCredentials(shared).credentials);
+		await work.completeSignIn({ access_token: "work-at" }, "cid");
+		await home.completeSignIn({ access_token: "home-at" }, "cid");
+		await work.signOut();
+
+		expect(shared.listSecrets()).toHaveLength(2);
+		expect(work.isConnected()).toBe(false);
+		expect(home.getTokens()?.access_token).toBe("home-at");
+	});
+
+	it("keeps its secret's id per vault, and mints a valid one when none is stored", () => {
+		const { secrets, local, credentials } = memCredentials();
+		credentials.setSignedIn({ tokens: { access_token: "at" }, clientId: "cid" });
+		const [id] = secrets.listSecrets();
+		expect(id).toMatch(/^copal-sign-in-[0-9a-f]{12}$/);
+		expect(local.get("copal-sign-in")).toBe(id);
+	});
 });

@@ -50,6 +50,7 @@ import type {
 	Events as RealEvents,
 	FileStats,
 	ListedFiles,
+	SecretStorage as RealSecretStorage,
 	Stat,
 	TAbstractFile as RealTAbstractFile,
 	TFile as RealTFile,
@@ -481,7 +482,7 @@ export class Vault extends Events implements RealVault {
 	append(): Promise<void> {
 		return unimplemented("Vault.append");
 	}
-	copy(): Promise<RealTFile> {
+	copy<T extends RealTAbstractFile>(): Promise<T> {
 		return unimplemented("Vault.copy");
 	}
 	static recurseChildren(root: RealTFolder, cb: (file: RealTAbstractFile) => unknown): void {
@@ -554,12 +555,57 @@ export class Workspace extends Events {
 	}
 }
 
-/** `app.vault` and `app.workspace` are the only fields the plugin reads. */
+/**
+ * Obsidian's secret store (`app.secretStorage`, since 1.11.4), as Obsidian 1.14.5 implements it: one
+ * map, ids that must be lowercase alphanumeric with dashes and at most 64 long (`setSecret` throws
+ * otherwise), `null` for an id never set. The real class declares a private member, which no other
+ * class can implement, so this conforms to its public surface.
+ *
+ * Pass one instance to two apps to model mobile, where the store is one namespace for the whole app.
+ */
+type PublicSecretStorage = Pick<RealSecretStorage, "setSecret" | "getSecret" | "listSecrets">;
+export class SecretStorage extends Events implements PublicSecretStorage {
+	readonly secrets = new Map<string, string>();
+
+	setSecret(id: string, secret: string): void {
+		if (!/^[a-z0-9-]+$/.test(id) || id.length > 64) {
+			throw new Error("Secret ID must be lowercase alphanumeric with optional dashes");
+		}
+		this.secrets.set(id, secret);
+		this.trigger("changed");
+	}
+
+	getSecret(id: string): string | null {
+		return this.secrets.get(id) ?? null;
+	}
+
+	listSecrets(): string[] {
+		return [...this.secrets.keys()];
+	}
+}
+
+/**
+ * The fields the plugin reads: `vault`, `workspace`, `secretStorage`, and the per-vault localStorage
+ * (`loadLocalStorage` / `saveLocalStorage`, which Obsidian keys by the vault's id and JSON-encodes).
+ */
 class AppStub {
+	private readonly local = new Map<string, string>();
+
 	constructor(
 		readonly vault: Vault,
 		readonly workspace: Workspace = new Workspace(),
+		readonly secretStorage: SecretStorage = new SecretStorage(),
 	) {}
+
+	loadLocalStorage(key: string): unknown {
+		const raw = this.local.get(key);
+		return raw === undefined ? null : (JSON.parse(raw) as unknown);
+	}
+
+	saveLocalStorage(key: string, data: unknown): void {
+		if (data === null || data === undefined) this.local.delete(key);
+		else this.local.set(key, JSON.stringify(data));
+	}
 }
 
 /**
@@ -573,9 +619,18 @@ class AppStub {
  * declarations: `Vault implements RealVault` and `Adapter implements DataAdapter` hold without casts,
  * which is what makes that subtree trustworthy. Widening this cast, or adding another, gives that up.
  */
-export function stubApp(files: Record<string, string> = {}, vaultName?: string): RealApp {
+export function stubApp(
+	files: Record<string, string> = {},
+	vaultName?: string,
+	secretStorage: SecretStorage = new SecretStorage(),
+): RealApp {
 	const vault = vaultName === undefined ? new Vault(files) : new Vault(files, vaultName);
-	return new AppStub(vault) as unknown as RealApp;
+	return new AppStub(vault, new Workspace(), secretStorage) as unknown as RealApp;
+}
+
+/** The stub secret store behind a `stubApp()`. */
+export function secretsOf(app: RealApp): SecretStorage {
+	return app.secretStorage as unknown as SecretStorage;
 }
 
 /** The stub vault behind a `stubApp()`, for arranging and asserting. */

@@ -30,17 +30,25 @@ Copal is a hosted service, and this plugin is the client for it. Please read thi
 [Privacy policy](https://copal.uk/privacy) · [Terms](https://copal.uk/terms) ·
 [Sub-processors](https://copal.uk/subprocessors)
 
-## Where your sign-in is stored, and what that means
+## Where your sign-in is stored
 
-⚠️ **Your Copal sign-in is stored in this vault's plugin data (`.obsidian/plugins/copal/data.json`).**
-Obsidian offers plugins no cross-platform secret store, so there is nowhere more protected to put it.
+**Your Copal sign-in is kept in Obsidian's secure storage on this device, never in the vault folder.**
+On desktop, Obsidian encrypts it with your operating system's keychain; on iOS and Android it is in the
+system keychain. (On Linux without a keyring, Obsidian keeps it unencrypted and tells you so.) It is
+listed under Settings → Keychain.
 
-The consequence is worth understanding. **If you sync this vault somewhere else** (iCloud, Obsidian
-Sync, Dropbox, git) **your Copal sign-in travels with it**, and any copy of the vault can use it.
+So a copy of this vault (iCloud, Obsidian Sync, Dropbox, git) carries no sign-in, and each device signs
+in on its own.
 
-Signing out asks Copal to revoke that sign-in, so the other copies cannot renew it, and tells you if it
-could not reach Copal to do so. Access already granted can take up to an hour to lapse. The same
-disclosure appears in the plugin's own settings pane.
+Versions before 1.1.0 kept the sign-in in this vault's plugin data (`.obsidian/plugins/copal/data.json`),
+where it travelled with any copy of the vault. From 1.1.0 the plugin revokes a sign-in it finds in that
+file, so no copy of it can be used, and asks you to sign in once more on each device. **Update every
+device that syncs this vault:** an older version keeps writing its sign-in into that file, and the
+newer one revokes it.
+
+Signing out asks Copal to revoke the sign-in, and tells you if it could not reach Copal to do so. Access
+already granted can take up to an hour to lapse. The same disclosure appears in the plugin's own
+settings pane.
 
 ## Installing
 
@@ -74,7 +82,7 @@ Markdown files stay.
 ## Mobile
 
 Fully supported on iOS and Android, including the search pane (reachable from the ribbon icon, since
-mobile has no status bar). Requires Obsidian 1.7.2 or later.
+mobile has no status bar). Requires Obsidian 1.11.4 or later.
 
 ## Support
 
